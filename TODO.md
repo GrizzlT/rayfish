@@ -94,7 +94,7 @@ Separate the long-running network engine from the CLI.
 - [ ] `pitopid` — background daemon process that owns the iroh endpoint, TUN devices, and all connections
 - [ ] `pitopi` CLI becomes a thin client that talks to `pitopid` over a Unix domain socket (or gRPC)
 - [ ] IPC protocol: create/join/leave/status/list commands as request/response messages
-- [ ] Daemon auto-starts on boot via launchd (macOS) / systemd (Linux)
+- [x] Daemon auto-starts on boot via launchd (macOS) / systemd (Linux)
 - [ ] macOS Network Extension (NEPacketTunnelProvider) — unprivileged TUN operation, no sudo required
 - [ ] macOS System Extension distribution — standalone .app outside the App Store
 - [ ] App Store distribution variant (Network Extension required by sandbox)
@@ -128,7 +128,7 @@ Fine-grained control over who can reach what.
 - [x] ACL policy engine — rules like `user:alice can access server:gamehost on port 25565`
 - [ ] Role-based access — map Discord roles / Slack groups to ACL groups
 - [ ] Admin controls — org admins grant/revoke access per user, per resource, per port
-- [ ] Resource tagging — peers advertise services (e.g., "minecraft:25565", "ssh:22") on the control channel
+- [x] Resource tagging — peers advertise services (e.g., "minecraft:25565", "ssh:22") on the control channel
 - [x] Default policies: deny-all, allow-same-org, allow-all
 - [x] Policy format: human-readable TOML (inspired by Tailscale ACLs)
 - [x] Enforcement at the forwarding layer — filter packets against ACLs before writing to TUN
@@ -143,5 +143,5 @@ Fine-grained control over who can reach what.
 - [ ] Bandwidth throttling / QoS per peer or per network
 - [ ] Encrypted peer-to-peer file transfer over the mesh (`pitopi send <file>`)
 - [ ] Web dashboard for network management and monitoring
-- [ ] Headless/embedded mode for IoT devices and servers
+- [x] Headless/embedded mode for IoT devices and servers
 - [ ] Exit node support — route internet traffic through a designated peer (like a traditional VPN)

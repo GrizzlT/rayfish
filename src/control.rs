@@ -26,6 +26,16 @@ pub enum ControlMsg {
     MeshWelcome {
         ip: Ipv4Addr,
     },
+    AdvertiseServices {
+        ip: Ipv4Addr,
+        services: Vec<ServiceTag>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceTag {
+    pub name: String,
+    pub port: u16,
 }
 
 pub fn encode_msg(msg: &ControlMsg) -> Vec<u8> {
