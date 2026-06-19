@@ -1,3 +1,4 @@
+mod config;
 mod control;
 mod forward;
 mod identity;
@@ -36,11 +37,25 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create a new network and wait for peers
-    Create,
+    Create {
+        /// Network name (defaults to "default")
+        #[arg(long, default_value = "default")]
+        name: String,
+    },
     /// Join an existing network using a node ID
     Join {
         /// The endpoint ID of the network creator
         node_id: EndpointId,
+        /// Network name (defaults to "default")
+        #[arg(long, default_value = "default")]
+        name: String,
+    },
+    /// List saved networks
+    List,
+    /// Leave a network (remove from saved config)
+    Leave {
+        /// Name of the network to leave
+        name: String,
     },
 }
 
@@ -53,29 +68,52 @@ fn check_root() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    check_root();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
     let cli = Cli::parse();
 
-    let token = shutdown::token();
-    let stats = stats::Stats::new();
-    stats.spawn_logger(token.clone());
-
     match cli.command {
-        Command::Create => cmd_create(token, stats).await,
-        Command::Join { node_id } => cmd_join(node_id, token, stats).await,
+        Command::List => cmd_list(),
+        Command::Leave { name } => cmd_leave(&name),
+        Command::Create { name } => {
+            check_root();
+            let token = shutdown::token();
+            let stats = stats::Stats::new();
+            stats.spawn_logger(token.clone());
+            cmd_create(&name, token, stats).await
+        }
+        Command::Join { node_id, name } => {
+            check_root();
+            let token = shutdown::token();
+            let stats = stats::Stats::new();
+            stats.spawn_logger(token.clone());
+            cmd_join(node_id, &name, token, stats).await
+        }
     }
 }
 
-async fn cmd_create(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
+async fn cmd_create(name: &str, token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
     let key = identity::load_or_create()?;
     let ep = transport::create_endpoint(key).await?;
 
-    tracing::info!("network created");
+    tracing::info!(name = %name, "network created");
     tracing::info!(ip = %COORDINATOR_IP, "your virtual IP");
     tracing::info!(node_id = %ep.id(), "share this node ID with peers");
+
+    // Save network to config
+    let mut app_config = config::load()?;
+    config::upsert_network(
+        &mut app_config,
+        config::NetworkConfig {
+            name: name.to_string(),
+            coordinator_id: ep.id().to_string(),
+            assigned_ip: None,
+            peers: vec![],
+        },
+    );
+    config::save(&app_config)?;
+    tracing::info!("saved network to config");
 
     let tun_dev =
         tun::TunDevice::create_mesh(COORDINATOR_IP).context("failed to create TUN device")?;
@@ -206,6 +244,7 @@ async fn broadcast_to_peers(peers: &PeerTable, msg: &ControlMsg, exclude: Option
 
 async fn cmd_join(
     node_id: EndpointId,
+    name: &str,
     token: CancellationToken,
     stats: Arc<Stats>,
 ) -> Result<()> {
@@ -234,7 +273,7 @@ async fn cmd_join(
             }
         };
 
-        match join_mesh(conn, &ep, token.clone(), stats.clone()).await {
+        match join_mesh(conn, &ep, name, node_id, token.clone(), stats.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if token.is_cancelled() {
@@ -250,6 +289,8 @@ async fn cmd_join(
 async fn join_mesh(
     coordinator_conn: iroh::endpoint::Connection,
     ep: &Endpoint,
+    network_name: &str,
+    coordinator_node_id: EndpointId,
     token: CancellationToken,
     stats: Arc<Stats>,
 ) -> Result<()> {
@@ -265,6 +306,27 @@ async fn join_mesh(
     };
 
     tracing::info!(ip = %my_ip, peers = existing_peers.len(), "joined network");
+
+    // Save network membership to config
+    let peer_entries: Vec<config::PeerEntry> = existing_peers
+        .iter()
+        .map(|p| config::PeerEntry {
+            ip: p.ip,
+            endpoint_id: p.endpoint_id.clone(),
+        })
+        .collect();
+    let mut app_config = config::load()?;
+    config::upsert_network(
+        &mut app_config,
+        config::NetworkConfig {
+            name: network_name.to_string(),
+            coordinator_id: coordinator_node_id.to_string(),
+            assigned_ip: Some(my_ip),
+            peers: peer_entries,
+        },
+    );
+    config::save(&app_config)?;
+    tracing::info!(name = %network_name, "saved network to config");
 
     let tun_dev = tun::TunDevice::create_mesh(my_ip).context("failed to create TUN device")?;
 
@@ -377,6 +439,39 @@ async fn join_mesh(
     });
 
     forward::run_mesh(tun_dev, peers, tun_tx, token, stats).await
+}
+
+fn cmd_list() -> Result<()> {
+    let app_config = config::load()?;
+    if app_config.networks.is_empty() {
+        println!("No saved networks.");
+        return Ok(());
+    }
+    for net in &app_config.networks {
+        let ip_str = net
+            .assigned_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "coordinator".to_string());
+        println!(
+            "{} (coordinator: {}, ip: {}, peers: {})",
+            net.name,
+            net.coordinator_id,
+            ip_str,
+            net.peers.len()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_leave(name: &str) -> Result<()> {
+    let mut app_config = config::load()?;
+    if config::remove_network(&mut app_config, name) {
+        config::save(&app_config)?;
+        println!("Left network '{}'.", name);
+    } else {
+        println!("Network '{}' not found.", name);
+    }
+    Ok(())
 }
 
 async fn backoff_sleep(token: &CancellationToken, backoff: &mut std::time::Duration) {

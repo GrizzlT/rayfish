@@ -48,9 +48,9 @@ Run multiple independent virtual networks simultaneously.
 
 ### Persistent config
 
-- [ ] Network config file at `~/.config/pitopi/networks.toml` — stores network memberships, assigned IPs, peer lists
-- [ ] Each network identified by creator's EndpointId + network name (e.g., `<endpoint_id>/gaming`)
-- [ ] CLI: `pitopi create --name <name>`, `pitopi join <ticket>`, `pitopi list`, `pitopi leave <name>`
+- [x] Network config file at `~/.config/pitopi/networks.toml` — stores network memberships, assigned IPs, peer lists
+- [x] Each network identified by creator's EndpointId + network name (e.g., `<endpoint_id>/gaming`)
+- [x] CLI: `pitopi create --name <name>`, `pitopi join <ticket>`, `pitopi list`, `pitopi leave <name>`
 
 ### Network isolation
 
