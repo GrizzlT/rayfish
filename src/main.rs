@@ -4,6 +4,7 @@ mod config;
 mod control;
 mod forward;
 mod identity;
+mod membership;
 mod peers;
 mod room_code;
 mod shutdown;
@@ -11,13 +12,13 @@ mod stats;
 mod transport;
 mod tun;
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::{net::Ipv4Addr, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use iroh::endpoint::Endpoint;
 use iroh::EndpointId;
+use iroh::endpoint::Endpoint;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -29,8 +30,8 @@ fn coordinator_ip(subnet_index: u8) -> Ipv4Addr {
     tun::TunDevice::coordinator_ip(subnet_index)
 }
 
-const BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
-const BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(name = "pitopi", about = "P2P mesh VPN powered by iroh")]
@@ -124,12 +125,7 @@ async fn main() -> Result<()> {
         Command::InstallService => cmd_install_service(),
         Command::UninstallService => cmd_uninstall_service(),
         Command::Completions { shell } => {
-            clap_complete::generate(
-                shell,
-                &mut Cli::command(),
-                "pitopi",
-                &mut std::io::stdout(),
-            );
+            clap_complete::generate(shell, &mut Cli::command(), "pitopi", &mut std::io::stdout());
             Ok(())
         }
     }
@@ -271,10 +267,14 @@ async fn handle_new_peer(
         ip: assigned_ip,
         endpoint_id: conn.remote_id().to_string(),
     };
-    broadcast_to_peers(&peers, &ControlMsg::PeerJoined(new_peer_info), Some(assigned_ip)).await;
+    broadcast_to_peers(
+        &peers,
+        &ControlMsg::PeerJoined(new_peer_info),
+        Some(assigned_ip),
+    )
+    .await;
 
-    let reader_handle =
-        forward::spawn_peer_reader(conn.clone(), tun_tx, token.clone(), stats);
+    let reader_handle = forward::spawn_peer_reader(conn.clone(), tun_tx, token.clone(), stats);
 
     tokio::select! {
         _ = token.cancelled() => {}
@@ -360,7 +360,17 @@ async fn cmd_join_on_endpoint(
             }
         };
 
-        match join_mesh(conn, ep, name, node_id, subnet_index, token.clone(), stats.clone()).await {
+        match join_mesh(
+            conn,
+            ep,
+            name,
+            node_id,
+            subnet_index,
+            token.clone(),
+            stats.clone(),
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if token.is_cancelled() {
@@ -632,7 +642,9 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
         let alpn = transport::network_alpn(&net.name);
 
         if net.assigned_ip.is_some() {
-            let coordinator_id: EndpointId = net.coordinator_id.parse()
+            let coordinator_id: EndpointId = net
+                .coordinator_id
+                .parse()
                 .context("invalid coordinator id in config")?;
             let name = net.name.clone();
             let ep = ep.clone();
@@ -642,7 +654,10 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
                 tracing::info!(network = %name, subnet_index, "connecting...");
                 match transport::connect_to_peer_with_alpn(&ep, coordinator_id, &alpn).await {
                     Ok(conn) => {
-                        if let Err(e) = join_mesh(conn, &ep, &name, coordinator_id, subnet_index, token, stats).await {
+                        if let Err(e) =
+                            join_mesh(conn, &ep, &name, coordinator_id, subnet_index, token, stats)
+                                .await
+                        {
                             tracing::warn!(network = %name, error = %e, "disconnected");
                         }
                     }
@@ -659,7 +674,10 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
             handles.push(tokio::spawn(async move {
                 tracing::info!(network = %name, subnet_index, "starting coordinator...");
                 let mut app_config = config::load().unwrap_or_default();
-                if let Err(e) = cmd_create_on_endpoint(&name, &ep, subnet_index, token, stats, &mut app_config).await {
+                if let Err(e) =
+                    cmd_create_on_endpoint(&name, &ep, subnet_index, token, stats, &mut app_config)
+                        .await
+                {
                     tracing::warn!(network = %name, error = %e, "coordinator stopped");
                 }
             }));
@@ -739,7 +757,7 @@ fn cmd_uninstall_service() -> Result<()> {
     }
 }
 
-async fn backoff_sleep(token: &CancellationToken, backoff: &mut std::time::Duration) {
+async fn backoff_sleep(token: &CancellationToken, backoff: &mut Duration) {
     tracing::info!(secs = backoff.as_secs(), "retrying in");
     tokio::select! {
         _ = token.cancelled() => {}
