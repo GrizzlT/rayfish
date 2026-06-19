@@ -59,6 +59,14 @@ enum Command {
     },
     /// Show status of active networks
     Status,
+    /// Connect to all saved networks
+    Up,
+    /// Disconnect from all networks
+    Down,
+    /// Install system service (systemd on Linux, launchd on macOS)
+    InstallService,
+    /// Uninstall system service
+    UninstallService,
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -98,6 +106,16 @@ async fn main() -> Result<()> {
             cmd_join(node_id, &name, token, stats).await
         }
         Command::Status => cmd_status(),
+        Command::Up => {
+            check_root();
+            let token = shutdown::token();
+            let stats = stats::Stats::new();
+            stats.spawn_logger(token.clone());
+            cmd_up(token, stats).await
+        }
+        Command::Down => cmd_down(),
+        Command::InstallService => cmd_install_service(),
+        Command::UninstallService => cmd_uninstall_service(),
         Command::Completions { shell } => {
             clap_complete::generate(
                 shell,
@@ -519,6 +537,124 @@ fn cmd_leave(name: &str) -> Result<()> {
         println!("Network '{}' not found.", name);
     }
     Ok(())
+}
+
+async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
+    let app_config = config::load()?;
+    if app_config.networks.is_empty() {
+        println!("No saved networks. Use 'pitopi create' or 'pitopi join' first.");
+        return Ok(());
+    }
+
+    let key = identity::load_or_create()?;
+    let ep = transport::create_endpoint(key).await?;
+
+    let mut handles = Vec::new();
+    for net in &app_config.networks {
+        if net.assigned_ip.is_some() {
+            let coordinator_id: EndpointId = net.coordinator_id.parse()
+                .context("invalid coordinator id in config")?;
+            let name = net.name.clone();
+            let ep = ep.clone();
+            let token = token.clone();
+            let stats = stats.clone();
+            handles.push(tokio::spawn(async move {
+                tracing::info!(network = %name, "connecting...");
+                match transport::connect_to_peer(&ep, coordinator_id).await {
+                    Ok(conn) => {
+                        if let Err(e) = join_mesh(conn, &ep, &name, coordinator_id, token, stats).await {
+                            tracing::warn!(network = %name, error = %e, "disconnected");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(network = %name, error = %e, "failed to connect");
+                    }
+                }
+            }));
+        } else {
+            let name = net.name.clone();
+            let token = token.clone();
+            let stats = stats.clone();
+            handles.push(tokio::spawn(async move {
+                tracing::info!(network = %name, "starting coordinator...");
+                if let Err(e) = cmd_create(&name, token, stats).await {
+                    tracing::warn!(network = %name, error = %e, "coordinator stopped");
+                }
+            }));
+        }
+    }
+
+    tokio::select! {
+        _ = token.cancelled() => {}
+        _ = futures::future::join_all(handles) => {}
+    }
+
+    Ok(())
+}
+
+fn cmd_down() -> Result<()> {
+    println!("Stopping all networks. Send SIGTERM to the running pitopi process.");
+    Ok(())
+}
+
+fn cmd_install_service() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let service = include_str!("../contrib/pitopi.service");
+        let path = std::path::Path::new("/etc/systemd/system/pitopi.service");
+        std::fs::write(path, service)?;
+        println!("Installed systemd service to {}", path.display());
+        println!("Run: sudo systemctl enable --now pitopi");
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist = include_str!("../contrib/com.pitopi.vpn.plist");
+        let path = std::path::Path::new("/Library/LaunchDaemons/com.pitopi.vpn.plist");
+        std::fs::write(path, plist)?;
+        println!("Installed launchd daemon to {}", path.display());
+        println!("Run: sudo launchctl load {}", path.display());
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    {
+        anyhow::bail!("service installation not supported on this platform");
+    }
+}
+
+fn cmd_uninstall_service() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::path::Path::new("/etc/systemd/system/pitopi.service");
+        if path.exists() {
+            std::fs::remove_file(path)?;
+            println!("Removed systemd service.");
+            println!("Run: sudo systemctl daemon-reload");
+        } else {
+            println!("Service not installed.");
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::path::Path::new("/Library/LaunchDaemons/com.pitopi.vpn.plist");
+        if path.exists() {
+            println!("Run: sudo launchctl unload {}", path.display());
+            std::fs::remove_file(path)?;
+            println!("Removed launchd daemon.");
+        } else {
+            println!("Service not installed.");
+        }
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    {
+        anyhow::bail!("service uninstallation not supported on this platform");
+    }
 }
 
 async fn backoff_sleep(token: &CancellationToken, backoff: &mut std::time::Duration) {

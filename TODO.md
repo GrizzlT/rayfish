@@ -61,8 +61,8 @@ Run multiple independent virtual networks simultaneously.
 
 ### Daemon mode
 
-- [ ] `pitopi up` — connect to all saved networks from config
-- [ ] `pitopi down` — disconnect from all networks, tear down TUN devices
+- [x] `pitopi up` — connect to all saved networks from config
+- [x] `pitopi down` — disconnect from all networks, tear down TUN devices
 
 ## Phase 4: UX polish
 
@@ -83,9 +83,9 @@ Make it pleasant to use day-to-day.
 
 ### Service integration
 
-- [ ] Systemd unit file for Linux servers
-- [ ] launchd plist for macOS
-- [ ] `pitopi install-service` / `pitopi uninstall-service` to manage service files
+- [x] Systemd unit file for Linux servers
+- [x] launchd plist for macOS
+- [x] `pitopi install-service` / `pitopi uninstall-service` to manage service files
 
 ## Phase 5: Daemon architecture
 

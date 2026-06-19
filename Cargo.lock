@@ -2510,6 +2510,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
+ "futures",
  "iroh",
  "libc",
  "serde",

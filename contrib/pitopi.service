@@ -1,0 +1,13 @@
+[Unit]
+Description=pitopi P2P mesh VPN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pitopi up
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
