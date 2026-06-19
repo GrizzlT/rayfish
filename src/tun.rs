@@ -13,13 +13,13 @@ pub struct TunDevice {
 }
 
 impl TunDevice {
-    pub fn create_mesh_subnet(addr: Ipv4Addr, subnet_index: u8) -> Result<Self> {
-        let gateway = Ipv4Addr::new(100, 64, subnet_index, 1);
+    pub fn create(addr: Ipv4Addr) -> Result<Self> {
+        let gateway = Ipv4Addr::new(100, 64, 0, 1);
         let mut config = Configuration::default();
         config
             .address(addr)
             .destination(gateway)
-            .netmask((255, 255, 255, 0))
+            .netmask((255, 192, 0, 0)) // /10
             .mtu(TUN_MTU)
             .up();
 
@@ -29,15 +29,10 @@ impl TunDevice {
         });
 
         let device = tun::create_as_async(&config)?;
-        tracing::info!(%addr, subnet_index, "TUN device created (mesh)");
+        tracing::info!(%addr, "TUN device created");
         Ok(Self {
             device: Arc::new(Mutex::new(device)),
         })
-    }
-
-    /// Compute the coordinator IP for a given subnet index: 100.64.{subnet_index}.1
-    pub fn coordinator_ip(subnet_index: u8) -> Ipv4Addr {
-        Ipv4Addr::new(100, 64, subnet_index, 1)
     }
 
     pub fn share(&self) -> TunDevice {
