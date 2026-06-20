@@ -99,6 +99,7 @@ Separate the long-running network engine from the CLI.
 - [ ] macOS System Extension distribution — standalone .app outside the App Store
 - [ ] App Store distribution variant (Network Extension required by sandbox)
 - [ ] Graceful fallback: use Network Extension if available, raw utun if running as root
+- [ ] WebSocket server in the daemon — push real-time status updates (peer connects/disconnects, network changes, stats) to local clients (future UI, menu bar app, web dashboard)
 - [ ] Menu bar app (macOS) / system tray (Linux) for quick status and network management
 
 ## Phase 6: Social discovery & auth
@@ -145,3 +146,6 @@ Fine-grained control over who can reach what.
 - [ ] Web dashboard for network management and monitoring
 - [x] Headless/embedded mode for IoT devices and servers
 - [ ] Exit node support — route internet traffic through a designated peer (like a traditional VPN)
+- [ ] WireGuard exit node adapter — userspace WireGuard client (boringtun) to forward internet-bound traffic through a standard WireGuard server (Mullvad, VPS, etc.) while mesh traffic stays on iroh
+- [ ] Rendezvous server — centralized discovery service where peers register (name, endpoint_id) and joiners query by name. Replaces the pkarr directory record with a trusted service, eliminating the name-overwrite attack vector. Monetization opportunity: free tier for small networks, paid for guaranteed uptime and priority resolution.
+- [ ] Multi-admin support — multiple coordinators per network, any admin can modify membership and publish DHT records
