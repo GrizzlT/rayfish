@@ -49,6 +49,16 @@ impl PeerTable {
         self.inner.read().unwrap().get(ip).map(|e| e.conn.clone())
     }
 
+    /// Returns (Connection, EndpointId, network_name) for a peer's virtual IP.
+    /// Used by `run_mesh` for ACL-aware routing.
+    pub fn lookup_full(&self, ip: &Ipv4Addr) -> Option<(Connection, EndpointId, String)> {
+        self.inner
+            .read()
+            .unwrap()
+            .get(ip)
+            .map(|e| (e.conn.clone(), e.endpoint_id, e.network.clone()))
+    }
+
     /// Removes a dead peer. Packets to this IP will be silently dropped until
     /// a new connection is added via [`PeerTable::add`].
     pub fn remove(&self, ip: &Ipv4Addr) {
@@ -110,6 +120,13 @@ mod tests {
         let table = PeerTable::new();
         let ip = Ipv4Addr::new(100, 64, 0, 2);
         assert!(table.lookup(&ip).is_none());
+    }
+
+    #[test]
+    fn test_peer_table_empty_lookup_full() {
+        let table = PeerTable::new();
+        let ip = Ipv4Addr::new(100, 64, 0, 5);
+        assert!(table.lookup_full(&ip).is_none());
     }
 
     #[test]

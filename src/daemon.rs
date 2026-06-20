@@ -83,6 +83,7 @@ pub struct DaemonState {
     shutdown_token: CancellationToken,
     blob_store: FsStore,
     blobs_proto: BlobsProtocol,
+    shared_acl: forward::SharedAcl,
 }
 
 impl DaemonState {
@@ -262,6 +263,7 @@ impl DaemonState {
             acl_dht_id_str,
             self.blob_store.clone(),
             self.blobs_proto.clone(),
+            self.shared_acl.clone(),
         );
         tasks.push(accept_handle);
 
@@ -399,6 +401,7 @@ impl DaemonState {
             disconnect_tx.clone(),
             cancel.clone(),
             self.stats.clone(),
+            self.shared_acl.clone(),
         )];
 
         // Join mesh via the connected peer
@@ -415,6 +418,7 @@ impl DaemonState {
             self.stats.clone(),
             self.blob_store.clone(),
             self.blobs_proto.clone(),
+            self.shared_acl.clone(),
         ).await?;
 
         // Store the secrets from the fetched membership data and refresh snapshot
@@ -551,6 +555,7 @@ impl DaemonState {
                 disconnect_tx.clone(),
                 cancel.clone(),
                 self.stats.clone(),
+                self.shared_acl.clone(),
             )];
 
             // Connect to the same peer via network ALPN for mesh data
@@ -562,7 +567,7 @@ impl DaemonState {
                     }
                     crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
                     self.peers.add(m.ip, peer_conn.clone(), m.identity, network_name);
-                    forward::spawn_peer_reader(peer_conn, m.identity, m.ip, self.tun_tx.clone(), disconnect_tx.clone(), cancel.clone(), self.stats.clone());
+                    forward::spawn_peer_reader(peer_conn, m.identity, m.ip, self.endpoint.id(), network_name.to_string(), self.shared_acl.clone(), self.tun_tx.clone(), disconnect_tx.clone(), cancel.clone(), self.stats.clone());
                 }
             }
 
@@ -760,6 +765,13 @@ impl DaemonState {
         tasks.push(spawn_peer_cleanup(disconnect_rx, self.peers.clone(), cancel.clone()));
 
         let acl_dht_id_str = Some(dht::acl_dht_id(&self.secret_key, name).to_string());
+
+        // Sync the restored ACL into the shared ACL state for enforcement
+        {
+            let s = state.read().unwrap();
+            self.shared_acl.set(name, s.acl.clone());
+        }
+
         let accept_handle = spawn_coordinator_accept(
             self.endpoint.clone(),
             name.to_string(),
@@ -776,6 +788,7 @@ impl DaemonState {
             acl_dht_id_str,
             self.blob_store.clone(),
             self.blobs_proto.clone(),
+            self.shared_acl.clone(),
         );
         tasks.push(accept_handle);
 
@@ -874,6 +887,7 @@ impl DaemonState {
         }
 
         self.peers.remove_by_network(name);
+        self.shared_acl.remove(name);
         self.refresh_alpns();
 
         // Remove from config
@@ -943,6 +957,9 @@ impl DaemonState {
     }
 
     async fn publish_and_broadcast_acl(&self, network: &str, data: &acl::AclData) {
+        // Sync into the shared ACL used by the forwarding layer
+        self.shared_acl.set(network, data.clone());
+
         let hash = acl::acl_hash(data);
         let bytes = acl::canonical_acl_bytes(data);
         let _ = self.blob_store.blobs().add_slice(&bytes).await;
@@ -1147,11 +1164,14 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
     // Single TUN for all networks
     let (tun_reader, tun_writer) = tun::create(my_ip).context("failed to create TUN device")?;
     let peers = PeerTable::new();
+    let shared_acl = forward::SharedAcl::new();
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
     forward::spawn_tun_writer(tun_writer, tun_rx);
     tokio::spawn(forward::run_mesh(
         tun_reader,
         peers.clone(),
+        public_key,
+        shared_acl.clone(),
         token.clone(),
         stats.clone(),
     ));
@@ -1167,6 +1187,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         shutdown_token: token.clone(),
         blob_store,
         blobs_proto,
+        shared_acl,
     });
 
     tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
@@ -1513,6 +1534,7 @@ fn spawn_coordinator_accept(
     acl_dht_id: Option<String>,
     blob_store: FsStore,
     blobs_proto: BlobsProtocol,
+    shared_acl: forward::SharedAcl,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run_accept_loop(
@@ -1532,6 +1554,7 @@ fn spawn_coordinator_accept(
             acl_dht_id,
             blob_store,
             blobs_proto,
+            shared_acl,
         ).await {
             tracing::warn!(network = %network_name, error = %e, "accept loop stopped");
         }
@@ -1556,6 +1579,7 @@ async fn run_accept_loop(
     acl_dht_id: Option<String>,
     blob_store: FsStore,
     blobs_proto: BlobsProtocol,
+    shared_acl: forward::SharedAcl,
 ) -> Result<()> {
     let self_member = {
         let s = state.read().unwrap();
@@ -1603,9 +1627,12 @@ async fn run_accept_loop(
             let tun_tx_c = tun_tx.clone();
             let disconnect_tx_c = disconnect_tx.clone();
             let dht_id_c = dht_id.clone();
+            let local_id = ep.id();
+            let network_c = network_name.to_string();
+            let shared_acl_c = shared_acl.clone();
             tokio::spawn(async move {
                 send_member_sync(&conn, &members, dht_id_c).await;
-                forward::spawn_peer_reader(conn, remote_id, peer_ip, tun_tx_c, disconnect_tx_c, token_c, stats_c);
+                forward::spawn_peer_reader(conn, remote_id, peer_ip, local_id, network_c, shared_acl_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
             });
             continue;
         }
@@ -1642,8 +1669,11 @@ async fn run_accept_loop(
             let stats_c = stats.clone();
             let tun_tx_c = tun_tx.clone();
             let disconnect_tx_c = disconnect_tx.clone();
+            let local_id = ep.id();
+            let network_c = network_name.to_string();
+            let shared_acl_c = shared_acl.clone();
             tokio::spawn(async move {
-                forward::spawn_peer_reader(conn, remote_id, peer_ip, tun_tx_c, disconnect_tx_c, token_c, stats_c);
+                forward::spawn_peer_reader(conn, remote_id, peer_ip, local_id, network_c, shared_acl_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
             });
             continue;
         }
@@ -1727,8 +1757,11 @@ async fn run_accept_loop(
         let stats_c = stats.clone();
         let tun_tx_c = tun_tx.clone();
         let disconnect_tx_c = disconnect_tx.clone();
+        let local_id = ep.id();
+        let network_c = network_name.to_string();
+        let shared_acl_c = shared_acl.clone();
         tokio::spawn(async move {
-            forward::spawn_peer_reader(conn, remote_id, peer_ip, tun_tx_c, disconnect_tx_c, token_c, stats_c);
+            forward::spawn_peer_reader(conn, remote_id, peer_ip, local_id, network_c, shared_acl_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
         });
     }
 }
@@ -1747,6 +1780,7 @@ async fn join_mesh_shared(
     stats: Arc<Stats>,
     blob_store: FsStore,
     blobs_proto: BlobsProtocol,
+    shared_acl: forward::SharedAcl,
 ) -> Result<Arc<std::sync::RwLock<NetworkState>>> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
@@ -1807,6 +1841,7 @@ async fn join_mesh_shared(
     peers.add(remote_ip, initial_conn.clone(), remote_id, network_name);
     forward::spawn_peer_reader(
         initial_conn.clone(), remote_id, remote_ip,
+        ep.id(), network_name.to_string(), shared_acl.clone(),
         tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone(),
     );
 
@@ -1820,7 +1855,7 @@ async fn join_mesh_shared(
                 let (mut send, _recv) = conn.open_bi().await?;
                 control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip }).await?;
                 peers.add(member.ip, conn.clone(), member.identity, network_name);
-                forward::spawn_peer_reader(conn, member.identity, member.ip, tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
+                forward::spawn_peer_reader(conn, member.identity, member.ip, ep.id(), network_name.to_string(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                 tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
             }
             Err(e) => {
@@ -1854,6 +1889,7 @@ async fn join_mesh_shared(
         let blob_store = blob_store.clone();
         let peers_c = peers.clone();
         let endpoint_c = ep.clone();
+        let shared_acl_ctrl = shared_acl.clone();
         async move {
             loop {
                 tokio::select! {
@@ -1914,6 +1950,7 @@ async fn join_mesh_shared(
                                         {
                                             match acl::verify_acl_data(&bytes, &acl_hash) {
                                                 Ok(data) => {
+                                                    shared_acl_ctrl.set(&network_name, data.clone());
                                                     live_state.write().unwrap().acl = data;
                                                     tracing::info!("ACL updated");
                                                 }
@@ -1946,6 +1983,7 @@ async fn join_mesh_shared(
         let network_name = network_name.to_string();
         let blob_store = blob_store.clone();
         let blobs_proto = blobs_proto.clone();
+        let shared_acl = shared_acl.clone();
         async move {
             loop {
                 tokio::select! {
@@ -1989,11 +2027,11 @@ async fn join_mesh_shared(
                                                 }).await;
                                             }
                                             peers.add(ip, conn.clone(), peer_identity, &network_name);
-                                            forward::spawn_peer_reader(conn, peer_identity, ip, tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
+                                            forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                                             broadcast_member_sync(&peers, &members, Some(ip), None).await;
                                         } else if is_member {
                                             peers.add(ip, conn.clone(), peer_identity, &network_name);
-                                            forward::spawn_peer_reader(conn, peer_identity, ip, tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
+                                            forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                                         }
                                     }
                                     Ok(ControlMsg::ReconnectRequest { identity: peer_identity, ip }) => {
@@ -2005,7 +2043,7 @@ async fn join_mesh_shared(
                                             if let Ok((mut send, _)) = conn.open_bi().await {
                                                 let _ = control::send_msg(&mut send, &ControlMsg::MemberSync { members: current_members, membership_dht_id: None }).await;
                                             }
-                                            forward::spawn_peer_reader(conn, peer_identity, ip, tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
+                                            forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                                         }
                                     }
                                     _ => {}
@@ -2034,6 +2072,7 @@ fn spawn_reconnect_loop(
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<Stats>,
+    shared_acl: forward::SharedAcl,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -2057,6 +2096,7 @@ fn spawn_reconnect_loop(
             let disconnect_tx = disconnect_tx.clone();
             let token = token.clone();
             let stats = stats.clone();
+            let shared_acl = shared_acl.clone();
 
             tokio::spawn(async move {
                 let mut backoff = BACKOFF_INITIAL;
@@ -2081,7 +2121,7 @@ fn spawn_reconnect_loop(
                             }
                             tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "reconnected to peer");
                             peers.add(peer_ip, conn.clone(), peer_id, &network_name);
-                            forward::spawn_peer_reader(conn, peer_id, peer_ip, tun_tx, disconnect_tx, token, stats);
+                            forward::spawn_peer_reader(conn, peer_id, peer_ip, my_identity, network_name, shared_acl, tun_tx, disconnect_tx, token, stats);
                             return;
                         }
                         Err(e) => { tracing::debug!(error = %e, "reconnect attempt failed"); }

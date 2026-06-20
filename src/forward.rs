@@ -5,6 +5,7 @@
 //! - [`spawn_peer_reader`]: one per peer, reads incoming datagrams and forwards to TUN writer
 //! - [`spawn_tun_writer`]: single task, writes incoming packets to the TUN device
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -15,9 +16,44 @@ use iroh::endpoint::Connection;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::acl::AclData;
 use crate::peers::PeerTable;
 use crate::stats::Stats;
 use crate::tun::{TunReader, TunWriter};
+
+/// Per-network ACL state shared across all forwarding tasks.
+///
+/// Uses `std::sync::RwLock` (not tokio) because reads happen on every packet
+/// and writes are rare. The inner map is keyed by network name.
+#[derive(Clone)]
+pub struct SharedAcl {
+    inner: Arc<std::sync::RwLock<HashMap<String, AclData>>>,
+}
+
+impl SharedAcl {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn set(&self, network: &str, acl: AclData) {
+        self.inner.write().unwrap().insert(network.to_string(), acl);
+    }
+
+    pub fn remove(&self, network: &str) {
+        self.inner.write().unwrap().remove(network);
+    }
+
+    pub fn get(&self, network: &str) -> AclData {
+        self.inner
+            .read()
+            .unwrap()
+            .get(network)
+            .cloned()
+            .unwrap_or_else(AclData::empty)
+    }
+}
 
 /// Sent by [`spawn_peer_reader`] when a peer connection drops,
 /// consumed by the reconnect loop (joiner) or cleanup task (coordinator).
@@ -45,6 +81,8 @@ fn dest_ip(packet: &[u8]) -> Option<Ipv4Addr> {
 pub async fn run_mesh(
     mut tun: TunReader,
     peers: PeerTable,
+    local_id: EndpointId,
+    shared_acl: SharedAcl,
     token: CancellationToken,
     stats: Arc<Stats>,
 ) -> Result<()> {
@@ -57,7 +95,13 @@ pub async fn run_mesh(
                 if n > 0 {
                     tracing::debug!(len = n, first_byte = buf[0], "TUN read");
                     if let Some(dst) = dest_ip(&buf[..n]) {
-                        if let Some(conn) = peers.lookup(&dst) {
+                        if let Some((conn, peer_endpoint_id, network)) = peers.lookup_full(&dst) {
+                            let acl = shared_acl.get(&network);
+                            if !acl.is_allowed(&local_id, &peer_endpoint_id) {
+                                tracing::debug!(%dst, "ACL denied outbound");
+                                stats.record_drop();
+                                continue;
+                            }
                             tracing::debug!(%dst, "routing to peer");
                             match conn.send_datagram(Bytes::copy_from_slice(&buf[..n])) {
                                 Ok(()) => stats.record_tx(n),
@@ -86,6 +130,9 @@ pub fn spawn_peer_reader(
     conn: Connection,
     peer_id: EndpointId,
     peer_ip: Ipv4Addr,
+    local_id: EndpointId,
+    network: String,
+    shared_acl: SharedAcl,
     tun_tx: mpsc::Sender<Vec<u8>>,
     disconnect_tx: mpsc::Sender<DisconnectEvent>,
     token: CancellationToken,
@@ -98,6 +145,10 @@ pub fn spawn_peer_reader(
                 result = conn.read_datagram() => {
                     match result {
                         Ok(datagram) => {
+                            if !shared_acl.get(&network).is_allowed(&peer_id, &local_id) {
+                                stats.record_drop();
+                                continue;
+                            }
                             stats.record_rx(datagram.len());
                             if tun_tx.send(datagram.to_vec()).await.is_err() {
                                 return;
