@@ -23,7 +23,8 @@ A complete guide to pitopi's architecture, protocols, and internals.
 15. [Shutdown](#15-shutdown)
 16. [DHT Membership](#16-dht-membership)
 17. [Network Lifecycle](#17-network-lifecycle)
-18. [Security Model](#18-security-model)
+18. [Code Flow Diagrams](#18-code-flow-diagrams)
+19. [Security Model](#19-security-model)
 
 ---
 
@@ -1218,7 +1219,172 @@ All networks share the same TUN device and routing table, since the address spac
 
 ---
 
-## 18. Security Model
+## 18. Code Flow Diagrams
+
+Visual reference for how data and control flow through the codebase.
+
+### Coordinator startup (`pitopi create`)
+
+```
+cmd_create()
+  → identity::load_or_create()            load/generate Ed25519 key
+  → dht::derive_membership_key()          blake3 derive per-network DHT key
+  → transport::create_endpoint_with_alpns()  bind iroh QUIC endpoint
+  → IrohIdentityProvider::new()            derive virtual IP via FNV-1a
+  → MemberList::new() + add(self)          first member (is_coordinator: true)
+  → config::save()                         persist to networks.toml
+  → tun::create(my_ip)                     create TUN device
+     ↓
+  (TunReader, TunWriter)                   split immediately, no Mutex
+     ↓
+  ┌───────────────────────────────────────────────────────────┐
+  │ Background tasks:                                         │
+  │                                                           │
+  │  forward::spawn_tun_writer(TunWriter, tun_rx)             │
+  │    └ reads packets from channel, writes to TUN            │
+  │                                                           │
+  │  forward::run_mesh(TunReader, peers, ...)                  │
+  │    └ reads packets from TUN, routes via PeerTable          │
+  │                                                           │
+  │  spawn_dht_publisher(...)                                  │
+  │    └ publishes membership to DHT on change + every 5 min   │
+  │                                                           │
+  │  spawn_peer_cleanup(disconnect_rx, peers)                  │
+  │    └ removes dead peers from PeerTable on disconnect       │
+  └───────────────────────────────────────────────────────────┘
+     ↓
+  run_accept_loop()                        blocks here
+    loop {
+      conn = accept_connection_with_alpn()
+      remote_id = conn.remote_id()
+      peer_ip = derive_ip(remote_id)
+
+      Case 1: known member
+        → send MemberSync, add to PeerTable, spawn_peer_reader
+
+      Case 2: approved peer
+        → promote to member, send Welcome, broadcast MemberSync,
+          add to PeerTable, spawn_peer_reader
+
+      Case 3: unknown peer
+        → check policy → check IP collision → broadcast MemberApproved
+        → add to members → send Welcome → broadcast MemberSync
+        → add to PeerTable → spawn_peer_reader
+    }
+```
+
+### Joiner startup (`pitopi join`)
+
+```
+cmd_join(node_id, "gaming")
+  → identity::load_or_create()
+  → transport::create_endpoint_with_alpns()
+  → IrohIdentityProvider::new()
+     ↓
+  loop {                                   outer reconnect loop
+    conn = connect_to_peer(coordinator)
+      or try_reconnect_to_known_peers()    DHT → local config fallback
+         ↓
+    enter_mesh(conn, ...)
+      → tun::create(my_ip)                (TunReader, TunWriter)
+      → spawn_tun_writer(TunWriter)
+      → spawn_reconnect_loop(...)          per-peer auto-reconnect
+      → join_mesh_shared(conn, ...)
+      │   ↓
+      │   recv Welcome { members, approved, dht_id }
+      │   → config::save()                persist membership
+      │   → peers.add(coordinator)        add to routing table
+      │   → spawn_peer_reader(coordinator_conn)
+      │   → for each other member:
+      │       connect → send MeshHello → peers.add → spawn_peer_reader
+      │   → spawn control_listener        listens for MemberApproved/MemberSync
+      │   → spawn mesh_acceptor           accepts MeshHello from new peers
+      │
+      → forward::run_mesh(TunReader)       blocks here, forwarding packets
+  }
+```
+
+### Data plane (steady state)
+
+```
+Outgoing packet (app → peer):
+
+  App writes to 100.64.x.x
+    → kernel routes to TUN (/10 netmask captures all 100.64-100.127)
+    → TunReader.read_packet()              [run_mesh]
+    → dest_ip(packet)                      extract IPv4 header bytes 16-19
+    → PeerTable.lookup(dst_ip)             → Connection
+    → conn.send_datagram(packet)           QUIC unreliable datagram
+
+Incoming packet (peer → app):
+
+  conn.read_datagram()                     [spawn_peer_reader, one per peer]
+    → tun_tx.send(packet)                  mpsc channel
+    → TunWriter.write_packet()             [spawn_tun_writer, single instance]
+    → kernel delivers to app via TUN
+```
+
+### Per-peer reconnection
+
+```
+spawn_peer_reader detects conn.read_datagram() error
+  → disconnect_tx.send(DisconnectEvent { endpoint_id, ip })
+     ↓
+  Coordinator (spawn_peer_cleanup):
+    → peers.remove(ip)
+    → done (peer reconnects to us)
+
+  Joiner (spawn_reconnect_loop):
+    → peers.remove(ip)
+    → spawn per-peer reconnect task:
+        loop {
+          sleep(backoff)                   1s → 2s → 4s → ... → 30s cap
+          connect_to_peer(endpoint_id)
+          send MeshHello { identity, ip }
+          peers.add(ip, new_conn)          transparently replaces old entry
+          spawn_peer_reader(new_conn)      feeds back into disconnect_tx
+          return
+        }
+
+  During gap:
+    run_mesh does peers.lookup(ip) → None → packet silently dropped
+  After reconnect:
+    peers.lookup(ip) → new Connection → traffic resumes
+```
+
+### Task topology (per session)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Main thread                                                  │
+│  cmd_create / cmd_join / cmd_up                              │
+│    → run_accept_loop (coord) or run_mesh (joiner)            │
+└─────────────────────────────────────────────────────────────┘
+
+┌──────────────────┐  ┌──────────────────┐  ┌────────────────┐
+│ spawn_tun_writer │  │ spawn_peer_reader│  │ spawn_peer_    │
+│ (1 per session)  │  │ (1 per peer)     │  │ reader (peer B)│
+│                  │  │                  │  │                │
+│ tun_rx → TUN     │  │ conn → tun_tx    │  │ conn → tun_tx  │
+└──────────────────┘  └──────────────────┘  └────────────────┘
+
+┌──────────────────┐  ┌──────────────────┐  ┌────────────────┐
+│ spawn_path_      │  │ spawn_dht_       │  │ spawn_peer_    │
+│ logger           │  │ publisher        │  │ cleanup /      │
+│ (1 per peer)     │  │ (coord only)     │  │ reconnect_loop │
+└──────────────────┘  └──────────────────┘  └────────────────┘
+
+┌──────────────────┐  ┌──────────────────┐
+│ control_listener │  │ mesh_acceptor    │
+│ (joiner only)    │  │ (joiner only)    │
+│ MemberApproved,  │  │ MeshHello,       │
+│ MemberSync       │  │ ReconnectRequest │
+└──────────────────┘  └──────────────────┘
+```
+
+---
+
+## 19. Security Model
 
 ### Transport security
 
@@ -1260,4 +1426,4 @@ Membership records published to the pkarr relay are signed with a per-network Ed
 - **Traffic analysis:** An observer on the network can see that two peers are communicating (via packet timing and size), even though they can't read the content.
 - **Denial of service:** A peer can flood the network with packets. No rate limiting is currently implemented.
 - **Member list confidentiality:** The member list (identities and IPs) is shared with all members. A member can see who else is in the network.
-- **Stale connections:** Disconnected peers' entries remain in the routing table. Packets sent to them fail silently.
+- **Reconnection window:** Packets to a disconnected peer are silently dropped until the reconnect loop establishes a new connection (up to 30 seconds with backoff).
