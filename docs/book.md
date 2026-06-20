@@ -1334,11 +1334,11 @@ The pkarr record contains only a blake3 hash pointer, not the membership data it
 "h,<blake3_hex>"            // blake3 hash of canonical membership data
 ```
 
-The full membership data is serialized as msgpack (sorted by identity for determinism) and stored in each peer's in-memory blob store (`MemStore` from iroh-blobs). Every peer serves blobs via the iroh-blobs protocol (`/iroh-bytes/4` ALPN), so any peer can provide the membership data to joiners. This removes the ~12-member limit that DNS TXT record size imposed.
+The full membership data is serialized as msgpack (sorted by identity for determinism) and stored in each peer's persistent blob store (`FsStore` from iroh-blobs). Every peer serves blobs via the iroh-blobs protocol (`/iroh-bytes/4` ALPN), so any peer can provide the membership data to joiners. This removes the ~12-member limit that DNS TXT record size imposed.
 
 ### Membership data exchange via iroh-blobs
 
-Every peer maintains an in-memory blob store (`MemStore`) and registers a `BlobsProtocol` handler. Whenever membership changes (via Welcome, MemberSync, or direct mutation), the peer computes the canonical msgpack bytes, adds them to the blob store via `blobs().add_slice()`, and the blob becomes available for fetching by any peer that knows the hash.
+Every peer maintains a persistent blob store (`FsStore`) and registers a `BlobsProtocol` handler. Whenever membership changes (via Welcome, MemberSync, or direct mutation), the peer computes the canonical msgpack bytes, adds them to the blob store via `blobs().add_slice()`, and the blob becomes available for fetching by any peer that knows the hash.
 
 Joiners that need the full membership (e.g., when coordinator is offline) fetch it via iroh-blobs:
 

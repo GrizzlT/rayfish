@@ -8,7 +8,7 @@ use iroh::endpoint::{Connection, Endpoint};
 use iroh::protocol::ProtocolHandler;
 use iroh::{EndpointId, SecretKey};
 use iroh::address_lookup::PkarrRelayClient;
-use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, HashAndFormat};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -75,7 +75,7 @@ pub struct DaemonState {
     tun_tx: mpsc::Sender<Vec<u8>>,
     networks: Arc<std::sync::RwLock<HashMap<String, NetworkHandle>>>,
     shutdown_token: CancellationToken,
-    blob_store: MemStore,
+    blob_store: FsStore,
     blobs_proto: BlobsProtocol,
 }
 
@@ -501,7 +501,13 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
     alpns.push(iroh_blobs::protocol::ALPN.to_vec());
     let ep = transport::create_endpoint_with_alpns(key, alpns).await?;
 
-    let blob_store = MemStore::new();
+    let blobs_dir = dirs::config_dir()
+        .context("no config directory")?
+        .join("pitopi")
+        .join("blobs");
+    std::fs::create_dir_all(&blobs_dir)?;
+    let blob_store = FsStore::load(&blobs_dir).await
+        .context("failed to open blob store")?;
     let blobs_proto = BlobsProtocol::new(&blob_store, None);
 
     // Single TUN for all networks
@@ -715,7 +721,7 @@ fn spawn_coordinator_accept(
     stats: Arc<Stats>,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
     dht_id: Option<String>,
-    blob_store: MemStore,
+    blob_store: FsStore,
     blobs_proto: BlobsProtocol,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -756,7 +762,7 @@ async fn run_accept_loop(
     stats: Arc<Stats>,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
     dht_id: Option<String>,
-    blob_store: MemStore,
+    blob_store: FsStore,
     blobs_proto: BlobsProtocol,
 ) -> Result<()> {
     let self_member = {
@@ -947,7 +953,7 @@ async fn join_mesh_shared(
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<Stats>,
-    blob_store: MemStore,
+    blob_store: FsStore,
     blobs_proto: BlobsProtocol,
 ) -> Result<Arc<std::sync::RwLock<NetworkState>>> {
     let my_identity = identity.local_identity();

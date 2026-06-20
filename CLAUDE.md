@@ -78,7 +78,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 
 **Gatekeeper model:** coordinator approves identities and broadcasts MemberApproved. Any peer can then welcome an approved identity when it connects. The coordinator doesn't need to be online when the approved peer actually joins.
 
-**DHT membership:** coordinator derives a per-network signing key via `blake3::derive_key` from its secret key + network name. Publishes a blake3 hash of the canonical membership data (msgpack-serialized, sorted by identity) as a signed DNS TXT record to iroh's pkarr relay (`dns.iroh.link/pkarr`). The pkarr record contains only the hash — not member entries — so room size is not limited by DNS record size. Peers learn the DHT ID from Welcome/MemberSync messages, persist it in config. Every peer stores the membership blob in an in-memory iroh-blobs store (`MemStore`) and serves it via the iroh-blobs protocol (`/iroh-bytes/4` ALPN). When the coordinator is offline, joiners resolve the hash from pkarr, then fetch the membership blob from any online peer using iroh-blobs, verifying the blake3 hash matches before trusting the data.
+**DHT membership:** coordinator derives a per-network signing key via `blake3::derive_key` from its secret key + network name. Publishes a blake3 hash of the canonical membership data (msgpack-serialized, sorted by identity) as a signed DNS TXT record to iroh's pkarr relay (`dns.iroh.link/pkarr`). The pkarr record contains only the hash — not member entries — so room size is not limited by DNS record size. Peers learn the DHT ID from Welcome/MemberSync messages, persist it in config. Every peer stores the membership blob in an in-memory iroh-blobs store (`FsStore`) and serves it via the iroh-blobs protocol (`/iroh-bytes/4` ALPN). When the coordinator is offline, joiners resolve the hash from pkarr, then fetch the membership blob from any online peer using iroh-blobs, verifying the blake3 hash matches before trusting the data.
 
 **Reconnection:** per-peer reader detects connection drop → sends DisconnectEvent on mpsc channel → coordinator side removes dead peer from PeerTable (peers reconnect to it); joiner side removes dead peer and spawns reconnect task with exponential backoff (1s–30s) → on success, sends MeshHello, adds new connection to PeerTable, spawns fresh peer reader. Packets to the peer drop silently during the gap.
 
@@ -91,7 +91,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 ## Key Dependencies
 
 - `iroh` — P2P QUIC transport with NAT traversal and relay fallback
-- `iroh-blobs` — content-addressed blob transfer for membership data exchange (MemStore, BlobsProtocol)
+- `iroh-blobs` — content-addressed blob transfer for membership data exchange (FsStore, BlobsProtocol)
 - `iroh-dns` — pkarr `SignedPacket` for DHT membership records
 - `blake3` — key derivation for per-network DHT signing keys, membership data hashing
 - `tun` — cross-platform TUN device (macOS utun, Linux /dev/net/tun)
