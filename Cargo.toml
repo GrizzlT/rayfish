@@ -14,6 +14,7 @@ futures = "0.3"
 iroh = "1"
 iroh-dns = "1"
 iroh-blobs = { version = "0.103", default-features = false, features = ["fs-store"] }
+rand = "0.9"
 rmp-serde = "1"
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }

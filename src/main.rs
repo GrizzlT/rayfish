@@ -6,6 +6,7 @@ mod forward;
 mod identity;
 mod ipc;
 mod membership;
+mod network_name;
 mod peers;
 mod room_code;
 mod shutdown;
