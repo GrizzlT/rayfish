@@ -20,6 +20,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use iroh::EndpointId;
+use iroh::SecretKey;
+use iroh::address_lookup::PkarrRelayClient;
 use iroh::endpoint::Endpoint;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -150,6 +152,39 @@ async fn main() -> Result<()> {
     }
 }
 
+fn spawn_dht_publisher(
+    client: PkarrRelayClient,
+    membership_key: SecretKey,
+    state: Arc<std::sync::RwLock<NetworkState>>,
+    notify: Arc<tokio::sync::Notify>,
+    token: CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            // Read current state and publish
+            let (members_snapshot, approved_snapshot) = {
+                let s = state.read().unwrap();
+                (s.members.clone(), s.approved.clone())
+            };
+            match dht::publish_membership(
+                &client, &membership_key, &members_snapshot, &approved_snapshot,
+            )
+            .await
+            {
+                Ok(()) => tracing::info!("published membership to DHT"),
+                Err(e) => tracing::warn!(error = %e, "failed to publish membership to DHT"),
+            }
+
+            // Wait for notification or periodic republish (5 min)
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(300)) => {},
+            }
+        }
+    });
+}
+
 async fn cmd_create(
     name: &str,
     mode: GroupMode,
@@ -158,6 +193,9 @@ async fn cmd_create(
 ) -> Result<()> {
     let key = identity::load_or_create()?;
     let public_key = key.public();
+    // Derive membership key and DHT ID before key is consumed by endpoint builder
+    let membership_key = dht::derive_membership_key(&key, name);
+    let dht_id = dht::membership_dht_id(&key, name).to_string();
     let alpn = transport::network_alpn(name);
     let ep = transport::create_endpoint_with_alpns(key, vec![alpn.clone()]).await?;
 
@@ -169,6 +207,7 @@ async fn cmd_create(
     tracing::info!(name = %name, mode = ?mode, "network created");
     tracing::info!(ip = %my_ip, "your virtual IP");
     tracing::info!(room_code = %room_code, "share this room code");
+    tracing::info!(dht_id = %dht_id, "membership DHT ID");
 
     let mut member_list = MemberList::new();
     member_list
@@ -185,7 +224,7 @@ async fn cmd_create(
     };
 
     let mut app_config = config::load()?;
-    save_network_config(&mut app_config, name, &ep, mode, Some(my_ip), &state)?;
+    save_network_config(&mut app_config, name, &ep, mode, Some(my_ip), &state, Some(dht_id.clone()))?;
 
     let tun_dev = tun::TunDevice::create(my_ip).context("failed to create TUN device")?;
 
@@ -203,8 +242,20 @@ async fn cmd_create(
 
     let state = Arc::new(std::sync::RwLock::new(state));
 
+    let pkarr_client = dht::create_pkarr_client(&ep)?;
+    let dht_notify = Arc::new(tokio::sync::Notify::new());
+
+    spawn_dht_publisher(
+        pkarr_client,
+        membership_key,
+        state.clone(),
+        dht_notify.clone(),
+        token.clone(),
+    );
+
     run_accept_loop(
         &ep, &alpn, &identity, &*policy, state, peers, tun_tx, token, stats,
+        Some(dht_notify), Some(dht_id),
     )
     .await
 }
@@ -220,6 +271,8 @@ async fn run_accept_loop(
     tun_tx: mpsc::Sender<Vec<u8>>,
     token: CancellationToken,
     stats: Arc<Stats>,
+    dht_notify: Option<Arc<tokio::sync::Notify>>,
+    dht_id: Option<String>,
 ) -> Result<()> {
     let self_member = {
         let s = state.read().unwrap();
@@ -266,8 +319,9 @@ async fn run_accept_loop(
             let token_c = token.clone();
             let stats_c = stats.clone();
             let tun_tx_c = tun_tx.clone();
+            let dht_id_c = dht_id.clone();
             tokio::spawn(async move {
-                send_member_sync(&conn, &members).await;
+                send_member_sync(&conn, &members, dht_id_c).await;
                 forward::spawn_peer_reader(conn, tun_tx_c, token_c, stats_c);
             });
             continue;
@@ -292,6 +346,10 @@ async fn run_accept_loop(
                     .expect("was approved, no collision");
             }
 
+            if let Some(notify) = &dht_notify {
+                notify.notify_one();
+            }
+
             let (members, approved) = {
                 let s = state.read().unwrap();
                 let m: Vec<Member> = s.members.all().into_iter().cloned().collect();
@@ -306,14 +364,14 @@ async fn run_accept_loop(
                     &ControlMsg::Welcome {
                         members: members.clone(),
                         approved,
-                        membership_dht_id: None,
+                        membership_dht_id: dht_id.clone(),
                     },
                 )
                 .await;
             }
 
             // Broadcast MemberSync to existing peers
-            broadcast_member_sync(&peers, &members, Some(peer_ip)).await;
+            broadcast_member_sync(&peers, &members, Some(peer_ip), dht_id.clone()).await;
 
             peers.add(peer_ip, conn.clone(), remote_id);
             let token_c = token.clone();
@@ -404,6 +462,10 @@ async fn run_accept_loop(
 
         tracing::info!(ip = %peer_ip, "new member approved and joined");
 
+        if let Some(notify) = &dht_notify {
+            notify.notify_one();
+        }
+
         // Send Welcome to new peer
         if let Ok((mut send, _)) = conn.open_bi().await {
             let _ = control::send_msg(
@@ -411,14 +473,14 @@ async fn run_accept_loop(
                 &ControlMsg::Welcome {
                     members: members.clone(),
                     approved,
-                    membership_dht_id: None,
+                    membership_dht_id: dht_id.clone(),
                 },
             )
             .await;
         }
 
         // Broadcast MemberSync to existing peers
-        broadcast_member_sync(&peers, &members, Some(peer_ip)).await;
+        broadcast_member_sync(&peers, &members, Some(peer_ip), dht_id.clone()).await;
 
         peers.add(peer_ip, conn.clone(), remote_id);
         let token_c = token.clone();
@@ -430,13 +492,17 @@ async fn run_accept_loop(
     }
 }
 
-async fn send_member_sync(conn: &iroh::endpoint::Connection, members: &[Member]) {
+async fn send_member_sync(
+    conn: &iroh::endpoint::Connection,
+    members: &[Member],
+    dht_id: Option<String>,
+) {
     if let Ok((mut send, _)) = conn.open_bi().await {
         let _ = control::send_msg(
             &mut send,
             &ControlMsg::MemberSync {
                 members: members.to_vec(),
-                membership_dht_id: None,
+                membership_dht_id: dht_id,
             },
         )
         .await;
@@ -447,10 +513,11 @@ async fn broadcast_member_sync(
     peers: &PeerTable,
     members: &[Member],
     exclude_ip: Option<Ipv4Addr>,
+    dht_id: Option<String>,
 ) {
     let msg = ControlMsg::MemberSync {
         members: members.to_vec(),
-        membership_dht_id: None,
+        membership_dht_id: dht_id,
     };
     for (ip, conn) in peers.all_connections() {
         if Some(ip) == exclude_ip {
@@ -819,7 +886,7 @@ async fn join_mesh_shared(
                                                     peers.add(ip, conn.clone(), peer_identity);
                                                     forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
                                                     // Broadcast updated member list
-                                                    broadcast_member_sync(&peers, &members, Some(ip)).await;
+                                                    broadcast_member_sync(&peers, &members, Some(ip), None).await;
                                                 } else if is_member {
                                                     tracing::info!(peer_ip = %ip, "known peer reconnecting via mesh");
                                                     peers.add(ip, conn.clone(), peer_identity);
@@ -923,6 +990,7 @@ fn save_network_config(
     mode: GroupMode,
     my_ip: Option<Ipv4Addr>,
     state: &NetworkState,
+    dht_id: Option<String>,
 ) -> Result<()> {
     let member_entries: Vec<config::MemberEntry> = state
         .members
@@ -954,7 +1022,7 @@ fn save_network_config(
             my_ip,
             members: member_entries,
             approved: approved_entries,
-            membership_dht_id: None,
+            membership_dht_id: dht_id,
         },
     );
     config::save(app_config)
@@ -1038,6 +1106,8 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
 
     let key = identity::load_or_create()?;
     let public_key = key.public();
+    // Clone key before it is consumed by the endpoint builder; needed for DHT derivation
+    let key_for_dht = key.clone();
 
     let alpns: Vec<Vec<u8>> = app_config
         .networks
@@ -1104,6 +1174,9 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
             let peers = peers.clone();
             let tun_tx = tun_tx.clone();
             let identity = IrohIdentityProvider::new(ep.id());
+            // Derive membership key and DHT ID for this network
+            let membership_key = dht::derive_membership_key(&key_for_dht, &name);
+            let dht_id = dht::membership_dht_id(&key_for_dht, &name).to_string();
             handles.push(tokio::spawn(async move {
                 tracing::info!(network = %name, "starting coordinator...");
                 let policy = policy_for_mode(mode);
@@ -1120,8 +1193,26 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
                     approved: ApprovedList::new(),
                 }));
                 let alpn = transport::network_alpn(&name);
+
+                let dht_notify = Arc::new(tokio::sync::Notify::new());
+                match dht::create_pkarr_client(&ep) {
+                    Ok(pkarr_client) => {
+                        spawn_dht_publisher(
+                            pkarr_client,
+                            membership_key,
+                            state.clone(),
+                            dht_notify.clone(),
+                            token.clone(),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(network = %name, error = %e, "failed to create pkarr client, DHT publishing disabled");
+                    }
+                }
+
                 if let Err(e) = run_accept_loop(
                     &ep, &alpn, &identity, &*policy, state, peers, tun_tx, token, stats,
+                    Some(dht_notify), Some(dht_id),
                 )
                 .await
                 {
