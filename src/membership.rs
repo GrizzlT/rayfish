@@ -119,6 +119,74 @@ impl MemberList {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedEntry {
+    pub identity: String,
+    pub ip: Ipv4Addr,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovedList {
+    entries: HashMap<String, ApprovedEntry>,
+}
+
+impl ApprovedList {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    pub fn approve(&mut self, entry: ApprovedEntry, members: &MemberList) -> Result<(), IpCollision> {
+        // Check collision against existing members
+        if let Some(existing) = members.get_by_ip(entry.ip) {
+            if existing.identity != entry.identity {
+                return Err(IpCollision {
+                    ip: entry.ip,
+                    existing_identity: existing.identity.clone(),
+                    new_identity: entry.identity.clone(),
+                });
+            }
+        }
+        // Check collision within approved list
+        if let Some(existing) = self.get_by_ip(entry.ip) {
+            if existing.identity != entry.identity {
+                return Err(IpCollision {
+                    ip: entry.ip,
+                    existing_identity: existing.identity.clone(),
+                    new_identity: entry.identity.clone(),
+                });
+            }
+        }
+        self.entries.insert(entry.identity.clone(), entry);
+        Ok(())
+    }
+
+    pub fn is_approved(&self, identity: &str) -> bool {
+        self.entries.contains_key(identity)
+    }
+
+    pub fn remove(&mut self, identity: &str) -> Option<ApprovedEntry> {
+        self.entries.remove(identity)
+    }
+
+    pub fn all(&self) -> Vec<&ApprovedEntry> {
+        self.entries.values().collect()
+    }
+
+    pub fn get_by_ip(&self, ip: Ipv4Addr) -> Option<&ApprovedEntry> {
+        self.entries.values().find(|e| e.ip == ip)
+    }
+
+    pub fn from_entries(entries: Vec<ApprovedEntry>) -> Self {
+        let mut list = Self::new();
+        for e in entries {
+            list.entries.insert(e.identity.clone(), e);
+        }
+        list
+    }
+}
+
 pub trait MembershipPolicy: Send + Sync {
     fn can_authorize(&self, acceptor: &Member) -> bool;
 }
@@ -392,5 +460,89 @@ mod tests {
         };
         assert!(policy.can_authorize(&coordinator));
         assert!(!policy.can_authorize(&regular));
+    }
+
+    #[test]
+    fn test_approved_list_add_and_check() {
+        let mut list = ApprovedList::new();
+        let entry = ApprovedEntry {
+            identity: "peer-x".to_string(),
+            ip: Ipv4Addr::new(100, 64, 5, 10),
+        };
+        let members = MemberList::new();
+        list.approve(entry, &members).unwrap();
+        assert!(list.is_approved("peer-x"));
+        assert!(!list.is_approved("peer-y"));
+    }
+
+    #[test]
+    fn test_approved_list_collision_with_member() {
+        let mut approved = ApprovedList::new();
+        let mut members = MemberList::new();
+        members.add(Member {
+            identity: "existing".to_string(),
+            ip: Ipv4Addr::new(100, 64, 5, 10),
+            is_coordinator: false,
+        }).unwrap();
+        let entry = ApprovedEntry {
+            identity: "new-peer".to_string(),
+            ip: Ipv4Addr::new(100, 64, 5, 10),
+        };
+        assert!(approved.approve(entry, &members).is_err());
+    }
+
+    #[test]
+    fn test_approved_list_collision_within_approved() {
+        let mut approved = ApprovedList::new();
+        let members = MemberList::new();
+        approved.approve(ApprovedEntry {
+            identity: "peer-a".to_string(),
+            ip: Ipv4Addr::new(100, 64, 5, 10),
+        }, &members).unwrap();
+        let result = approved.approve(ApprovedEntry {
+            identity: "peer-b".to_string(),
+            ip: Ipv4Addr::new(100, 64, 5, 10),
+        }, &members);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_approved_list_same_identity_is_idempotent() {
+        let mut approved = ApprovedList::new();
+        let members = MemberList::new();
+        approved.approve(ApprovedEntry {
+            identity: "peer-a".to_string(),
+            ip: Ipv4Addr::new(100, 64, 5, 10),
+        }, &members).unwrap();
+        approved.approve(ApprovedEntry {
+            identity: "peer-a".to_string(),
+            ip: Ipv4Addr::new(100, 64, 5, 10),
+        }, &members).unwrap();
+        assert_eq!(approved.all().len(), 1);
+    }
+
+    #[test]
+    fn test_approved_list_remove() {
+        let mut approved = ApprovedList::new();
+        let members = MemberList::new();
+        approved.approve(ApprovedEntry {
+            identity: "peer-a".to_string(),
+            ip: Ipv4Addr::new(100, 64, 5, 10),
+        }, &members).unwrap();
+        let removed = approved.remove("peer-a");
+        assert!(removed.is_some());
+        assert!(!approved.is_approved("peer-a"));
+    }
+
+    #[test]
+    fn test_approved_list_from_entries() {
+        let entries = vec![
+            ApprovedEntry { identity: "a".to_string(), ip: Ipv4Addr::new(100, 64, 0, 2) },
+            ApprovedEntry { identity: "b".to_string(), ip: Ipv4Addr::new(100, 64, 0, 3) },
+        ];
+        let list = ApprovedList::from_entries(entries);
+        assert!(list.is_approved("a"));
+        assert!(list.is_approved("b"));
+        assert_eq!(list.all().len(), 2);
     }
 }
