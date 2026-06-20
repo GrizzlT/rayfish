@@ -1229,12 +1229,14 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
                                         match transport::connect_to_peer_with_alpn(&ep, member.identity, &alpn).await {
                                             Ok(conn) => {
                                                 tracing::info!(network = %name, peer_ip = %member.ip, "connected via DHT-resolved peer");
-                                                if let Err(e) = join_mesh_shared(
-                                                    conn, &ep, &name, &identity, &alpn, peers, tun_tx, token, stats,
+                                                match join_mesh_shared(
+                                                    conn, &ep, &name, &identity, &alpn, peers.clone(), tun_tx.clone(), token.clone(), stats.clone(),
                                                 ).await {
-                                                    tracing::warn!(network = %name, error = %e, "join_mesh_shared failed (DHT path)");
+                                                    Ok(()) => return,
+                                                    Err(e) => {
+                                                        tracing::warn!(network = %name, error = %e, "join_mesh_shared failed (DHT path), falling back to coordinator");
+                                                    }
                                                 }
-                                                return;
                                             }
                                             Err(e) => {
                                                 tracing::debug!(peer_ip = %member.ip, error = %e, "DHT-resolved peer unavailable");

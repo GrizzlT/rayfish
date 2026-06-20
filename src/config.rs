@@ -293,4 +293,23 @@ coordinator_id = "19bf5a58ddce79c97edefc3e5a9e1eae5b41e55d03cf5de8d71b5c7b70cadb
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.networks[0].membership_dht_id, None);
     }
+
+    #[test]
+    fn test_deserialize_minimal() {
+        let coord_id = iroh::SecretKey::generate().public();
+        let toml_str = format!(
+            r#"
+[[networks]]
+name = "test"
+coordinator_id = "{coord_id}"
+"#
+        );
+        let config: AppConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.networks.len(), 1);
+        assert_eq!(config.networks[0].name, "test");
+        assert_eq!(config.networks[0].group_mode, GroupMode::Restricted);
+        assert!(config.networks[0].members.is_empty());
+        assert!(config.networks[0].approved.is_empty());
+        assert_eq!(config.networks[0].membership_dht_id, None);
+    }
 }

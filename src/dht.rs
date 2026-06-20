@@ -344,4 +344,17 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no membership records found"));
     }
+
+    #[test]
+    fn test_decode_rejects_unknown_tag() {
+        let key = SecretKey::generate();
+        let packet = SignedPacket::from_txt_strings(
+            &key,
+            "_pitopi",
+            vec!["v1", "x,some_identity"],
+            300,
+        ).unwrap();
+        let result = decode_membership_record(&packet);
+        assert!(result.is_err());
+    }
 }
