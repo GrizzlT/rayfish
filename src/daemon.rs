@@ -215,10 +215,22 @@ impl DaemonState {
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
             tasks.push(spawn_dht_publisher(
-                pkarr_client,
+                pkarr_client.clone(),
                 membership_key,
                 state.clone(),
                 dht_notify.clone(),
+                cancel.clone(),
+            ));
+
+            // Seed list publisher
+            let seed_notify = Arc::new(tokio::sync::Notify::new());
+            tasks.push(spawn_seed_list_publisher(
+                pkarr_client,
+                network_secret,
+                self.endpoint.id(),
+                self.peers.clone(),
+                name.clone(),
+                seed_notify,
                 cancel.clone(),
             ));
         }
@@ -418,6 +430,21 @@ impl DaemonState {
                 net.membership_dht_pubkey = Some(membership_dht_pubkey.to_string());
             }
             let _ = config::save(&app_config);
+        }
+
+        // Membership poller — periodically checks for membership changes via DHT
+        let mut tasks = tasks;
+        if let Ok(poller_client) = dht::create_pkarr_client(&self.endpoint) {
+            tasks.push(spawn_membership_poller(
+                poller_client,
+                membership_dht_pubkey,
+                state.clone(),
+                self.endpoint.clone(),
+                self.blob_store.clone(),
+                self.peers.clone(),
+                name.to_string(),
+                cancel.clone(),
+            ));
         }
 
         let handle = NetworkHandle {
@@ -976,6 +1003,162 @@ fn spawn_dht_publisher(
                 _ = token.cancelled() => break,
                 _ = notify.notified() => {},
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {},
+            }
+        }
+    })
+}
+
+fn spawn_seed_list_publisher(
+    client: PkarrRelayClient,
+    network_secret: [u8; 32],
+    endpoint_id: EndpointId,
+    peers: PeerTable,
+    network_name: String,
+    notify: Arc<tokio::sync::Notify>,
+    token: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let key = SecretKey::from_bytes(&network_secret);
+        loop {
+            let mut peer_ids: Vec<EndpointId> = peers
+                .peers_for_network(&network_name)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            peer_ids.push(endpoint_id);
+            peer_ids.sort_by_key(|id| id.to_string());
+            peer_ids.dedup();
+
+            match dht::publish_seed_list(&client, &key, &peer_ids).await {
+                Ok(()) => tracing::info!(count = peer_ids.len(), "published seed list"),
+                Err(e) => tracing::warn!(error = %e, "failed to publish seed list"),
+            }
+
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(300)) => {},
+            }
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_membership_poller(
+    client: PkarrRelayClient,
+    membership_dht_pubkey: EndpointId,
+    state: Arc<std::sync::RwLock<NetworkState>>,
+    endpoint: Endpoint,
+    blob_store: FsStore,
+    peers: PeerTable,
+    network_name: String,
+    token: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+            }
+
+            let current_hash = {
+                let s = state.read().unwrap();
+                s.snapshot.as_ref().map(|snap| snap.hash.clone())
+            };
+
+            let remote_hash = match dht::resolve_membership_hash(&client, membership_dht_pubkey).await {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::debug!(error = %e, "membership poll failed");
+                    continue;
+                }
+            };
+
+            if current_hash.as_deref() == Some(remote_hash.as_str()) {
+                continue;
+            }
+
+            tracing::info!(old = ?current_hash, new = %remote_hash, "membership changed");
+
+            let blob_hash = match remote_hash.parse::<blake3::Hash>() {
+                Ok(h) => iroh_blobs::Hash::from_bytes(*h.as_bytes()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "invalid membership hash");
+                    continue;
+                }
+            };
+
+            // Try fetching from any connected peer
+            let peer_ids: Vec<EndpointId> = peers
+                .peers_for_network(&network_name)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+
+            let mut new_data = None;
+            for peer_id in &peer_ids {
+                let conn = match transport::connect_to_peer_with_alpn(
+                    &endpoint, *peer_id, iroh_blobs::protocol::ALPN,
+                ).await {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if blob_store.remote().fetch(
+                    conn, HashAndFormat::raw(blob_hash),
+                ).await.is_err() {
+                    continue;
+                }
+                match blob_store.blobs().get_bytes(blob_hash).await {
+                    Ok(bytes) => {
+                        match rmp_serde::from_slice::<crate::membership::MembershipData>(&bytes) {
+                            Ok(data) => { new_data = Some(data); break; }
+                            Err(_) => continue,
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+
+            let Some(data) = new_data else {
+                tracing::warn!("could not fetch updated membership from any peer");
+                continue;
+            };
+
+            // Reconcile: find removed peers
+            let old_members: Vec<EndpointId> = {
+                let s = state.read().unwrap();
+                s.members.all().iter().map(|m| m.identity).collect()
+            };
+            let new_member_ids: std::collections::HashSet<EndpointId> =
+                data.members.iter().map(|m| m.identity).collect();
+
+            for old_id in &old_members {
+                if !new_member_ids.contains(old_id) {
+                    let s = state.read().unwrap();
+                    if let Some(member) = s.members.get(old_id) {
+                        peers.remove(&member.ip);
+                        tracing::info!(peer = %old_id.fmt_short(), "removed kicked peer");
+                    }
+                }
+            }
+
+            // Check if we were removed
+            let my_id = endpoint.id();
+            if !new_member_ids.contains(&my_id)
+                && !data.approved.iter().any(|a| a.identity == my_id)
+            {
+                tracing::warn!("we have been removed from the network");
+                break;
+            }
+
+            // Update state
+            {
+                let mut s = state.write().unwrap();
+                s.members = MemberList::from_members(data.members);
+                s.approved = ApprovedList::from_entries(data.approved);
+                s.network_secret = data.network_secret;
+                s.membership_signing_key = data.membership_signing_key;
+                s.refresh_snapshot();
             }
         }
     })
