@@ -68,15 +68,16 @@ pub struct PeerStatus {
     pub ip: Ipv4Addr,
 }
 
-pub fn socket_path() -> Result<PathBuf> {
-    Ok(dirs::config_dir()
-        .context("could not determine config directory")?
-        .join("pitopi")
-        .join("pitopi.sock"))
+pub fn socket_path() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        PathBuf::from("/var/run/pitopi.sock")
+    } else {
+        PathBuf::from("/var/run/pitopi/pitopi.sock")
+    }
 }
 
 pub async fn connect() -> Result<UnixStream> {
-    let path = socket_path()?;
+    let path = socket_path();
     UnixStream::connect(&path)
         .await
         .context("daemon not running — start it with: sudo pitopi daemon")

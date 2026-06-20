@@ -421,7 +421,10 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
     }
 
     // IPC server
-    let socket_path = ipc::socket_path()?;
+    let socket_path = ipc::socket_path();
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
     }

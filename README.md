@@ -70,7 +70,7 @@ pitopi uninstall-service            Remove the system service
 
 ## Daemon architecture
 
-Pitopi uses a daemon/client split similar to Tailscale. The daemon (`pitopi daemon`) is a long-lived root process that owns the iroh endpoint, TUN device, and all peer connections. CLI commands talk to it over a Unix socket (`~/.config/pitopi/pitopi.sock`).
+Pitopi uses a daemon/client split similar to Tailscale. The daemon (`pitopi daemon`) is a long-lived root process that owns the iroh endpoint, TUN device, and all peer connections. CLI commands talk to it over a Unix socket (`/var/run/pitopi/pitopi.sock`).
 
 You can dynamically create, join, and leave networks while the daemon is running — no restart needed.
 

@@ -218,7 +218,7 @@ Before using any network commands, start the daemon:
 sudo pitopi daemon
 ```
 
-The daemon is a long-lived process that owns the iroh endpoint, TUN device, and all peer connections. It listens for commands on a Unix socket at `~/.config/pitopi/pitopi.sock`. On startup, it restores all previously saved networks from config.
+The daemon is a long-lived process that owns the iroh endpoint, TUN device, and all peer connections. It listens for commands on a Unix socket at `/var/run/pitopi/pitopi.sock`. On startup, it restores all previously saved networks from config.
 
 `pitopi up` is an alias for `pitopi daemon`.
 
@@ -1452,7 +1452,7 @@ When a user runs `sudo pitopi daemon` (or `sudo pitopi up`):
 
 4. **Start accept loop.** A shared accept loop dispatches incoming connections by ALPN to the correct network's handler.
 
-5. **Start IPC listener.** Bind the Unix socket at `~/.config/pitopi/pitopi.sock` and accept client commands.
+5. **Start IPC listener.** Bind the Unix socket at `/var/run/pitopi/pitopi.sock` and accept client commands.
 
 6. **Block on shutdown.** Wait for `CancellationToken` (SIGINT/SIGTERM or `pitopi down`).
 
@@ -1496,7 +1496,7 @@ Each active network has:
 
 ### IPC protocol
 
-The Unix socket at `~/.config/pitopi/pitopi.sock` uses the same wire format as the peer-to-peer control protocol: 4-byte big-endian length prefix + JSON body. The types are defined in `src/ipc.rs`:
+The Unix socket at `/var/run/pitopi/pitopi.sock` uses the same wire format as the peer-to-peer control protocol: 4-byte big-endian length prefix + JSON body. The types are defined in `src/ipc.rs`:
 
 - **`IpcRequest`** — `Create`, `Join`, `Leave`, `Status`, `Shutdown`
 - **`IpcResponse`** — `Ok`, `Error`, `Created`, `Joined`, `Status`
