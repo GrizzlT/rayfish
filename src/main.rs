@@ -78,7 +78,7 @@ enum Command {
         /// The three-word network name (e.g., gentle-amber-fox)
         name: String,
     },
-    /// List saved networks
+    /// List networks (queries daemon if running, falls back to saved config)
     List,
     /// Leave a network (remove from saved config)
     Leave {
@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::List => cmd_list(),
+        Command::List => cmd_list().await,
         Command::Leave { name } => ipc_leave(&name).await,
         Command::Create { mode } => ipc_create(mode).await,
         Command::Join { name } => ipc_join(&name).await,
@@ -196,10 +196,36 @@ async fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Client-side commands (no daemon needed)
+// Client-side commands (daemon optional)
 // ---------------------------------------------------------------------------
 
-fn cmd_list() -> Result<()> {
+async fn cmd_list() -> Result<()> {
+    if let Ok(mut stream) = ipc::connect().await {
+        ipc::send_msg(&mut stream, &ipc::IpcRequest::Status).await?;
+        let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+        match resp {
+            ipc::IpcResponse::Status { networks, .. } => {
+                if networks.is_empty() {
+                    println!("No active networks.");
+                } else {
+                    for net in &networks {
+                        let role = match &net.role {
+                            ipc::NetworkRole::Coordinator => "coordinator",
+                            ipc::NetworkRole::Member => "member",
+                        };
+                        println!(
+                            "{} (role: {}, ip: {}, peers: {})",
+                            net.name, role, net.my_ip, net.peers.len(),
+                        );
+                    }
+                }
+            }
+            ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+            other => eprintln!("Unexpected response: {:?}", other),
+        }
+        return Ok(());
+    }
+
     let app_config = config::load()?;
     if app_config.networks.is_empty() {
         println!("No saved networks.");
@@ -209,18 +235,10 @@ fn cmd_list() -> Result<()> {
         let ip_str = net
             .my_ip
             .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "coordinator".to_string());
-        let coordinator = net.members.iter()
-            .find(|m| m.is_coordinator)
-            .map(|m| m.identity.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| "?".to_string());
         println!(
-            "{} (coordinator: {}, ip: {}, members: {}, mode: {:?})",
-            net.name,
-            coordinator,
-            ip_str,
-            net.members.len(),
-            net.group_mode,
+            "{} (ip: {}, members: {}, mode: {:?})",
+            net.name, ip_str, net.members.len(), net.group_mode,
         );
     }
     Ok(())

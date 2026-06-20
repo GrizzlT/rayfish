@@ -317,7 +317,7 @@ TUN devices are virtual network interfaces. Creating them requires root privileg
 | `pitopi nuke NAME [--force]` | Publish empty records to DHT then leave | Yes |
 | `pitopi status` | Show active networks, peers, and IPs | Yes |
 | `pitopi down` | Shut down the daemon | Yes |
-| `pitopi list` | Show saved networks from config file | No |
+| `pitopi list` | Show networks (queries daemon if running) | No |
 | `pitopi acl NAME tag TAG PEERS…` | Assign a tag to one or more peers | Yes |
 | `pitopi acl NAME untag TAG PEERS…` | Remove a tag from peers | Yes |
 | `pitopi acl NAME allow SRC DST` | Add an allow rule | Yes |

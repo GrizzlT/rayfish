@@ -121,7 +121,7 @@ ACL rules are distributed to all peers via iroh-blobs and enforced at the packet
 | `pitopi nuke NAME [--force]` | Publish empty records to DHT then leave | Yes |
 | `pitopi status` | Show active networks, peers, and IPs | Yes |
 | `pitopi down` | Shut down the daemon | Yes |
-| `pitopi list` | Show saved networks from config file | No |
+| `pitopi list` | Show networks (queries daemon if running) | No |
 | `pitopi acl NAME tag TAG PEERS…` | Assign a tag to peers (coordinator) | Yes |
 | `pitopi acl NAME allow SRC DST` | Add an allow rule (coordinator) | Yes |
 | `pitopi acl NAME show` | Display current ACL state | Yes |

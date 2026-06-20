@@ -33,8 +33,8 @@ cargo -q run -- acl gentle-amber-fox remove 0
 cargo -q run -- acl gentle-amber-fox show
 cargo -q run -- acl gentle-amber-fox apply   # re-publish current ACL to peers
 
-# Standalone (no daemon needed)
-cargo -q run -- list                # show saved networks from config
+# Standalone (daemon optional — queries daemon if running, falls back to saved config)
+cargo -q run -- list                # show networks
 
 # System service
 sudo cargo -q run -- install-service
