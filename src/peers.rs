@@ -34,6 +34,10 @@ impl PeerTable {
         self.inner.read().unwrap().get(ip).map(|e| e.conn.clone())
     }
 
+    pub fn remove(&self, ip: &Ipv4Addr) {
+        self.inner.write().unwrap().remove(ip);
+    }
+
     pub fn all_connections(&self) -> Vec<(Ipv4Addr, Connection)> {
         self.inner
             .read()

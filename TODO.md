@@ -39,7 +39,7 @@ Go from 2 peers to N peers in a single network.
 
 - [x] Peer disconnect detection — remove from routing table, notify remaining peers via control channel
 - [x] Replicate peer list to all members — any peer holds full state, not just the coordinator
-- [ ] If coordinator goes offline, existing mesh stays connected; any peer can accept new joiners
+- [x] If coordinator goes offline, existing mesh stays connected; any peer can accept new joiners (via gatekeeper model + DHT membership discovery)
 - [x] Any peer can share the network ID (creator's EndpointId) to invite others
 
 ## Phase 3: Multi-network support

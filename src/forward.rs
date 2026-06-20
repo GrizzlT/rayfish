@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
+use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -10,6 +11,11 @@ use tokio_util::sync::CancellationToken;
 use crate::peers::PeerTable;
 use crate::stats::Stats;
 use crate::tun::{TunReader, TunWriter};
+
+pub struct DisconnectEvent {
+    pub endpoint_id: EndpointId,
+    pub ip: Ipv4Addr,
+}
 
 fn dest_ip(packet: &[u8]) -> Option<Ipv4Addr> {
     if packet.len() < 20 {
@@ -62,7 +68,10 @@ pub async fn run_mesh(
 
 pub fn spawn_peer_reader(
     conn: Connection,
+    peer_id: EndpointId,
+    peer_ip: Ipv4Addr,
     tun_tx: mpsc::Sender<Vec<u8>>,
+    disconnect_tx: mpsc::Sender<DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<Stats>,
 ) -> tokio::task::JoinHandle<()> {
@@ -79,7 +88,8 @@ pub fn spawn_peer_reader(
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "peer reader connection lost");
+                            tracing::warn!(peer = %peer_id.fmt_short(), ip = %peer_ip, error = %e, "peer connection lost");
+                            let _ = disconnect_tx.send(DisconnectEvent { endpoint_id: peer_id, ip: peer_ip }).await;
                             return;
                         }
                     }

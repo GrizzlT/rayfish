@@ -288,8 +288,11 @@ async fn cmd_create(
         token.clone(),
     );
 
+    let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+    spawn_peer_cleanup(disconnect_rx, peers.clone(), token.clone());
+
     run_accept_loop(
-        &ep, &alpn, &identity, &*policy, state, peers, tun_tx, token, stats,
+        &ep, &alpn, &identity, &*policy, state, peers, tun_tx, disconnect_tx, token, stats,
         Some(dht_notify), Some(dht_id),
     )
     .await
@@ -304,6 +307,7 @@ async fn run_accept_loop(
     state: Arc<std::sync::RwLock<NetworkState>>,
     peers: PeerTable,
     tun_tx: mpsc::Sender<Vec<u8>>,
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<Stats>,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
@@ -355,10 +359,11 @@ async fn run_accept_loop(
             let token_c = token.clone();
             let stats_c = stats.clone();
             let tun_tx_c = tun_tx.clone();
+            let disconnect_tx_c = disconnect_tx.clone();
             let dht_id_c = dht_id.clone();
             tokio::spawn(async move {
                 send_member_sync(&conn, &members, dht_id_c).await;
-                forward::spawn_peer_reader(conn, tun_tx_c, token_c, stats_c);
+                forward::spawn_peer_reader(conn, remote_id, peer_ip, tun_tx_c, disconnect_tx_c, token_c, stats_c);
             });
             continue;
         }
@@ -413,8 +418,9 @@ async fn run_accept_loop(
             let token_c = token.clone();
             let stats_c = stats.clone();
             let tun_tx_c = tun_tx.clone();
+            let disconnect_tx_c = disconnect_tx.clone();
             tokio::spawn(async move {
-                forward::spawn_peer_reader(conn, tun_tx_c, token_c, stats_c);
+                forward::spawn_peer_reader(conn, remote_id, peer_ip, tun_tx_c, disconnect_tx_c, token_c, stats_c);
             });
             continue;
         }
@@ -522,8 +528,9 @@ async fn run_accept_loop(
         let token_c = token.clone();
         let stats_c = stats.clone();
         let tun_tx_c = tun_tx.clone();
+        let disconnect_tx_c = disconnect_tx.clone();
         tokio::spawn(async move {
-            forward::spawn_peer_reader(conn, tun_tx_c, token_c, stats_c);
+            forward::spawn_peer_reader(conn, remote_id, peer_ip, tun_tx_c, disconnect_tx_c, token_c, stats_c);
         });
     }
 }
@@ -725,6 +732,7 @@ async fn join_mesh_shared(
     alpn: &[u8],
     peers: PeerTable,
     tun_tx: mpsc::Sender<Vec<u8>>,
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
     stats: Arc<Stats>,
 ) -> Result<()> {
@@ -822,7 +830,10 @@ async fn join_mesh_shared(
     peers.add(remote_ip, initial_conn.clone(), remote_id);
     forward::spawn_peer_reader(
         initial_conn.clone(),
+        remote_id,
+        remote_ip,
         tun_tx.clone(),
+        disconnect_tx.clone(),
         token.clone(),
         stats.clone(),
     );
@@ -848,7 +859,7 @@ async fn join_mesh_shared(
                 .await?;
 
                 peers.add(member.ip, conn.clone(), member.identity);
-                forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
+                forward::spawn_peer_reader(conn, member.identity, member.ip, tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                 tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
             }
             Err(e) => {
@@ -920,6 +931,7 @@ async fn join_mesh_shared(
         let token = token.clone();
         let stats = stats.clone();
         let tun_tx = tun_tx.clone();
+        let disconnect_tx = disconnect_tx.clone();
         let expected_alpn = alpn.to_vec();
         let live_state = live_state.clone();
         async move {
@@ -976,13 +988,13 @@ async fn join_mesh_shared(
                                                         ).await;
                                                     }
                                                     peers.add(ip, conn.clone(), peer_identity);
-                                                    forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
+                                                    forward::spawn_peer_reader(conn, peer_identity, ip, tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                                                     // Broadcast updated member list
                                                     broadcast_member_sync(&peers, &members, Some(ip), None).await;
                                                 } else if is_member {
                                                     tracing::info!(peer_ip = %ip, "known peer reconnecting via mesh");
                                                     peers.add(ip, conn.clone(), peer_identity);
-                                                    forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
+                                                    forward::spawn_peer_reader(conn, peer_identity, ip, tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                                                 } else {
                                                     tracing::warn!(peer = %peer_identity.fmt_short(), "unknown peer, not approved — rejecting");
                                                 }
@@ -1012,7 +1024,7 @@ async fn join_mesh_shared(
                                                         ).await;
                                                     }
 
-                                                    forward::spawn_peer_reader(conn, tun_tx.clone(), token.clone(), stats.clone());
+                                                    forward::spawn_peer_reader(conn, peer_identity, ip, tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                                                 } else {
                                                     tracing::warn!(peer = %peer_identity, "unknown peer reconnect attempt");
                                                 }
@@ -1059,6 +1071,20 @@ async fn enter_mesh(
     let (tun_tx, tun_rx) = mpsc::channel::<Vec<u8>>(256);
     forward::spawn_tun_writer(tun_writer, tun_rx);
 
+    let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+    spawn_reconnect_loop(
+        disconnect_rx,
+        ep.clone(),
+        alpn.to_vec(),
+        identity.local_identity(),
+        my_ip,
+        peers.clone(),
+        tun_tx.clone(),
+        disconnect_tx.clone(),
+        token.clone(),
+        stats.clone(),
+    );
+
     join_mesh_shared(
         initial_conn,
         ep,
@@ -1067,6 +1093,7 @@ async fn enter_mesh(
         alpn,
         peers.clone(),
         tun_tx.clone(),
+        disconnect_tx,
         token.clone(),
         stats.clone(),
     )
@@ -1238,6 +1265,19 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
             let tun_tx = tun_tx.clone();
             let token = token.clone();
             let stats = stats.clone();
+            let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+            spawn_reconnect_loop(
+                disconnect_rx,
+                ep.clone(),
+                alpn.clone(),
+                identity.local_identity(),
+                identity.local_ip(),
+                peers.clone(),
+                tun_tx.clone(),
+                disconnect_tx.clone(),
+                token.clone(),
+                stats.clone(),
+            );
             handles.push(tokio::spawn(async move {
                 tracing::info!(network = %name, "connecting...");
 
@@ -1266,7 +1306,7 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
                                             Ok(conn) => {
                                                 tracing::info!(network = %name, peer_ip = %member.ip, "connected via DHT-resolved peer");
                                                 match join_mesh_shared(
-                                                    conn, &ep, &name, &identity, &alpn, peers.clone(), tun_tx.clone(), token.clone(), stats.clone(),
+                                                    conn, &ep, &name, &identity, &alpn, peers.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone(),
                                                 ).await {
                                                     Ok(()) => return,
                                                     Err(e) => {
@@ -1295,7 +1335,7 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
                     Ok(conn) => {
                         tracing::info!(network = %name, "connected");
                         if let Err(e) = join_mesh_shared(
-                            conn, &ep, &name, &identity, &alpn, peers, tun_tx, token, stats,
+                            conn, &ep, &name, &identity, &alpn, peers, tun_tx, disconnect_tx, token, stats,
                         )
                         .await
                         {
@@ -1353,8 +1393,11 @@ async fn cmd_up(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
                     }
                 }
 
+                let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+                spawn_peer_cleanup(disconnect_rx, peers.clone(), token.clone());
+
                 if let Err(e) = run_accept_loop(
-                    &ep, &alpn, &identity, &*policy, state, peers, tun_tx, token, stats,
+                    &ep, &alpn, &identity, &*policy, state, peers, tun_tx, disconnect_tx, token, stats,
                     Some(dht_notify), Some(dht_id),
                 )
                 .await
@@ -1436,6 +1479,113 @@ fn cmd_uninstall_service() -> Result<()> {
     {
         anyhow::bail!("service uninstallation not supported on this platform");
     }
+}
+
+fn spawn_peer_cleanup(
+    mut disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
+    peers: PeerTable,
+    token: CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                event = disconnect_rx.recv() => {
+                    match event {
+                        Some(ev) => {
+                            tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, "removing dead peer");
+                            peers.remove(&ev.ip);
+                        }
+                        None => return,
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_reconnect_loop(
+    mut disconnect_rx: mpsc::Receiver<forward::DisconnectEvent>,
+    ep: Endpoint,
+    alpn: Vec<u8>,
+    my_identity: EndpointId,
+    my_ip: Ipv4Addr,
+    peers: PeerTable,
+    tun_tx: mpsc::Sender<Vec<u8>>,
+    disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
+    token: CancellationToken,
+    stats: Arc<Stats>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                _ = token.cancelled() => return,
+                event = disconnect_rx.recv() => match event {
+                    Some(ev) => ev,
+                    None => return,
+                },
+            };
+
+            let peer_id = event.endpoint_id;
+            let peer_ip = event.ip;
+            tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "peer disconnected, will reconnect");
+            peers.remove(&peer_ip);
+
+            let ep = ep.clone();
+            let alpn = alpn.clone();
+            let peers = peers.clone();
+            let tun_tx = tun_tx.clone();
+            let disconnect_tx = disconnect_tx.clone();
+            let token = token.clone();
+            let stats = stats.clone();
+
+            tokio::spawn(async move {
+                let mut backoff = BACKOFF_INITIAL;
+                loop {
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    tracing::info!(peer = %peer_id.fmt_short(), secs = backoff.as_secs(), "reconnecting in");
+                    tokio::select! {
+                        _ = token.cancelled() => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+
+                    match transport::connect_to_peer_with_alpn(&ep, peer_id, &alpn).await {
+                        Ok(conn) => {
+                            let (mut send, _) = match conn.open_bi().await {
+                                Ok(bi) => bi,
+                                Err(e) => {
+                                    tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "reconnect handshake failed");
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = control::send_msg(
+                                &mut send,
+                                &ControlMsg::MeshHello { identity: my_identity, ip: my_ip },
+                            ).await {
+                                tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "reconnect MeshHello failed");
+                                continue;
+                            }
+
+                            tracing::info!(peer = %peer_id.fmt_short(), ip = %peer_ip, "reconnected to peer");
+                            peers.add(peer_ip, conn.clone(), peer_id);
+                            forward::spawn_peer_reader(
+                                conn, peer_id, peer_ip,
+                                tun_tx, disconnect_tx, token, stats,
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::debug!(peer = %peer_id.fmt_short(), error = %e, "reconnect attempt failed");
+                        }
+                    }
+                }
+            });
+        }
+    });
 }
 
 async fn backoff_sleep(token: &CancellationToken, backoff: &mut Duration) {
