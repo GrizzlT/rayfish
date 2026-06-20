@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 
-use crate::membership::Member;
+use crate::membership::{ApprovedEntry, Member};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMsg {
@@ -33,6 +33,14 @@ pub enum ControlMsg {
     AdvertiseServices {
         ip: Ipv4Addr,
         services: Vec<ServiceTag>,
+    },
+    MemberApproved {
+        identity: String,
+        ip: Ipv4Addr,
+    },
+    Welcome {
+        members: Vec<Member>,
+        approved: Vec<ApprovedEntry>,
     },
 }
 
@@ -169,6 +177,51 @@ mod tests {
         let msg = ControlMsg::MeshHello {
             identity: "peer-xyz".to_string(),
             ip: Ipv4Addr::new(100, 64, 0, 4),
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_member_approved() {
+        let msg = ControlMsg::MemberApproved {
+            identity: "new-peer-xyz".to_string(),
+            ip: Ipv4Addr::new(100, 64, 12, 34),
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_welcome() {
+        use crate::membership::ApprovedEntry;
+        let msg = ControlMsg::Welcome {
+            members: vec![Member {
+                identity: "coord".to_string(),
+                ip: Ipv4Addr::new(100, 64, 0, 2),
+                is_coordinator: true,
+            }],
+            approved: vec![ApprovedEntry {
+                identity: "pending-peer".to_string(),
+                ip: Ipv4Addr::new(100, 64, 0, 5),
+            }],
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_welcome_empty_approved() {
+        let msg = ControlMsg::Welcome {
+            members: vec![Member {
+                identity: "a".to_string(),
+                ip: Ipv4Addr::new(100, 64, 0, 2),
+                is_coordinator: true,
+            }],
+            approved: vec![],
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
