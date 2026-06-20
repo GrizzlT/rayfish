@@ -1,6 +1,7 @@
 use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result};
+use iroh::EndpointId;
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 
@@ -17,17 +18,19 @@ pub enum ControlMsg {
     },
     MemberSync {
         members: Vec<Member>,
+        #[serde(default)]
+        membership_dht_id: Option<String>,
     },
     ReconnectRequest {
-        identity: String,
+        identity: EndpointId,
         ip: Ipv4Addr,
     },
     MeshHello {
-        identity: String,
+        identity: EndpointId,
         ip: Ipv4Addr,
     },
     MeshWelcome {
-        identity: String,
+        identity: EndpointId,
         ip: Ipv4Addr,
     },
     AdvertiseServices {
@@ -35,12 +38,14 @@ pub enum ControlMsg {
         services: Vec<ServiceTag>,
     },
     MemberApproved {
-        identity: String,
+        identity: EndpointId,
         ip: Ipv4Addr,
     },
     Welcome {
         members: Vec<Member>,
         approved: Vec<ApprovedEntry>,
+        #[serde(default)]
+        membership_dht_id: Option<String>,
     },
 }
 
@@ -92,12 +97,18 @@ pub async fn recv_msg(stream: &mut RecvStream) -> Result<ControlMsg> {
 mod tests {
     use super::*;
 
+    fn test_id(seed: u8) -> EndpointId {
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0] = seed;
+        iroh::SecretKey::from(key_bytes).public()
+    }
+
     #[test]
-    fn test_roundtrip_join_approved_basic() {
+    fn test_roundtrip_join_approved() {
         let msg = ControlMsg::JoinApproved {
             your_ip: Ipv4Addr::new(100, 64, 0, 3),
             members: vec![Member {
-                identity: "test-id-abc123".to_string(),
+                identity: test_id(1),
                 ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
             }],
@@ -108,25 +119,10 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_mesh_hello_basic() {
+    fn test_roundtrip_mesh_hello() {
         let msg = ControlMsg::MeshHello {
-            identity: "peer-abc".to_string(),
+            identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 0, 4),
-        };
-        let bytes = encode_msg(&msg);
-        let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
-    fn test_roundtrip_join_approved() {
-        let msg = ControlMsg::JoinApproved {
-            your_ip: Ipv4Addr::new(100, 64, 10, 5),
-            members: vec![Member {
-                identity: "coord-id".to_string(),
-                ip: Ipv4Addr::new(100, 64, 5, 3),
-                is_coordinator: true,
-            }],
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -148,16 +144,17 @@ mod tests {
         let msg = ControlMsg::MemberSync {
             members: vec![
                 Member {
-                    identity: "a".to_string(),
+                    identity: test_id(1),
                     ip: Ipv4Addr::new(100, 64, 0, 2),
                     is_coordinator: true,
                 },
                 Member {
-                    identity: "b".to_string(),
+                    identity: test_id(2),
                     ip: Ipv4Addr::new(100, 64, 0, 3),
                     is_coordinator: false,
                 },
             ],
+            membership_dht_id: None,
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -167,19 +164,8 @@ mod tests {
     #[test]
     fn test_roundtrip_reconnect_request() {
         let msg = ControlMsg::ReconnectRequest {
-            identity: "returning-peer".to_string(),
+            identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 7, 42),
-        };
-        let bytes = encode_msg(&msg);
-        let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
-    fn test_roundtrip_mesh_hello_with_identity() {
-        let msg = ControlMsg::MeshHello {
-            identity: "peer-xyz".to_string(),
-            ip: Ipv4Addr::new(100, 64, 0, 4),
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -189,7 +175,7 @@ mod tests {
     #[test]
     fn test_roundtrip_member_approved() {
         let msg = ControlMsg::MemberApproved {
-            identity: "new-peer-xyz".to_string(),
+            identity: test_id(1),
             ip: Ipv4Addr::new(100, 64, 12, 34),
         };
         let bytes = encode_msg(&msg);
@@ -202,14 +188,15 @@ mod tests {
         use crate::membership::ApprovedEntry;
         let msg = ControlMsg::Welcome {
             members: vec![Member {
-                identity: "coord".to_string(),
+                identity: test_id(1),
                 ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
             }],
             approved: vec![ApprovedEntry {
-                identity: "pending-peer".to_string(),
+                identity: test_id(2),
                 ip: Ipv4Addr::new(100, 64, 0, 5),
             }],
+            membership_dht_id: None,
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -217,14 +204,16 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_welcome_empty_approved() {
+    fn test_roundtrip_welcome_with_dht_id() {
+        use crate::membership::ApprovedEntry;
         let msg = ControlMsg::Welcome {
             members: vec![Member {
-                identity: "a".to_string(),
+                identity: test_id(1),
                 ip: Ipv4Addr::new(100, 64, 0, 2),
                 is_coordinator: true,
             }],
             approved: vec![],
+            membership_dht_id: Some("abc123dht".to_string()),
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();

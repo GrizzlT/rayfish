@@ -306,6 +306,7 @@ async fn run_accept_loop(
                     &ControlMsg::Welcome {
                         members: members.clone(),
                         approved,
+                        membership_dht_id: None,
                     },
                 )
                 .await;
@@ -410,6 +411,7 @@ async fn run_accept_loop(
                 &ControlMsg::Welcome {
                     members: members.clone(),
                     approved,
+                    membership_dht_id: None,
                 },
             )
             .await;
@@ -434,6 +436,7 @@ async fn send_member_sync(conn: &iroh::endpoint::Connection, members: &[Member])
             &mut send,
             &ControlMsg::MemberSync {
                 members: members.to_vec(),
+                membership_dht_id: None,
             },
         )
         .await;
@@ -447,6 +450,7 @@ async fn broadcast_member_sync(
 ) {
     let msg = ControlMsg::MemberSync {
         members: members.to_vec(),
+        membership_dht_id: None,
     };
     for (ip, conn) in peers.all_connections() {
         if Some(ip) == exclude_ip {
@@ -593,7 +597,7 @@ async fn join_mesh_shared(
 
     let msg = control::recv_msg(&mut recv).await?;
     let (members, approved) = match msg {
-        ControlMsg::Welcome { members, approved } => {
+        ControlMsg::Welcome { members, approved, .. } => {
             tracing::info!(network = %network_name, "welcomed to network");
             // Joiner-side collision check
             if let Some(existing) = members
@@ -620,7 +624,7 @@ async fn join_mesh_shared(
             }
             (members, vec![])
         }
-        ControlMsg::MemberSync { members } => {
+        ControlMsg::MemberSync { members, .. } => {
             tracing::info!(network = %network_name, "reconnected via peer");
             (members, vec![])
         }
@@ -658,6 +662,7 @@ async fn join_mesh_shared(
             my_ip: Some(my_ip),
             members: member_entries,
             approved: approved_config,
+            membership_dht_id: None,
         },
     );
     config::save(&app_config)?;
@@ -729,7 +734,7 @@ async fn join_mesh_shared(
                                         let members = s.members.clone();
                                         let _ = s.approved.approve(entry, &members);
                                     }
-                                    Ok(ControlMsg::MemberSync { members }) => {
+                                    Ok(ControlMsg::MemberSync { members, .. }) => {
                                         tracing::info!(count = members.len(), "member list updated");
                                         live_state.write().unwrap().members = MemberList::from_members(members);
                                     }
@@ -807,6 +812,7 @@ async fn join_mesh_shared(
                                                             &ControlMsg::Welcome {
                                                                 members: members.clone(),
                                                                 approved: approved_list,
+                                                                membership_dht_id: None,
                                                             },
                                                         ).await;
                                                     }
@@ -843,7 +849,7 @@ async fn join_mesh_shared(
                                                     if let Ok((mut send, _)) = conn.open_bi().await {
                                                         let _ = control::send_msg(
                                                             &mut send,
-                                                            &ControlMsg::MemberSync { members: current_members },
+                                                            &ControlMsg::MemberSync { members: current_members, membership_dht_id: None },
                                                         ).await;
                                                     }
 
@@ -948,6 +954,7 @@ fn save_network_config(
             my_ip,
             members: member_entries,
             approved: approved_entries,
+            membership_dht_id: None,
         },
     );
     config::save(app_config)
