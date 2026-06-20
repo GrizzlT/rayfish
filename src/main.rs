@@ -8,7 +8,7 @@ mod ipc;
 mod membership;
 mod network_name;
 mod peers;
-mod room_code;
+
 mod shutdown;
 mod stats;
 mod transport;

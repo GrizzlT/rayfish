@@ -356,11 +356,13 @@ pub fn membership_hash(members: &MemberList, approved: &ApprovedList) -> String 
 }
 
 /// Deserializes canonical msgpack bytes into [`MembershipData`].
+#[allow(dead_code)]
 pub fn decode_membership_data(bytes: &[u8]) -> Result<MembershipData> {
     rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid membership data: {e}"))
 }
 
 /// Verifies that bytes match the expected hash, then deserializes.
+#[allow(dead_code)]
 pub fn verify_membership_data(bytes: &[u8], expected_hash: &str) -> Result<MembershipData> {
     let actual = blake3::hash(bytes).to_hex().to_string();
     if actual != expected_hash {

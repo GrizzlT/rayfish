@@ -23,11 +23,11 @@ use crate::identity;
 use crate::ipc::{self, IpcRequest, IpcResponse, NetworkRole, NetworkStatus, PeerStatus};
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
-    MemberList, MembershipPolicy, policy_for_mode, canonical_membership_bytes, membership_hash,
-    verify_membership_data,
+    MemberList, MembershipPolicy, policy_for_mode, canonical_membership_bytes_with_secrets,
+    membership_hash, verify_membership_data,
 };
+use crate::network_name;
 use crate::peers::PeerTable;
-use crate::room_code;
 use crate::stats::Stats;
 use crate::transport;
 use crate::tun;
@@ -45,11 +45,16 @@ struct NetworkState {
     members: MemberList,
     approved: ApprovedList,
     snapshot: Option<MembershipSnapshot>,
+    network_secret: [u8; 32],
+    membership_signing_key: [u8; 32],
 }
 
 impl NetworkState {
     fn refresh_snapshot(&mut self) {
-        let bytes = canonical_membership_bytes(&self.members, &self.approved);
+        let bytes = canonical_membership_bytes_with_secrets(
+            &self.members, &self.approved,
+            &self.network_secret, &self.membership_signing_key,
+        );
         let hash = blake3::hash(&bytes).to_hex().to_string();
         self.snapshot = Some(MembershipSnapshot { hash, msgpack_bytes: bytes });
     }
@@ -63,7 +68,6 @@ pub struct NetworkHandle {
     state: Arc<std::sync::RwLock<NetworkState>>,
     cancel: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
-    room_code: Option<String>,
 }
 
 pub struct DaemonState {
@@ -109,28 +113,33 @@ impl DaemonState {
     }
 
     async fn create_network(&self, mode: GroupMode) -> IpcResponse {
-        // TODO(task-6): generate three-word name here
-        let name = "placeholder-network";
-        {
-            let networks = self.networks.read().unwrap();
-            if networks.contains_key(name) {
-                return IpcResponse::Error {
-                    message: format!("network '{}' already active", name),
-                };
-            }
-        }
-
-        match self.create_network_inner(name, mode).await {
+        match self.create_network_inner(mode).await {
             Ok(resp) => resp,
             Err(e) => IpcResponse::Error { message: format!("{e:#}") },
         }
     }
 
-    async fn create_network_inner(&self, name: &str, mode: GroupMode) -> Result<IpcResponse> {
-        let membership_key = dht::derive_membership_key(&self.secret_key, name);
-        let dht_id = dht::membership_dht_id(&self.secret_key, name).to_string();
+    async fn create_network_inner(&self, mode: GroupMode) -> Result<IpcResponse> {
+        let name = network_name::generate_name();
+
+        {
+            let networks = self.networks.read().unwrap();
+            if networks.contains_key(&name) {
+                return Ok(IpcResponse::Error {
+                    message: format!("network '{name}' already active"),
+                });
+            }
+        }
+
+        // Generate network secret (for seed list publishing)
+        let network_secret: [u8; 32] = rand::random();
+        let network_secret_key = SecretKey::from_bytes(&network_secret);
+
+        // Derive membership signing key
+        let membership_key = dht::derive_membership_key(&self.secret_key, &name);
+        let membership_signing_key = membership_key.to_bytes();
+        let dht_id = dht::membership_dht_id(&self.secret_key, &name).to_string();
         let my_ip = self.identity.local_ip();
-        let room_code = room_code::encode(name, &self.endpoint.id());
         let policy = policy_for_mode(mode);
 
         let mut member_list = MemberList::new();
@@ -146,10 +155,33 @@ impl DaemonState {
             members: member_list,
             approved: ApprovedList::new(),
             snapshot: None,
+            network_secret,
+            membership_signing_key,
         };
         net_state.refresh_snapshot();
         if let Some(snap) = &net_state.snapshot {
             let _ = self.blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
+        }
+
+        // Publish directory and seed list to DHT
+        if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
+            let dir_key = dht::derive_directory_key(&name);
+            if let Err(e) = dht::publish_directory(
+                &pkarr_client,
+                &dir_key,
+                &network_secret_key.public(),
+                &membership_key.public(),
+            ).await {
+                tracing::warn!(error = %e, "failed to publish directory record");
+            }
+
+            if let Err(e) = dht::publish_seed_list(
+                &pkarr_client,
+                &SecretKey::from_bytes(&network_secret),
+                &[self.endpoint.id()],
+            ).await {
+                tracing::warn!(error = %e, "failed to publish seed list");
+            }
         }
 
         // Save to config
@@ -164,14 +196,14 @@ impl DaemonState {
         }).collect();
         let mut app_config = config::load()?;
         config::upsert_network(&mut app_config, config::NetworkConfig {
-            name: name.to_string(),
+            name: name.clone(),
             group_mode: mode,
             my_ip: Some(my_ip),
             members: member_entries,
             approved: approved_entries,
             membership_dht_id: Some(dht_id.clone()),
-            network_pkarr_pubkey: None,
-            membership_dht_pubkey: None,
+            network_pkarr_pubkey: Some(network_secret_key.public().to_string()),
+            membership_dht_pubkey: Some(membership_key.public().to_string()),
         });
         config::save(&app_config)?;
 
@@ -198,7 +230,7 @@ impl DaemonState {
         // Accept loop for this network
         let accept_handle = spawn_coordinator_accept(
             self.endpoint.clone(),
-            name.to_string(),
+            name.clone(),
             self.identity.clone(),
             policy,
             state.clone(),
@@ -216,69 +248,121 @@ impl DaemonState {
 
         // Update ALPNs
         let handle = NetworkHandle {
-            name: name.to_string(),
+            name: name.clone(),
             role: NetworkRole::Coordinator,
             my_ip,
             state,
             cancel,
             tasks,
-            room_code: Some(room_code.clone()),
         };
-        self.networks.write().unwrap().insert(name.to_string(), handle);
+        self.networks.write().unwrap().insert(name.clone(), handle);
         self.refresh_alpns();
 
-        tracing::info!(name, ip = %my_ip, room_code = %room_code, "network created");
+        tracing::info!(name = %name, ip = %my_ip, "network created");
 
         Ok(IpcResponse::Created {
-            name: name.to_string(),
+            name,
             my_ip,
         })
     }
 
     async fn join_network(&self, name: &str) -> IpcResponse {
-        // TODO(task-7): resolve coordinator endpoint from DHT by three-word name
-        match self.join_network_inner(name, None).await {
+        match self.join_network_inner(name).await {
             Ok(resp) => resp,
             Err(e) => IpcResponse::Error { message: format!("{e:#}") },
         }
     }
 
-    async fn join_network_inner(&self, node_id_str: &str, name_override: Option<&str>) -> Result<IpcResponse> {
-        let parsed = room_code::parse_input(node_id_str).context("invalid node ID or room code")?;
-        let network_name = name_override.unwrap_or_else(|| {
-            if parsed.network_name.is_empty() { "default" } else { &parsed.network_name }
-        }).to_string();
-
+    async fn join_network_inner(&self, name: &str) -> Result<IpcResponse> {
         {
             let networks = self.networks.read().unwrap();
-            if networks.contains_key(&network_name) {
+            if networks.contains_key(name) {
                 return Ok(IpcResponse::Error {
-                    message: format!("network '{}' already active", network_name),
+                    message: format!("already in network '{name}'"),
                 });
             }
         }
 
-        let alpn = transport::network_alpn(&network_name);
+        // Step 1: Resolve directory record (name → network pkarr pubkey + membership DHT pubkey)
+        let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
+        let (network_pkarr_pubkey, membership_dht_pubkey) =
+            dht::resolve_directory(&pkarr_client, name).await
+                .context("failed to resolve network directory")?;
+
+        // Step 2: Resolve seed list and membership hash in parallel
+        let (seed_result, hash_result) = tokio::join!(
+            dht::resolve_seed_list(&pkarr_client, network_pkarr_pubkey),
+            dht::resolve_membership_hash(&pkarr_client, membership_dht_pubkey),
+        );
+
+        let peer_ids = seed_result.context("failed to resolve seed list")?;
+        let expected_hash = hash_result.context("failed to resolve membership hash")?;
+
+        if peer_ids.is_empty() {
+            return Ok(IpcResponse::Error {
+                message: "no peers found in seed list".to_string(),
+            });
+        }
+
+        // Step 3: Connect to a peer and fetch membership blob
+        let blob_hash = {
+            let b3_hash: blake3::Hash = expected_hash.parse()
+                .context("invalid membership hash from DHT")?;
+            iroh_blobs::Hash::from_bytes(*b3_hash.as_bytes())
+        };
+
+        let mut membership_data = None;
+        for peer_id in &peer_ids {
+            match self.try_fetch_blob_from_peer(*peer_id, blob_hash).await {
+                Ok(data) => {
+                    membership_data = Some(data);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "failed to fetch blob");
+                    continue;
+                }
+            }
+        }
+
+        let data = membership_data.context("could not fetch membership from any peer")?;
+
+        let alpn = transport::network_alpn(name);
         let my_ip = self.identity.local_ip();
 
-        // Connect to coordinator, fall back to DHT if unreachable
-        let conn = match transport::connect_to_peer_with_alpn(
-            &self.endpoint,
-            parsed.endpoint_id,
-            &alpn,
-        ).await {
-            Ok(c) => c,
-            Err(coordinator_err) => {
-                match self.try_dht_fallback_join(&network_name, &alpn).await {
-                    Ok(resp) => return Ok(resp),
-                    Err(fallback_err) => {
-                        return Err(coordinator_err.context(
-                            format!("coordinator unreachable and DHT fallback failed: {fallback_err}")
-                        ));
+        // Try to connect to the first reachable peer via the network ALPN
+        let mut initial_conn = None;
+        for peer_id in &peer_ids {
+            if *peer_id == self.endpoint.id() { continue; }
+            match transport::connect_to_peer_with_alpn(&self.endpoint, *peer_id, &alpn).await {
+                Ok(conn) => {
+                    initial_conn = Some(conn);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id.fmt_short(), error = %e, "failed to connect to seed peer");
+                }
+            }
+        }
+
+        // Fall back to connecting to known members from the membership data
+        if initial_conn.is_none() {
+            let my_identity = self.identity.local_identity();
+            for member in &data.members {
+                if member.identity == my_identity { continue; }
+                match transport::connect_to_peer_with_alpn(&self.endpoint, member.identity, &alpn).await {
+                    Ok(conn) => {
+                        initial_conn = Some(conn);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(peer = %member.identity.fmt_short(), error = %e, "failed to connect to member");
                     }
                 }
             }
-        };
+        }
+
+        let conn = initial_conn.context("could not connect to any peer in the network")?;
 
         let cancel = self.shutdown_token.child_token();
         let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
@@ -288,7 +372,7 @@ impl DaemonState {
             disconnect_rx,
             self.endpoint.clone(),
             alpn.clone(),
-            network_name.clone(),
+            name.to_string(),
             self.identity.local_identity(),
             my_ip,
             self.peers.clone(),
@@ -298,11 +382,11 @@ impl DaemonState {
             self.stats.clone(),
         )];
 
-        // Join mesh
+        // Join mesh via the connected peer
         let state = join_mesh_shared(
             conn,
             &self.endpoint,
-            &network_name,
+            name,
             &self.identity,
             &alpn,
             self.peers.clone(),
@@ -314,26 +398,58 @@ impl DaemonState {
             self.blobs_proto.clone(),
         ).await?;
 
+        // Store the secrets from the fetched membership data
+        {
+            let mut s = state.write().unwrap();
+            s.network_secret = data.network_secret;
+            s.membership_signing_key = data.membership_signing_key;
+        }
+
+        // Save config with the DHT pubkeys
+        if let Ok(mut app_config) = config::load() {
+            if let Some(net) = app_config.networks.iter_mut().find(|n| n.name == name) {
+                net.network_pkarr_pubkey = Some(network_pkarr_pubkey.to_string());
+                net.membership_dht_pubkey = Some(membership_dht_pubkey.to_string());
+            }
+            let _ = config::save(&app_config);
+        }
+
         let handle = NetworkHandle {
-            name: network_name.clone(),
+            name: name.to_string(),
             role: NetworkRole::Member,
             my_ip,
             state,
             cancel,
             tasks,
-            room_code: None,
         };
-        self.networks.write().unwrap().insert(network_name.clone(), handle);
+        self.networks.write().unwrap().insert(name.to_string(), handle);
         self.refresh_alpns();
 
-        tracing::info!(network = %network_name, ip = %my_ip, "joined network");
+        tracing::info!(network = %name, ip = %my_ip, "joined network");
 
         Ok(IpcResponse::Joined {
-            name: network_name,
+            name: name.to_string(),
             my_ip,
         })
     }
 
+    async fn try_fetch_blob_from_peer(
+        &self,
+        peer_id: EndpointId,
+        blob_hash: iroh_blobs::Hash,
+    ) -> Result<crate::membership::MembershipData> {
+        let conn = transport::connect_to_peer_with_alpn(
+            &self.endpoint, peer_id, iroh_blobs::protocol::ALPN,
+        ).await?;
+        self.blob_store.remote().fetch(
+            conn, HashAndFormat::raw(blob_hash),
+        ).await.map_err(|e| anyhow::anyhow!("blob fetch failed: {e}"))?;
+        let bytes = self.blob_store.blobs().get_bytes(blob_hash).await
+            .map_err(|e| anyhow::anyhow!("blob read failed: {e}"))?;
+        rmp_serde::from_slice(&bytes).context("invalid membership data")
+    }
+
+    #[allow(dead_code)]
     async fn try_dht_fallback_join(&self, network_name: &str, alpn: &[u8]) -> Result<IpcResponse> {
         let app_config = config::load()?;
         let net_config = app_config.networks.iter()
@@ -414,6 +530,8 @@ impl DaemonState {
                 members: MemberList::from_members(data.members),
                 approved: ApprovedList::from_entries(data.approved),
                 snapshot: None,
+                network_secret: data.network_secret,
+                membership_signing_key: data.membership_signing_key,
             };
             ns.refresh_snapshot();
             let live_state = Arc::new(std::sync::RwLock::new(ns));
@@ -425,7 +543,6 @@ impl DaemonState {
                 state: live_state,
                 cancel,
                 tasks,
-                room_code: None,
             };
             self.networks.write().unwrap().insert(network_name.to_string(), handle);
             self.refresh_alpns();
@@ -437,6 +554,148 @@ impl DaemonState {
         }
 
         anyhow::bail!("no peers reachable for DHT fallback")
+    }
+
+    /// Restores a coordinator network from saved config (uses the existing name).
+    async fn restore_coordinator_network(&self, name: &str, mode: GroupMode) -> Result<IpcResponse> {
+        {
+            let networks = self.networks.read().unwrap();
+            if networks.contains_key(name) {
+                return Ok(IpcResponse::Error {
+                    message: format!("network '{name}' already active"),
+                });
+            }
+        }
+
+        let membership_key = dht::derive_membership_key(&self.secret_key, name);
+        let membership_signing_key = membership_key.to_bytes();
+        let dht_id = dht::membership_dht_id(&self.secret_key, name).to_string();
+        let my_ip = self.identity.local_ip();
+        let policy = policy_for_mode(mode);
+
+        // The network secret was originally random; on restore we generate a fresh one
+        // and re-publish the seed list / directory with the new key.
+        let network_secret: [u8; 32] = rand::random();
+        let network_secret_key = SecretKey::from_bytes(&network_secret);
+
+        let mut member_list = MemberList::new();
+        member_list
+            .add(Member {
+                identity: self.identity.local_identity(),
+                ip: my_ip,
+                is_coordinator: true,
+            })
+            .expect("self-add cannot collide");
+
+        let mut net_state = NetworkState {
+            members: member_list,
+            approved: ApprovedList::new(),
+            snapshot: None,
+            network_secret,
+            membership_signing_key,
+        };
+        net_state.refresh_snapshot();
+        if let Some(snap) = &net_state.snapshot {
+            let _ = self.blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
+        }
+
+        // Re-publish directory and seed list
+        if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
+            let dir_key = dht::derive_directory_key(name);
+            if let Err(e) = dht::publish_directory(
+                &pkarr_client,
+                &dir_key,
+                &network_secret_key.public(),
+                &membership_key.public(),
+            ).await {
+                tracing::warn!(error = %e, "failed to publish directory record on restore");
+            }
+
+            if let Err(e) = dht::publish_seed_list(
+                &pkarr_client,
+                &SecretKey::from_bytes(&network_secret),
+                &[self.endpoint.id()],
+            ).await {
+                tracing::warn!(error = %e, "failed to publish seed list on restore");
+            }
+        }
+
+        // Update config with new secrets
+        let member_entries = net_state.members.all().into_iter().map(|m| config::MemberEntry {
+            identity: m.identity,
+            ip: m.ip,
+            is_coordinator: m.is_coordinator,
+        }).collect();
+        let approved_entries = net_state.approved.all().into_iter().map(|a| config::ApprovedConfigEntry {
+            identity: a.identity,
+            ip: a.ip,
+        }).collect();
+        let mut app_config = config::load()?;
+        config::upsert_network(&mut app_config, config::NetworkConfig {
+            name: name.to_string(),
+            group_mode: mode,
+            my_ip: Some(my_ip),
+            members: member_entries,
+            approved: approved_entries,
+            membership_dht_id: Some(dht_id.clone()),
+            network_pkarr_pubkey: Some(network_secret_key.public().to_string()),
+            membership_dht_pubkey: Some(membership_key.public().to_string()),
+        });
+        config::save(&app_config)?;
+
+        let cancel = self.shutdown_token.child_token();
+        let state = Arc::new(std::sync::RwLock::new(net_state));
+        let mut tasks = Vec::new();
+
+        let dht_notify = Arc::new(tokio::sync::Notify::new());
+        if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
+            tasks.push(spawn_dht_publisher(
+                pkarr_client,
+                membership_key,
+                state.clone(),
+                dht_notify.clone(),
+                cancel.clone(),
+            ));
+        }
+
+        let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
+        tasks.push(spawn_peer_cleanup(disconnect_rx, self.peers.clone(), cancel.clone()));
+
+        let accept_handle = spawn_coordinator_accept(
+            self.endpoint.clone(),
+            name.to_string(),
+            self.identity.clone(),
+            policy,
+            state.clone(),
+            self.peers.clone(),
+            self.tun_tx.clone(),
+            disconnect_tx,
+            cancel.clone(),
+            self.stats.clone(),
+            Some(dht_notify),
+            Some(dht_id),
+            self.blob_store.clone(),
+            self.blobs_proto.clone(),
+        );
+        tasks.push(accept_handle);
+
+        let handle = NetworkHandle {
+            name: name.to_string(),
+            role: NetworkRole::Coordinator,
+            my_ip,
+            state,
+            cancel,
+            tasks,
+        };
+        self.networks.write().unwrap().insert(name.to_string(), handle);
+        self.refresh_alpns();
+
+        tracing::info!(name = %name, ip = %my_ip, "network restored (coordinator)");
+
+        Ok(IpcResponse::Created {
+            name: name.to_string(),
+            my_ip,
+        })
     }
 
     async fn leave_network(&self, name: &str) -> IpcResponse {
@@ -548,19 +807,11 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
     // Restore saved networks
     for net in &app_config.networks {
         if net.my_ip.is_some() {
-            // We're a member — join via coordinator (found in member list)
-            let coordinator = net.members.iter().find(|m| m.is_coordinator).cloned();
+            // We're a member — rejoin via DHT name lookup
             let name = net.name.clone();
             let daemon_c = daemon.clone();
             tokio::spawn(async move {
-                let node_id_str = match coordinator {
-                    Some(m) => m.identity.to_string(),
-                    None => {
-                        tracing::warn!(network = %name, "no coordinator in saved config, cannot restore");
-                        return;
-                    }
-                };
-                match daemon_c.join_network_inner(&node_id_str, Some(&name)).await {
+                match daemon_c.join_network_inner(&name).await {
                     Ok(IpcResponse::Joined { name, my_ip }) => {
                         tracing::info!(network = %name, ip = %my_ip, "restored member network");
                     }
@@ -574,12 +825,12 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
                 }
             });
         } else {
-            // We're the coordinator — create
+            // We're the coordinator — restore with existing name
             let name = net.name.clone();
             let mode = net.group_mode;
             let daemon_c = daemon.clone();
             tokio::spawn(async move {
-                match daemon_c.create_network_inner(&name, mode).await {
+                match daemon_c.restore_coordinator_network(&name, mode).await {
                     Ok(IpcResponse::Created { name, .. }) => {
                         tracing::info!(network = %name, "restored coordinator network");
                     }
@@ -1057,6 +1308,8 @@ async fn join_mesh_shared(
             members: MemberList::from_members(members.clone()),
             approved: ApprovedList::from_entries(approved),
             snapshot: None,
+            network_secret: [0u8; 32],
+            membership_signing_key: [0u8; 32],
         };
         ns.refresh_snapshot();
         if let Some(snap) = &ns.snapshot {
