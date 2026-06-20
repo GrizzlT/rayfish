@@ -52,6 +52,11 @@ pub enum ControlMsg {
         approved: Vec<ApprovedEntry>,
         #[serde(default)]
         membership_dht_id: Option<String>,
+        #[serde(default)]
+        acl_dht_id: Option<String>,
+    },
+    AclUpdated {
+        acl_hash: String,
     },
 }
 
@@ -204,6 +209,7 @@ mod tests {
                 ip: Ipv4Addr::new(100, 64, 0, 5),
             }],
             membership_dht_id: None,
+            acl_dht_id: None,
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
@@ -220,6 +226,34 @@ mod tests {
             }],
             approved: vec![],
             membership_dht_id: Some("abc123dht".to_string()),
+            acl_dht_id: None,
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_acl_updated() {
+        let msg = ControlMsg::AclUpdated {
+            acl_hash: "abc123def456".to_string(),
+        };
+        let bytes = encode_msg(&msg);
+        let decoded = decode_msg(&bytes).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_welcome_with_acl_dht_id() {
+        let msg = ControlMsg::Welcome {
+            members: vec![Member {
+                identity: test_id(1),
+                ip: Ipv4Addr::new(100, 64, 0, 2),
+                is_coordinator: true,
+            }],
+            approved: vec![],
+            membership_dht_id: Some("mem123".to_string()),
+            acl_dht_id: Some("acl456".to_string()),
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();

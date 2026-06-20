@@ -1380,7 +1380,7 @@ async fn run_accept_loop(
             };
             if let Ok((mut send, _)) = conn.open_bi().await {
                 let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
-                    members: members.clone(), approved, membership_dht_id: dht_id.clone(),
+                    members: members.clone(), approved, membership_dht_id: dht_id.clone(), acl_dht_id: None,
                 }).await;
             }
             broadcast_member_sync(&peers, &members, Some(peer_ip), dht_id.clone()).await;
@@ -1465,7 +1465,7 @@ async fn run_accept_loop(
 
         if let Ok((mut send, _)) = conn.open_bi().await {
             let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
-                members: members.clone(), approved, membership_dht_id: dht_id.clone(),
+                members: members.clone(), approved, membership_dht_id: dht_id.clone(), acl_dht_id: None,
             }).await;
         }
         broadcast_member_sync(&peers, &members, Some(peer_ip), dht_id.clone()).await;
@@ -1501,7 +1501,7 @@ async fn join_mesh_shared(
     let (_send, mut recv) = initial_conn.accept_bi().await.context("accept control stream")?;
     let msg = control::recv_msg(&mut recv).await?;
     let (members, approved, received_dht_id) = match msg {
-        ControlMsg::Welcome { members, approved, membership_dht_id } => {
+        ControlMsg::Welcome { members, approved, membership_dht_id, acl_dht_id: _ } => {
             tracing::info!(network = %network_name, "welcomed to network");
             if let Some(existing) = members.iter().find(|m| m.ip == my_ip && m.identity != my_identity) {
                 anyhow::bail!("IP collision: {} is already assigned to {}", my_ip, existing.identity);
@@ -1695,7 +1695,7 @@ async fn join_mesh_shared(
                                             };
                                             if let Ok((mut send, _)) = conn.open_bi().await {
                                                 let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
-                                                    members: members.clone(), approved: approved_list, membership_dht_id: None,
+                                                    members: members.clone(), approved: approved_list, membership_dht_id: None, acl_dht_id: None,
                                                 }).await;
                                             }
                                             peers.add(ip, conn.clone(), peer_identity, &network_name);
