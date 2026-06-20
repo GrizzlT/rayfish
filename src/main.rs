@@ -327,6 +327,30 @@ async fn run_accept_loop(
             continue;
         }
 
+        // Check IP collision before broadcasting approval (drop lock before any await)
+        let collision_reason: Option<String> = {
+            let s = state.read().unwrap();
+            if let Some(existing) = s.members.get_by_ip(peer_ip)
+                && existing.identity != remote_id
+            {
+                tracing::warn!(ip = %peer_ip, existing = %existing.identity, new = %remote_id, "IP collision");
+                Some(format!("IP collision: {} already assigned", peer_ip))
+            } else if let Some(existing) = s.approved.get_by_ip(peer_ip)
+                && existing.identity != remote_id
+            {
+                tracing::warn!(ip = %peer_ip, existing = %existing.identity, new = %remote_id, "IP collision (approved list)");
+                Some(format!("IP collision: {} already assigned", peer_ip))
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = collision_reason {
+            if let Ok((mut send, _)) = conn.open_bi().await {
+                let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
+            }
+            continue;
+        }
+
         // Broadcast MemberApproved to existing peers
         broadcast_control_msg(
             &peers,
@@ -337,15 +361,25 @@ async fn run_accept_loop(
         )
         .await;
 
-        // Immediately promote (peer is connected right now)
-        {
+        // Immediately promote (peer is connected right now); collision shouldn't happen
+        // after the check above, but handle defensively
+        let add_collision: Option<String> = {
             let mut s = state.write().unwrap();
             let new_member = Member {
                 identity: remote_id.clone(),
                 ip: peer_ip,
                 is_coordinator: false,
             };
-            let _ = s.members.add(new_member);
+            s.members.add(new_member).err().map(|e| {
+                tracing::warn!(error = %e, "IP collision adding member after broadcast");
+                format!("IP collision: {} already assigned", peer_ip)
+            })
+        };
+        if let Some(reason) = add_collision {
+            if let Ok((mut send, _)) = conn.open_bi().await {
+                let _ = control::send_msg(&mut send, &ControlMsg::JoinDenied { reason }).await;
+            }
+            continue;
         }
 
         let (members, approved) = {

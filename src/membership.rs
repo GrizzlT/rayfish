@@ -139,24 +139,24 @@ impl ApprovedList {
 
     pub fn approve(&mut self, entry: ApprovedEntry, members: &MemberList) -> Result<(), IpCollision> {
         // Check collision against existing members
-        if let Some(existing) = members.get_by_ip(entry.ip) {
-            if existing.identity != entry.identity {
-                return Err(IpCollision {
-                    ip: entry.ip,
-                    existing_identity: existing.identity.clone(),
-                    new_identity: entry.identity.clone(),
-                });
-            }
+        if let Some(existing) = members.get_by_ip(entry.ip)
+            && existing.identity != entry.identity
+        {
+            return Err(IpCollision {
+                ip: entry.ip,
+                existing_identity: existing.identity.clone(),
+                new_identity: entry.identity.clone(),
+            });
         }
         // Check collision within approved list
-        if let Some(existing) = self.get_by_ip(entry.ip) {
-            if existing.identity != entry.identity {
-                return Err(IpCollision {
-                    ip: entry.ip,
-                    existing_identity: existing.identity.clone(),
-                    new_identity: entry.identity.clone(),
-                });
-            }
+        if let Some(existing) = self.get_by_ip(entry.ip)
+            && existing.identity != entry.identity
+        {
+            return Err(IpCollision {
+                ip: entry.ip,
+                existing_identity: existing.identity.clone(),
+                new_identity: entry.identity.clone(),
+            });
         }
         self.entries.insert(entry.identity.clone(), entry);
         Ok(())
