@@ -33,6 +33,7 @@ use url::Url;
 // ---------------------------------------------------------------------------
 
 const RECORD_NAME: &str = "_pitopi";
+const ACL_RECORD_NAME: &str = "_pitopi_acl";
 const RECORD_VERSION: &str = "v1";
 const RECORD_TTL: u32 = 300;
 /// The production pkarr relay run by number 0.
@@ -55,6 +56,18 @@ pub fn derive_membership_key(coordinator_key: &SecretKey, network_name: &str) ->
 /// Returns the `EndpointId` (public key) under which membership is published on the DHT.
 pub fn membership_dht_id(coordinator_key: &SecretKey, network_name: &str) -> EndpointId {
     derive_membership_key(coordinator_key, network_name).public()
+}
+
+/// Derives a deterministic `SecretKey` for this network's DHT ACL record.
+pub fn derive_acl_key(coordinator_key: &SecretKey, network_name: &str) -> SecretKey {
+    let context = format!("pitopi/acl/{network_name}");
+    let derived = blake3::derive_key(&context, &coordinator_key.to_bytes());
+    SecretKey::from_bytes(&derived)
+}
+
+/// Returns the `EndpointId` under which the ACL record is published on the DHT.
+pub fn acl_dht_id(coordinator_key: &SecretKey, network_name: &str) -> EndpointId {
+    derive_acl_key(coordinator_key, network_name).public()
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +110,51 @@ pub fn decode_membership_record(
     }
 
     bail!("no membership hash found in record")
+}
+
+// ---------------------------------------------------------------------------
+// ACL record encoding / decoding
+// ---------------------------------------------------------------------------
+
+/// Encodes an ACL hash into a signed pkarr packet.
+pub fn encode_acl_record(key: &SecretKey, hash: &str) -> Result<SignedPacket> {
+    let values = vec![RECORD_VERSION.to_string(), format!("h,{hash}")];
+    SignedPacket::from_txt_strings(key, ACL_RECORD_NAME, values, RECORD_TTL)
+        .map_err(|e| anyhow::anyhow!("failed to build ACL packet: {e}"))
+}
+
+/// Decodes a signed pkarr ACL packet, extracting the ACL hash.
+pub fn decode_acl_record(packet: &SignedPacket) -> Result<String> {
+    let records = packet.txt_records(ACL_RECORD_NAME);
+    ensure!(!records.is_empty(), "no ACL records found");
+    ensure!(records[0] == RECORD_VERSION, "unsupported ACL record version: {}", records[0]);
+    for record in &records[1..] {
+        if let Some(hash) = record.strip_prefix("h,") {
+            return Ok(hash.to_string());
+        }
+    }
+    bail!("no ACL hash found in record")
+}
+
+/// Publishes an ACL hash to the pkarr relay.
+pub async fn publish_acl(client: &PkarrRelayClient, key: &SecretKey, hash: &str) -> Result<()> {
+    let packet = encode_acl_record(key, hash)?;
+    client
+        .publish(&packet)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to publish ACL: {e}"))
+}
+
+/// Resolves the ACL hash from the pkarr relay.
+pub async fn resolve_acl_hash(
+    client: &PkarrRelayClient,
+    dht_id: EndpointId,
+) -> Result<String> {
+    let packet = client
+        .resolve(dht_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve ACL: {e}"))?;
+    decode_acl_record(&packet)
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +498,58 @@ mod tests {
         let key = derive_directory_key(name);
         let id = directory_dht_id(name);
         assert_eq!(id, key.public());
+    }
+
+    // -- ACL record tests -------------------------------------------------------
+
+    #[test]
+    fn acl_key_is_deterministic() {
+        let key = SecretKey::generate();
+        let a = derive_acl_key(&key, "test-net");
+        let b = derive_acl_key(&key, "test-net");
+        assert_eq!(a.public(), b.public());
+    }
+
+    #[test]
+    fn acl_key_differs_by_network() {
+        let key = SecretKey::generate();
+        let a = derive_acl_key(&key, "alpha");
+        let b = derive_acl_key(&key, "beta");
+        assert_ne!(a.public(), b.public());
+    }
+
+    #[test]
+    fn acl_key_differs_from_membership_key() {
+        let key = SecretKey::generate();
+        let acl = derive_acl_key(&key, "test-net");
+        let mem = derive_membership_key(&key, "test-net");
+        assert_ne!(acl.public(), mem.public());
+    }
+
+    #[test]
+    fn acl_dht_id_matches_key() {
+        let key = SecretKey::generate();
+        let derived = derive_acl_key(&key, "net");
+        let id = acl_dht_id(&key, "net");
+        assert_eq!(id, derived.public());
+    }
+
+    #[test]
+    fn acl_record_roundtrip() {
+        let key = SecretKey::generate();
+        let hash = "aabbccdd1234567890";
+        let packet = encode_acl_record(&key, hash).unwrap();
+        let decoded = decode_acl_record(&packet).unwrap();
+        assert_eq!(decoded, hash);
+    }
+
+    #[test]
+    fn acl_record_rejects_missing_hash() {
+        let key = SecretKey::generate();
+        let values = vec!["v1".to_string()];
+        let packet = SignedPacket::from_txt_strings(&key, "_pitopi_acl", values, 300).unwrap();
+        let result = decode_acl_record(&packet);
+        assert!(result.is_err());
     }
 
     // -- Seed list record tests -----------------------------------------------
