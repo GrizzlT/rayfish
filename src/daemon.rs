@@ -158,12 +158,13 @@ impl DaemonState {
         let mut app_config = config::load()?;
         config::upsert_network(&mut app_config, config::NetworkConfig {
             name: name.to_string(),
-            coordinator_id: self.endpoint.id(),
             group_mode: mode,
             my_ip: Some(my_ip),
             members: member_entries,
             approved: approved_entries,
             membership_dht_id: Some(dht_id.clone()),
+            network_pkarr_pubkey: None,
+            membership_dht_pubkey: None,
         });
         config::save(&app_config)?;
 
@@ -540,11 +541,18 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
     // Restore saved networks
     for net in &app_config.networks {
         if net.my_ip.is_some() {
-            // We're a member — join
-            let node_id_str = net.coordinator_id.to_string();
+            // We're a member — join via coordinator (found in member list)
+            let coordinator = net.members.iter().find(|m| m.is_coordinator).cloned();
             let name = net.name.clone();
             let daemon_c = daemon.clone();
             tokio::spawn(async move {
+                let node_id_str = match coordinator {
+                    Some(m) => m.identity.to_string(),
+                    None => {
+                        tracing::warn!(network = %name, "no coordinator in saved config, cannot restore");
+                        return;
+                    }
+                };
                 match daemon_c.join_network_inner(&node_id_str, Some(&name)).await {
                     Ok(IpcResponse::Joined { name, my_ip }) => {
                         tracing::info!(network = %name, ip = %my_ip, "restored member network");
@@ -998,12 +1006,13 @@ async fn join_mesh_shared(
     });
     config::upsert_network(&mut app_config, config::NetworkConfig {
         name: network_name.to_string(),
-        coordinator_id: initial_conn.remote_id(),
         group_mode: GroupMode::Restricted,
         my_ip: Some(my_ip),
         members: member_entries,
         approved: approved_config,
         membership_dht_id: dht_id_to_save,
+        network_pkarr_pubkey: None,
+        membership_dht_pubkey: None,
     });
     config::save(&app_config)?;
 

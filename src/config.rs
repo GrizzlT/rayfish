@@ -26,10 +26,8 @@ pub struct ApprovedConfigEntry {
 /// A single saved network membership.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkConfig {
-    /// Human-readable network name.
+    /// Three-word network name (e.g., "gentle-amber-fox").
     pub name: String,
-    /// EndpointId of the network coordinator (creator).
-    pub coordinator_id: EndpointId,
     /// Membership mode: open or restricted.
     #[serde(default)]
     pub group_mode: GroupMode,
@@ -44,6 +42,12 @@ pub struct NetworkConfig {
     /// DHT membership key ID for this network (hex-encoded), if known.
     #[serde(default)]
     pub membership_dht_id: Option<String>,
+    /// Network pkarr public key (hex-encoded) for resolving seed list.
+    #[serde(default)]
+    pub network_pkarr_pubkey: Option<String>,
+    /// Membership DHT public key (hex-encoded) for resolving membership hash.
+    #[serde(default)]
+    pub membership_dht_pubkey: Option<String>,
 }
 
 /// Top-level config stored at `~/.config/pitopi/networks.toml`.
@@ -99,6 +103,7 @@ pub fn remove_network(config: &mut AppConfig, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::EndpointId;
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -112,7 +117,6 @@ mod tests {
             networks: vec![
                 NetworkConfig {
                     name: "gaming".to_string(),
-                    coordinator_id: test_id(1),
                     group_mode: GroupMode::Open,
                     my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
                     members: vec![
@@ -129,15 +133,18 @@ mod tests {
                     ],
                     approved: vec![],
                     membership_dht_id: None,
+                    network_pkarr_pubkey: None,
+                    membership_dht_pubkey: None,
                 },
                 NetworkConfig {
                     name: "work".to_string(),
-                    coordinator_id: test_id(4),
                     group_mode: GroupMode::Restricted,
                     my_ip: None,
                     members: vec![],
                     approved: vec![],
                     membership_dht_id: None,
+                    network_pkarr_pubkey: None,
+                    membership_dht_pubkey: None,
                 },
             ],
         };
@@ -159,12 +166,13 @@ mod tests {
         let mut config = AppConfig::default();
         let net = NetworkConfig {
             name: "test".to_string(),
-            coordinator_id: test_id(1),
             group_mode: GroupMode::Open,
             my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
             members: vec![],
             approved: vec![],
             membership_dht_id: None,
+            network_pkarr_pubkey: None,
+            membership_dht_pubkey: None,
         };
         upsert_network(&mut config, net.clone());
         assert_eq!(config.networks.len(), 1);
@@ -176,28 +184,29 @@ mod tests {
         let mut config = AppConfig {
             networks: vec![NetworkConfig {
                 name: "test".to_string(),
-                coordinator_id: test_id(1),
                 group_mode: GroupMode::Restricted,
                 my_ip: None,
                 members: vec![],
                 approved: vec![],
                 membership_dht_id: None,
+                network_pkarr_pubkey: None,
+                membership_dht_pubkey: None,
             }],
         };
-        let new_id = test_id(2);
         let updated = NetworkConfig {
             name: "test".to_string(),
-            coordinator_id: new_id,
             group_mode: GroupMode::Open,
             my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
             members: vec![],
             approved: vec![],
             membership_dht_id: None,
+            network_pkarr_pubkey: None,
+            membership_dht_pubkey: None,
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
-        assert_eq!(config.networks[0].coordinator_id, new_id);
         assert_eq!(config.networks[0].group_mode, GroupMode::Open);
+        assert_eq!(config.networks[0].my_ip, Some(Ipv4Addr::new(100, 64, 10, 5)));
     }
 
     #[test]
@@ -206,21 +215,23 @@ mod tests {
             networks: vec![
                 NetworkConfig {
                     name: "keep".to_string(),
-                    coordinator_id: test_id(1),
                     group_mode: GroupMode::Restricted,
                     my_ip: None,
                     members: vec![],
                     approved: vec![],
                     membership_dht_id: None,
+                    network_pkarr_pubkey: None,
+                    membership_dht_pubkey: None,
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
-                    coordinator_id: test_id(2),
                     group_mode: GroupMode::Restricted,
                     my_ip: None,
                     members: vec![],
                     approved: vec![],
                     membership_dht_id: None,
+                    network_pkarr_pubkey: None,
+                    membership_dht_pubkey: None,
                 },
             ],
         };
@@ -242,7 +253,6 @@ mod tests {
         let config = AppConfig {
             networks: vec![NetworkConfig {
                 name: "gaming".to_string(),
-                coordinator_id: id1,
                 group_mode: GroupMode::Restricted,
                 my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
                 members: vec![MemberEntry {
@@ -255,6 +265,8 @@ mod tests {
                     ip: Ipv4Addr::new(100, 64, 12, 34),
                 }],
                 membership_dht_id: None,
+                network_pkarr_pubkey: None,
+                membership_dht_pubkey: None,
             }],
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -269,12 +281,13 @@ mod tests {
         let config = AppConfig {
             networks: vec![NetworkConfig {
                 name: "gaming".to_string(),
-                coordinator_id: test_id(1),
                 group_mode: GroupMode::Restricted,
                 my_ip: Some(Ipv4Addr::new(100, 64, 10, 5)),
                 members: vec![],
                 approved: vec![],
                 membership_dht_id: Some("dht-key-xyz".to_string()),
+                network_pkarr_pubkey: None,
+                membership_dht_pubkey: None,
             }],
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -288,7 +301,6 @@ mod tests {
         let toml_str = r#"
 [[networks]]
 name = "test"
-coordinator_id = "19bf5a58ddce79c97edefc3e5a9e1eae5b41e55d03cf5de8d71b5c7b70cadb00"
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.networks[0].membership_dht_id, None);
@@ -296,14 +308,10 @@ coordinator_id = "19bf5a58ddce79c97edefc3e5a9e1eae5b41e55d03cf5de8d71b5c7b70cadb
 
     #[test]
     fn test_deserialize_minimal() {
-        let coord_id = iroh::SecretKey::generate().public();
-        let toml_str = format!(
-            r#"
+        let toml_str = r#"
 [[networks]]
 name = "test"
-coordinator_id = "{coord_id}"
-"#
-        );
+"#;
         let config: AppConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.networks.len(), 1);
         assert_eq!(config.networks[0].name, "test");
@@ -311,5 +319,18 @@ coordinator_id = "{coord_id}"
         assert!(config.networks[0].members.is_empty());
         assert!(config.networks[0].approved.is_empty());
         assert_eq!(config.networks[0].membership_dht_id, None);
+        assert_eq!(config.networks[0].network_pkarr_pubkey, None);
+        assert_eq!(config.networks[0].membership_dht_pubkey, None);
+    }
+
+    #[test]
+    fn test_new_fields_default_none() {
+        let config: AppConfig = toml::from_str(r#"
+[[networks]]
+name = "test"
+membership_dht_id = "abc123"
+"#).unwrap();
+        assert_eq!(config.networks[0].network_pkarr_pubkey, None);
+        assert_eq!(config.networks[0].membership_dht_pubkey, None);
     }
 }

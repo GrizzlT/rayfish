@@ -164,10 +164,14 @@ fn cmd_list() -> Result<()> {
             .my_ip
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "coordinator".to_string());
+        let coordinator = net.members.iter()
+            .find(|m| m.is_coordinator)
+            .map(|m| m.identity.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         println!(
             "{} (coordinator: {}, ip: {}, members: {}, mode: {:?})",
             net.name,
-            net.coordinator_id,
+            coordinator,
             ip_str,
             net.members.len(),
             net.group_mode,
