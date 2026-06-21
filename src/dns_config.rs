@@ -109,6 +109,7 @@ impl DnsConfigurator for MacosResolver {
         let content = format!("{HEADER_COMMENT}nameserver {RESOLVER_IP}\n");
         std::fs::write(&path, content).context("writing /etc/resolver file")?;
         tracing::info!("configured macOS scoped resolver for .{DNS_DOMAIN} via {RESOLVER_IP}");
+
         Ok(())
     }
 
@@ -122,6 +123,139 @@ impl DnsConfigurator for MacosResolver {
     fn name(&self) -> &'static str {
         "macos-scoped-resolver"
     }
+}
+
+/// Update system search domains so bare hostnames resolve through pitopi.
+/// Sets search domains to `pi` + `<network>.pi` for each active network.
+/// Call whenever networks are joined or left.
+pub fn update_search_domains(network_names: &[String]) {
+    let mut domains: Vec<String> = network_names
+        .iter()
+        .map(|n| format!("{n}.{DNS_DOMAIN}"))
+        .collect();
+    domains.push(DNS_DOMAIN.to_string());
+
+    if let Err(e) = set_search_domains(&domains) {
+        tracing::warn!(error = %e, "failed to update search domains");
+    } else {
+        tracing::info!(domains = ?domains, "updated search domains");
+    }
+}
+
+/// Remove all pitopi search domains (called on daemon shutdown).
+pub fn clear_search_domains() {
+    if let Err(e) = set_search_domains(&[]) {
+        tracing::warn!(error = %e, "failed to clear search domains");
+    }
+}
+
+fn set_search_domains(pitopi_domains: &[String]) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        set_search_domains_macos(pitopi_domains)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        set_search_domains_linux(pitopi_domains)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pitopi_domains;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn active_network_service() -> Option<String> {
+    use std::process::Command;
+    let output = Command::new("networksetup")
+        .args(["-listallnetworkservices"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().skip(1) {
+        let service = line.trim_start_matches('*').trim();
+        if service.is_empty() {
+            continue;
+        }
+        let check = Command::new("networksetup")
+            .args(["-getinfo", service])
+            .output()
+            .ok()?;
+        let info = String::from_utf8_lossy(&check.stdout);
+        if info.lines().any(|l| l.starts_with("IP address: ") && !l.contains("none")) {
+            return Some(service.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn get_macos_search_domains(service: &str) -> Vec<String> {
+    use std::process::Command;
+    let output = Command::new("networksetup")
+        .args(["-getsearchdomains", service])
+        .output()
+        .ok();
+    match output {
+        Some(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            if stdout.contains("aren't any") {
+                Vec::new()
+            } else {
+                stdout.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()
+            }
+        }
+        None => Vec::new(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_search_domains_macos(pitopi_domains: &[String]) -> Result<()> {
+    use std::process::Command;
+    let service = active_network_service().context("no active network service")?;
+    let existing = get_macos_search_domains(&service);
+    // Keep non-pitopi domains, replace pitopi ones
+    let mut domains: Vec<String> = existing
+        .into_iter()
+        .filter(|d| !d.ends_with(&format!(".{DNS_DOMAIN}")) && d != DNS_DOMAIN)
+        .collect();
+    domains.extend(pitopi_domains.iter().cloned());
+
+    if domains.is_empty() {
+        let status = Command::new("networksetup")
+            .args(["-setsearchdomains", &service, "empty"])
+            .status()
+            .context("networksetup -setsearchdomains")?;
+        anyhow::ensure!(status.success(), "networksetup -setsearchdomains failed");
+    } else {
+        let status = Command::new("networksetup")
+            .arg("-setsearchdomains")
+            .arg(&service)
+            .args(&domains)
+            .status()
+            .context("networksetup -setsearchdomains")?;
+        anyhow::ensure!(status.success(), "networksetup -setsearchdomains failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_search_domains_linux(pitopi_domains: &[String]) -> Result<()> {
+    use std::process::Command;
+    // Try systemd-resolved first
+    if Command::new("resolvectl").arg("status").output().is_ok_and(|o| o.status.success()) {
+        let mut args = vec!["domain".to_string(), "utun_pitopi".to_string()];
+        // Keep the routing domain
+        args.push(format!("~{DNS_DOMAIN}"));
+        args.extend(pitopi_domains.iter().cloned());
+        let status = Command::new("resolvectl")
+            .args(&args)
+            .status()
+            .context("resolvectl domain")?;
+        anyhow::ensure!(status.success(), "resolvectl domain failed");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

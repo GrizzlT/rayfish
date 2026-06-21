@@ -98,7 +98,7 @@ async fn handle_query(data: &[u8], table: &HostnameTable) -> Option<Vec<u8>> {
     }
 }
 
-async fn resolve_name(name: &str, suffix: &str, table: &HostnameTable) -> Option<HostnameEntry> {
+pub async fn resolve_name(name: &str, suffix: &str, table: &HostnameTable) -> Option<HostnameEntry> {
     let stripped = name.strip_suffix(suffix)?;
     let table_guard = table.read().await;
 

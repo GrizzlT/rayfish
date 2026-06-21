@@ -51,8 +51,3 @@ pub fn load_collision_index() -> Result<u32> {
         Ok(0)
     }
 }
-
-pub fn save_collision_index(index: u32) -> Result<()> {
-    let path = collision_index_path()?;
-    std::fs::write(&path, index.to_string()).context("write collision_index")
-}

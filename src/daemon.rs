@@ -772,6 +772,9 @@ impl DaemonState {
             .collect();
         tracing::info!(alpns = ?alpn_strs, "refreshing ALPNs");
         self.endpoint.set_alpns(alpns);
+
+        let network_names: Vec<String> = self.networks.iter().map(|e| e.key().clone()).collect();
+        dns_config::update_search_domains(&network_names);
     }
 
     async fn handle_request(&self, req: IpcRequest) -> IpcResponse {
@@ -2510,23 +2513,23 @@ impl DaemonState {
     // File sharing
     // -----------------------------------------------------------------------
 
-    fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
-        for entry in self.networks.iter() {
-            let state = entry.value().state.read().unwrap();
-            if let Some(m) = state
-                .members
-                .all()
-                .iter()
-                .find(|m| m.hostname.as_deref() == Some(name))
-            {
-                return Some(m.identity);
+    async fn resolve_peer_name(&self, name: &str) -> Option<EndpointId> {
+        let suffix = format!(".{}", crate::DNS_DOMAIN);
+        let qualified = if name.ends_with(&suffix) {
+            name.to_string()
+        } else {
+            format!("{name}{suffix}")
+        };
+        if let Some((ip, _)) = dns::resolve_name(&qualified, &suffix, &self.hostname_table).await {
+            if let Some((_, eid, _)) = self.peers.lookup_v4(&ip) {
+                return Some(eid);
             }
         }
         self.resolve_short_id_any_network(name)
     }
 
     async fn send_file(&self, path: &str, peer: &str) -> IpcResponse {
-        let peer_id = match self.resolve_peer_name(peer) {
+        let peer_id = match self.resolve_peer_name(peer).await {
             Some(id) => id,
             None => {
                 return IpcResponse::Error {
@@ -2954,6 +2957,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
                     && let Err(e) = configurator.revert() {
                         tracing::warn!(error = %e, "failed to revert DNS configuration");
                     }
+                dns_config::clear_search_domains();
                 let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
             }

@@ -244,10 +244,8 @@ pub fn policy_for_mode(mode: GroupMode) -> Box<dyn MembershipPolicy> {
 /// depend directly on iroh types.
 pub trait IdentityProvider: Send + Sync {
     fn local_ip(&self) -> Ipv4Addr;
-    fn local_ipv6(&self) -> Ipv6Addr;
     fn local_identity(&self) -> EndpointId;
     fn derive_ip(&self, peer_identity: &EndpointId) -> Ipv4Addr;
-    fn derive_ipv6(&self, peer_identity: &EndpointId) -> Ipv6Addr;
 }
 
 /// Derives a deterministic virtual IP from an [`EndpointId`] using FNV-1a.
@@ -302,24 +300,12 @@ pub fn derive_ipv6(identity: &EndpointId) -> Ipv6Addr {
 pub struct IrohIdentityProvider {
     endpoint_id: EndpointId,
     ip: Ipv4Addr,
-    ipv6: Ipv6Addr,
-    collision_index: u32,
 }
 
 impl IrohIdentityProvider {
     pub fn new(endpoint_id: EndpointId, collision_index: u32) -> Self {
         let ip = derive_ip_with_index(&endpoint_id, collision_index);
-        let ipv6 = derive_ipv6(&endpoint_id);
-        Self {
-            endpoint_id,
-            ip,
-            ipv6,
-            collision_index,
-        }
-    }
-
-    pub fn collision_index(&self) -> u32 {
-        self.collision_index
+        Self { endpoint_id, ip }
     }
 }
 
@@ -328,20 +314,12 @@ impl IdentityProvider for IrohIdentityProvider {
         self.ip
     }
 
-    fn local_ipv6(&self) -> Ipv6Addr {
-        self.ipv6
-    }
-
     fn local_identity(&self) -> EndpointId {
         self.endpoint_id
     }
 
     fn derive_ip(&self, peer_identity: &EndpointId) -> Ipv4Addr {
         derive_ip(peer_identity)
-    }
-
-    fn derive_ipv6(&self, peer_identity: &EndpointId) -> Ipv6Addr {
-        derive_ipv6(peer_identity)
     }
 }
 
