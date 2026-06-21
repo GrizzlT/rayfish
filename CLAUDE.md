@@ -19,6 +19,7 @@ sudo cargo -q run -- daemon
 
 # In another terminal: create/join/manage networks (talks to daemon via IPC)
 cargo -q run -- create                      # generates network + prints join code (public key)
+cargo -q run -- create --name gaming        # create with a custom network name
 cargo -q run -- create --hostname alice     # create with a chosen DNS hostname
 cargo -q run -- join <public-key>           # join by public key (the join code)
 cargo -q run -- join <public-key> --name my-net  # join with a local alias
@@ -73,7 +74,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 
 ### Modules
 
-- `src/main.rs` — thin CLI client (clap), IPC client functions, `spawn_path_logger`, service install/uninstall; `pitopi create` (generates network, prints join code), `pitopi join <public-key> [--name alias]`, `pitopi nuke <name>`, `pitopi acl <network> tag/untag/allow/remove/show/apply` subcommands; `pitopi status` displays DNS names (hostname.network.pi) instead of IPs when available
+- `src/main.rs` — thin CLI client (clap), IPC client functions, `spawn_path_logger`, service install/uninstall; `pitopi create [--name custom-name]` (generates network with optional custom name, prints join code), `pitopi join <public-key> [--name alias]`, `pitopi nuke <name>`, `pitopi acl <network> tag/untag/allow/remove/show/apply` subcommands; `pitopi status` displays DNS names (hostname.network.pi) instead of IPs when available
 - `src/daemon.rs` — daemon process: DaemonState (shared endpoint + TUN + PeerTable + ProtocolRouter), NetworkHandle per active network, IPC server over Unix socket, ProtocolRouter dispatches connections via iroh ProtocolHandler by ALPN (MeshProtocol per network + BlobsProtocol for blob transfers), coordinator accept loop, joiner mesh logic, reconnect loop, single DHT publisher (`spawn_network_publisher`), group poller (`spawn_group_poller`), local alias generation, `nuke_network()`, `restore_coordinator_network()`, ACL state on NetworkHandle, IPC handlers for ACL commands, ACL included in GroupBlob, ACL load from file on startup, empty record publish on nuke; MeshHello propagates hostname to peers with collision resolution via `resolve_collision()`, DNS table updated on peer connection; hostname persisted per-network in config (`my_hostname`); coordinator reads MeshHello from connecting peers via `spawn_coordinator_hello_reader()` to learn their hostname, update member list, and register in DNS table; joiner sends MeshHello to coordinator on initial connection
 - `src/network_name.rs` — local alias generation: adjective-noun-noun word lists embedded at compile time, `generate_name()` (random selection via rand), `is_valid_name()` for validation
 - `src/ipc.rs` — IPC protocol types (IpcRequest, IpcResponse, NetworkStatus, PeerStatus), length-prefixed JSON wire helpers, socket path (`/var/run/pitopi/pitopi.sock`), client connect helper; `IpcRequest::Create` has no `name` field, `IpcRequest::Join { network_key, name: Option }`, `IpcRequest::Nuke { name, force }`, `IpcRequest::AclTag`, `AclUntag`, `AclAllow`, `AclRemove`, `AclShow`, `AclApply`, `FirewallAdd`, `FirewallRemove`, `FirewallShow`, `FirewallDefault`; `IpcResponse::Created { name, network_key, my_ip }`, `IpcResponse::AclState`, `IpcResponse::FirewallState`
@@ -81,7 +82,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 - `src/membership.rs` — IdentityProvider trait, FNV-1a IP derivation, MemberList, ApprovedList, GroupMode, MembershipPolicy, canonical msgpack serialization + blake3 hashing; `GroupBlob { members, approved, acl }`, `canonical_group_bytes()`, `group_blob_hash()`, `decode_group_blob()`, `verify_group_blob()`
 - `src/transport.rs` — iroh endpoint setup, per-network ALPN, connect/accept
 - `src/tun.rs` — TUN device creation with /10 netmask, split into TunReader/TunWriter for lock-free I/O
-- `src/forward.rs` — multi-peer forwarding: TUN → routing table → correct peer connection, DisconnectEvent notification on peer drop; network ACL enforcement + local firewall enforcement in `run_mesh` (outbound: local→peer) and `spawn_peer_reader` (inbound: peer→local); denied packets dropped with `stats.record_drop()`
+- `src/forward.rs` — multi-peer forwarding: TUN → routing table → correct peer connection, DisconnectEvent notification on peer drop; network ACL enforcement + local firewall enforcement in `run_mesh` (outbound: local→peer) and `spawn_peer_reader` (inbound: peer→local); labeled drop counters via `stats.record_drop(DropReason::*)`
 - `src/dht.rs` — single pkarr record type per network: `encode_network_record(key, blob_hash, seed_peers)`, `decode_network_record(packet)`, `publish_network()`, `resolve_network()`; only the coordinator (holder of per-network secret key) can publish
 - `src/control.rs` — control protocol: Welcome, MemberApproved, JoinApproved, JoinDenied, MemberSync, MeshHello, MeshWelcome, ReconnectRequest, AdvertiseServices, `BlobUpdated { hash: blake3::Hash }`
 - `src/peers.rs` — PeerTable (routing by dest IP), PeerEntry with Connection + endpoint_id + network name, remove_by_network for teardown; `SharedAcl` type, `PeerTable::lookup_full()` for ACL-aware routing
@@ -92,12 +93,12 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 - `src/dns_config.rs` — OS-level DNS configuration: `DnsConfigurator` trait with `apply()`/`revert()`, platform detection chain (macOS scoped resolver `/etc/resolver/pi`, Linux systemd-resolved/resolvconf/direct), resolver points to `127.0.0.1`, backup/restore of modified files (`.before-pitopi` suffix), crash recovery on daemon start
 - `src/hostname.rs` — hostname generation (`generate_hostname()` from NOUNS_B word list), validation (`is_valid_hostname()`), collision resolution (`resolve_collision()` — appends numeric suffix, wired into MeshHello handler)
 - `src/audit.rs` — append-only audit log at `~/.config/pitopi/audit.log` (not yet wired in)
-- `src/stats.rs` — packet/byte counters with periodic logging
+- `src/stats.rs` — `ForwardMetrics` (iroh-metrics `MetricsGroup`): `packets_rx/tx`, `bytes_rx/tx` counters + `Family<DropLabels, Counter>` for labeled drops (`Acl`, `Firewall`, `SendFailure`, `NoPeer`, `Malformed`); 30-second interval logger + session summary; registered with iroh-metrics `Registry` alongside iroh's endpoint metrics for Prometheus export on `:9090`
 - `src/shutdown.rs` — SIGINT/SIGTERM handling via CancellationToken
 
 ### Key flows
 
-**Create (coordinator):** generates local alias (three-word name via `network_name::generate_name()`) → generates random per-network `SecretKey` → builds initial `GroupBlob` (self as member, empty approved, empty ACL) → serializes + blake3 hashes → publishes blob to iroh-blobs store → publishes single pkarr record (blob hash + seed peers) signed with network secret key → persists `network_secret_key` (hex) + `network_public_key` to config → spawns `spawn_network_publisher` → prints public key as the join code.
+**Create (coordinator):** uses custom name if provided via `--name`, otherwise generates three-word name via `network_name::generate_name()` → generates random per-network `SecretKey` → builds initial `GroupBlob` (self as member, empty approved, empty ACL) → serializes + blake3 hashes → publishes blob to iroh-blobs store → publishes single pkarr record (blob hash + seed peers) signed with network secret key → persists `network_secret_key` (hex) + `network_public_key` to config → spawns `spawn_network_publisher` → prints public key as the join code.
 
 **Join:** parses public key join code → resolves single pkarr record (blob hash + seed peers) → connects to a seed peer, fetches GroupBlob via iroh-blobs → verifies `blake3(blob) == hash` → applies members, approved list, ACL from GroupBlob → connects to coordinator or mesh peer → receives Welcome (latest member list + approved list) → joiner checks own IP for collision → connects to each existing peer with MeshHello → spawns per-peer datagram readers → spawns `spawn_group_poller` to poll pkarr for blob updates.
 
@@ -137,6 +138,7 @@ A background `spawn_group_poller()` checks the pkarr record every 60s and fetche
 - `rmp-serde` — msgpack serialization for canonical membership and ACL data (compact, deterministic)
 - `serde` + `serde_json` + `toml` — serialization for control messages and config
 - `simple-dns` — DNS packet parsing/building for Magic DNS resolver (A queries and responses)
+- `iroh-metrics` — Prometheus-compatible metrics: `Counter`, `Gauge`, `Family` with `MetricsGroup` derive, `Registry`, `MetricsServer` HTTP endpoint
 - `dashmap` — lock-free concurrent hash map for ProtocolRouter handler dispatch
 - `dirs` — platform config directory resolution
 

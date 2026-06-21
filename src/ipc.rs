@@ -14,6 +14,8 @@ pub enum IpcRequest {
     Create {
         mode: GroupMode,
         #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
         hostname: Option<String>,
     },
     Join {
@@ -92,6 +94,14 @@ pub enum IpcResponse {
     Status {
         endpoint_id: EndpointId,
         networks: Vec<NetworkStatus>,
+        #[serde(default)]
+        packets_rx: u64,
+        #[serde(default)]
+        packets_tx: u64,
+        #[serde(default)]
+        bytes_rx: u64,
+        #[serde(default)]
+        bytes_tx: u64,
     },
     AclState {
         display: String,
@@ -199,6 +209,7 @@ mod tests {
     fn test_request_roundtrip() {
         let req = IpcRequest::Create {
             mode: GroupMode::Open,
+            name: None,
             hostname: None,
         };
         let json = serde_json::to_vec(&req).unwrap();
@@ -285,11 +296,15 @@ mod tests {
                     connection: None,
                 }],
             }],
+            packets_rx: 0,
+            packets_tx: 0,
+            bytes_rx: 0,
+            bytes_tx: 0,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let decoded: IpcResponse = serde_json::from_slice(&json).unwrap();
         match decoded {
-            IpcResponse::Status { endpoint_id, networks } => {
+            IpcResponse::Status { endpoint_id, networks, .. } => {
                 assert_eq!(endpoint_id, ep_id);
                 assert_eq!(networks.len(), 1);
                 assert_eq!(networks[0].peers[0].endpoint_id, peer_id);

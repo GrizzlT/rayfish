@@ -46,28 +46,29 @@ sudo pitopi daemon &    # start the daemon in the background
 
 ```bash
 # Create a network — you become the coordinator
-pitopi create
+pitopi create --hostname alice
 # > Network created: gentle-amber-fox
 # >   IP: 100.64.23.142
+# >   Hostname: alice.gentle-amber-fox.pi
 # >   Join code: 3f8a...c7d2
 # >   Share this join code to invite others
 
 # On another machine, join using the join code
-pitopi join 3f8a...c7d2 --name gaming
+pitopi join 3f8a...c7d2 --name gaming --hostname bob
 # > Joined network 'gaming'.
 # >   IP: 100.64.7.201
+# >   Hostname: bob.gaming.pi
 
 # Check what's running
 pitopi status
 # > Endpoint: <your-endpoint-id>
-# >   gaming [coordinator]
-# >     IP: 100.64.23.142
+# >   gaming [coordinator] — alice.gaming.pi
 # >     Peers:
-# >       100.64.7.201 (<peer-endpoint-id>)
+# >       bob.gaming.pi (b3f2)
 
-# Reach each other
-ping 100.64.23.142    # from the joiner
-ping 100.64.7.201     # from the coordinator
+# Reach each other by name or IP
+ping alice.gaming.pi    # from the joiner
+ping bob.pi             # from the coordinator (flat lookup)
 
 # Leave a network
 pitopi leave gaming
@@ -188,6 +189,16 @@ sudo pitopi install-service    # installs systemd unit or launchd plist
 ```
 
 The service runs `pitopi daemon` on boot, restoring all saved networks automatically. `just deploy <ip>` does this automatically on Linux servers.
+
+## Metrics
+
+The daemon exposes Prometheus-compatible metrics on port 9090:
+
+```bash
+curl http://localhost:9090/metrics
+```
+
+Includes pitopi forwarding counters (`pitopi_packets_rx_total`, `pitopi_bytes_tx_total`, `pitopi_drops_total{reason="acl"}`, etc.) and iroh transport metrics (`socket_*`, `net_report_*`). `pitopi status` also shows aggregate traffic stats.
 
 ## Configuration
 

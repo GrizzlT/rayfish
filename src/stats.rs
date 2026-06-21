@@ -1,55 +1,85 @@
-//! Packet and byte counters with periodic logging.
+//! Packet and byte counters using iroh-metrics with Prometheus-compatible export.
 //!
-//! Uses atomics for lock-free recording from concurrent peer reader tasks.
-//! A background logger prints 30-second interval stats and a session summary on shutdown.
+//! Replaces hand-rolled atomics with `iroh_metrics::Counter` and labeled drop
+//! counters via `Family<DropLabels, Counter>`. A background logger prints
+//! 30-second interval deltas and a session summary on shutdown.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use iroh_metrics::{Counter, EncodeLabelSet, EncodeLabelValue, Family, MetricsGroup};
 use tokio_util::sync::CancellationToken;
 
-/// Lock-free packet/byte counters shared across all forwarding tasks.
-pub struct Stats {
-    packets_rx: AtomicU64,
-    packets_tx: AtomicU64,
-    bytes_rx: AtomicU64,
-    bytes_tx: AtomicU64,
-    drops: AtomicU64,
-    start_time: Instant,
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, EncodeLabelValue)]
+pub enum DropReason {
+    Acl,
+    Firewall,
+    SendFailure,
+    NoPeer,
+    Malformed,
 }
 
-impl Stats {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            packets_rx: AtomicU64::new(0),
-            packets_tx: AtomicU64::new(0),
-            bytes_rx: AtomicU64::new(0),
-            bytes_tx: AtomicU64::new(0),
-            drops: AtomicU64::new(0),
-            start_time: Instant::now(),
-        })
-    }
+impl DropReason {
+    const ALL: [DropReason; 5] = [
+        DropReason::Acl,
+        DropReason::Firewall,
+        DropReason::SendFailure,
+        DropReason::NoPeer,
+        DropReason::Malformed,
+    ];
+}
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, EncodeLabelSet)]
+pub struct DropLabels {
+    pub reason: DropReason,
+}
+
+#[derive(Debug, MetricsGroup)]
+#[metrics(name = "pitopi", default)]
+pub struct ForwardMetrics {
+    /// Total packets received from peers
+    pub packets_rx: Counter,
+    /// Total packets sent to peers
+    pub packets_tx: Counter,
+    /// Total bytes received from peers
+    pub bytes_rx: Counter,
+    /// Total bytes sent to peers
+    pub bytes_tx: Counter,
+    /// Dropped packets by reason
+    pub drops: Family<DropLabels, Counter>,
+}
+
+impl ForwardMetrics {
     pub fn record_rx(&self, bytes: usize) {
-        self.packets_rx.fetch_add(1, Ordering::Relaxed);
-        self.bytes_rx.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.packets_rx.inc();
+        self.bytes_rx.inc_by(bytes as u64);
     }
 
     pub fn record_tx(&self, bytes: usize) {
-        self.packets_tx.fetch_add(1, Ordering::Relaxed);
-        self.bytes_tx.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.packets_tx.inc();
+        self.bytes_tx.inc_by(bytes as u64);
     }
 
-    pub fn record_drop(&self) {
-        self.drops.fetch_add(1, Ordering::Relaxed);
+    pub fn record_drop(&self, reason: DropReason) {
+        self.drops.get_or_create(&DropLabels { reason }).inc();
     }
 
-    /// Spawns a background task that logs stats every 30 seconds and prints
-    /// a session summary when the cancellation token fires.
+    fn total_drops(&self) -> u64 {
+        DropReason::ALL
+            .iter()
+            .map(|r| {
+                self.drops
+                    .get(&DropLabels { reason: *r })
+                    .map(|c| c.get())
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
     pub fn spawn_logger(self: &Arc<Self>, token: CancellationToken) {
         let stats = self.clone();
         tokio::spawn(async move {
+            let start = Instant::now();
             let mut prev_rx = 0u64;
             let mut prev_tx = 0u64;
             let mut prev_bytes_rx = 0u64;
@@ -59,11 +89,11 @@ impl Stats {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        let rx = stats.packets_rx.load(Ordering::Relaxed);
-                        let tx = stats.packets_tx.load(Ordering::Relaxed);
-                        let brx = stats.bytes_rx.load(Ordering::Relaxed);
-                        let btx = stats.bytes_tx.load(Ordering::Relaxed);
-                        let drops = stats.drops.load(Ordering::Relaxed);
+                        let rx = stats.packets_rx.get();
+                        let tx = stats.packets_tx.get();
+                        let brx = stats.bytes_rx.get();
+                        let btx = stats.bytes_tx.get();
+                        let drops = stats.total_drops();
 
                         tracing::info!(
                             rx = rx - prev_rx,
@@ -81,29 +111,23 @@ impl Stats {
                         prev_drops = drops;
                     }
                     _ = token.cancelled() => {
-                        stats.log_summary();
+                        let duration = start.elapsed();
+                        let mins = duration.as_secs() / 60;
+                        let secs = duration.as_secs() % 60;
+                        let total_bytes = stats.bytes_rx.get() + stats.bytes_tx.get();
+
+                        tracing::info!(
+                            duration = format!("{}m{}s", mins, secs),
+                            total_rx = stats.packets_rx.get(),
+                            total_tx = stats.packets_tx.get(),
+                            total_bytes,
+                            "session complete"
+                        );
                         return;
                     }
                 }
             }
         });
-    }
-
-    fn log_summary(&self) {
-        let duration = self.start_time.elapsed();
-        let mins = duration.as_secs() / 60;
-        let secs = duration.as_secs() % 60;
-
-        let total_bytes =
-            self.bytes_rx.load(Ordering::Relaxed) + self.bytes_tx.load(Ordering::Relaxed);
-
-        tracing::info!(
-            duration = format!("{}m{}s", mins, secs),
-            total_rx = self.packets_rx.load(Ordering::Relaxed),
-            total_tx = self.packets_tx.load(Ordering::Relaxed),
-            total_bytes,
-            "session complete"
-        );
     }
 }
 
@@ -113,26 +137,47 @@ mod tests {
 
     #[test]
     fn test_record_rx() {
-        let stats = Stats::new();
+        let stats = ForwardMetrics::default();
         stats.record_rx(100);
         stats.record_rx(200);
-        assert_eq!(stats.packets_rx.load(Ordering::Relaxed), 2);
-        assert_eq!(stats.bytes_rx.load(Ordering::Relaxed), 300);
+        assert_eq!(stats.packets_rx.get(), 2);
+        assert_eq!(stats.bytes_rx.get(), 300);
     }
 
     #[test]
     fn test_record_tx() {
-        let stats = Stats::new();
+        let stats = ForwardMetrics::default();
         stats.record_tx(500);
-        assert_eq!(stats.packets_tx.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.bytes_tx.load(Ordering::Relaxed), 500);
+        assert_eq!(stats.packets_tx.get(), 1);
+        assert_eq!(stats.bytes_tx.get(), 500);
     }
 
     #[test]
     fn test_record_drop() {
-        let stats = Stats::new();
-        stats.record_drop();
-        stats.record_drop();
-        assert_eq!(stats.drops.load(Ordering::Relaxed), 2);
+        let stats = ForwardMetrics::default();
+        stats.record_drop(DropReason::Acl);
+        stats.record_drop(DropReason::Firewall);
+        stats.record_drop(DropReason::Acl);
+        assert_eq!(
+            stats
+                .drops
+                .get(&DropLabels {
+                    reason: DropReason::Acl
+                })
+                .unwrap()
+                .get(),
+            2
+        );
+        assert_eq!(
+            stats
+                .drops
+                .get(&DropLabels {
+                    reason: DropReason::Firewall
+                })
+                .unwrap()
+                .get(),
+            1
+        );
+        assert_eq!(stats.total_drops(), 3);
     }
 }

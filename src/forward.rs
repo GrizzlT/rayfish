@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::acl::AclData;
 use crate::firewall::{self, Action, Direction, SharedFirewall};
 use crate::peers::PeerTable;
-use crate::stats::Stats;
+use crate::stats::{DropReason, ForwardMetrics};
 use crate::tun::{TunReader, TunWriter};
 
 /// Maximum datagram size accepted from a peer. Anything larger is dropped before
@@ -111,7 +111,7 @@ pub async fn run_mesh(
     shared_acl: SharedAcl,
     firewall: SharedFirewall,
     token: CancellationToken,
-    stats: Arc<Stats>,
+    stats: Arc<ForwardMetrics>,
 ) -> Result<()> {
     let mut buf = vec![0u8; 1500];
     loop {
@@ -127,12 +127,12 @@ pub async fn run_mesh(
                             let acl = shared_acl.get(&network);
                             if !acl.is_allowed(&local_id, &peer_endpoint_id) {
                                 tracing::debug!(dst = %info.dst_ip, "ACL denied outbound");
-                                stats.record_drop();
+                                stats.record_drop(DropReason::Acl);
                                 continue;
                             }
                             if firewall.evaluate_packet(Direction::Out, &info, &peer_endpoint_id) == Action::Deny {
                                 tracing::debug!(dst = %info.dst_ip, port = info.dst_port, "firewall denied outbound");
-                                stats.record_drop();
+                                stats.record_drop(DropReason::Firewall);
                                 continue;
                             }
                             tracing::debug!(dst = %info.dst_ip, "routing to peer");
@@ -140,12 +140,12 @@ pub async fn run_mesh(
                                 Ok(()) => stats.record_tx(n),
                                 Err(e) => {
                                     tracing::debug!(dst = %info.dst_ip, error = %e, "datagram send failed");
-                                    stats.record_drop();
+                                    stats.record_drop(DropReason::SendFailure);
                                 }
                             }
                         } else {
                             tracing::debug!(dst = %info.dst_ip, "no peer for dst");
-                            stats.record_drop();
+                            stats.record_drop(DropReason::NoPeer);
                         }
                     } else {
                         tracing::debug!(len = n, "not IPv4, dropping");
@@ -171,7 +171,7 @@ pub fn spawn_peer_reader(
     tun_tx: mpsc::Sender<Vec<u8>>,
     disconnect_tx: mpsc::Sender<DisconnectEvent>,
     token: CancellationToken,
-    stats: Arc<Stats>,
+    stats: Arc<ForwardMetrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -188,9 +188,9 @@ pub fn spawn_peer_reader(
                                         return;
                                     }
                                 }
-                                _ => {
-                                    stats.record_drop();
-                                }
+                                InboundDecision::DropAcl => stats.record_drop(DropReason::Acl),
+                                InboundDecision::DropFirewall => stats.record_drop(DropReason::Firewall),
+                                InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
                             }
                         }
                         Err(e) => {

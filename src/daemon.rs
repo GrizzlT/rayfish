@@ -33,7 +33,7 @@ use crate::membership::{
 };
 use crate::network_name;
 use crate::peers::PeerTable;
-use crate::stats::Stats;
+use crate::stats::ForwardMetrics;
 use crate::transport;
 use crate::tun;
 
@@ -170,7 +170,7 @@ pub struct DaemonState {
     endpoint: Endpoint,
     identity: IrohIdentityProvider,
     peers: PeerTable,
-    stats: Arc<Stats>,
+    stats: Arc<ForwardMetrics>,
     tun_tx: mpsc::Sender<Vec<u8>>,
     networks: Arc<DashMap<String, NetworkHandle>>,
     shutdown_token: CancellationToken,
@@ -191,7 +191,7 @@ impl DaemonState {
 
     async fn handle_request(&self, req: IpcRequest) -> IpcResponse {
         match req {
-            IpcRequest::Create { mode, hostname } => self.create_network(mode, hostname).await,
+            IpcRequest::Create { mode, name, hostname } => self.create_network(mode, name, hostname).await,
             IpcRequest::Join { network_key, name, hostname } => self.join_network(&network_key, name.as_deref(), hostname).await,
             IpcRequest::Leave { name } => self.leave_network(&name).await,
             IpcRequest::Nuke { name, force } => self.nuke_network(&name, force).await,
@@ -215,15 +215,24 @@ impl DaemonState {
         }
     }
 
-    async fn create_network(&self, mode: GroupMode, hostname: Option<String>) -> IpcResponse {
-        match self.create_network_inner(mode, hostname).await {
+    async fn create_network(&self, mode: GroupMode, name: Option<String>, hostname: Option<String>) -> IpcResponse {
+        match self.create_network_inner(mode, name, hostname).await {
             Ok(resp) => resp,
             Err(e) => IpcResponse::Error { message: format!("{e:#}") },
         }
     }
 
-    async fn create_network_inner(&self, mode: GroupMode, hostname: Option<String>) -> Result<IpcResponse> {
-        let name = network_name::generate_name();
+    async fn create_network_inner(&self, mode: GroupMode, custom_name: Option<String>, hostname: Option<String>) -> Result<IpcResponse> {
+        let name = match custom_name {
+            Some(n) => {
+                anyhow::ensure!(
+                    crate::hostname::is_valid_hostname(&n),
+                    "invalid network name '{n}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+                );
+                n
+            }
+            None => network_name::generate_name(),
+        };
 
         // Generate per-network keypair
         let net_secret_key = SecretKey::generate();
@@ -1072,6 +1081,10 @@ impl DaemonState {
         IpcResponse::Status {
             endpoint_id: self.endpoint.id(),
             networks: statuses,
+            packets_rx: self.stats.packets_rx.get(),
+            packets_tx: self.stats.packets_tx.get(),
+            bytes_rx: self.stats.bytes_rx.get(),
+            bytes_tx: self.stats.bytes_tx.get(),
         }
     }
 
@@ -1434,7 +1447,7 @@ impl DaemonState {
     }
 }
 
-pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
+pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) -> Result<()> {
     let key = identity::load_or_create()?;
     let public_key = key.public();
     let identity = IrohIdentityProvider::new(public_key);
@@ -1528,6 +1541,23 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
 
     // Accept loop — dispatches connections via ProtocolHandler by ALPN
     protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
+
+    // Metrics registry: pitopi counters + iroh endpoint metrics
+    let mut registry = iroh_metrics::Registry::default();
+    registry.register(stats.clone());
+    registry.register_all(daemon.endpoint.metrics());
+    let metrics_addr: std::net::SocketAddr = ([0, 0, 0, 0], 9090).into();
+    let registry = Arc::new(registry);
+    let _metrics_server = match iroh_metrics::service::MetricsServer::spawn(metrics_addr, registry).await {
+        Ok(server) => {
+            tracing::info!(addr = %server.local_addr(), "metrics server started");
+            Some(server)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to start metrics server (Prometheus export disabled)");
+            None
+        }
+    };
 
     tracing::info!(ip = %my_ip, id = %daemon.endpoint.id().fmt_short(), "daemon started");
 
@@ -1851,7 +1881,7 @@ fn spawn_coordinator_accept(
     tun_tx: mpsc::Sender<Vec<u8>>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
-    stats: Arc<Stats>,
+    stats: Arc<ForwardMetrics>,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
     blob_store: FsStore,
     shared_acl: forward::SharedAcl,
@@ -1894,7 +1924,7 @@ async fn run_accept_loop(
     tun_tx: mpsc::Sender<Vec<u8>>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
-    stats: Arc<Stats>,
+    stats: Arc<ForwardMetrics>,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
     blob_store: FsStore,
     shared_acl: forward::SharedAcl,
@@ -2166,7 +2196,7 @@ async fn join_mesh_shared(
     tun_tx: mpsc::Sender<Vec<u8>>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
-    stats: Arc<Stats>,
+    stats: Arc<ForwardMetrics>,
     blob_store: FsStore,
     shared_acl: forward::SharedAcl,
     firewall: SharedFirewall,
@@ -2488,7 +2518,7 @@ fn spawn_reconnect_loop(
     tun_tx: mpsc::Sender<Vec<u8>>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
     token: CancellationToken,
-    stats: Arc<Stats>,
+    stats: Arc<ForwardMetrics>,
     shared_acl: forward::SharedAcl,
     firewall: SharedFirewall,
 ) -> JoinHandle<()> {

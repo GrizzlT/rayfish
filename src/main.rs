@@ -80,7 +80,10 @@ enum Command {
         /// Membership mode: open or restricted
         #[arg(long, default_value = "restricted")]
         mode: GroupMode,
-        /// Hostname for this peer (random if not specified)
+        /// Network name used in DNS (e.g. "gaming" → alice.gaming.pi). Random if not set
+        #[arg(long)]
+        name: Option<String>,
+        /// Your hostname within the network (e.g. "alice" → alice.gaming.pi). Random if not set
         #[arg(long)]
         hostname: Option<String>,
     },
@@ -91,7 +94,7 @@ enum Command {
         /// Optional local alias for the network
         #[arg(long)]
         name: Option<String>,
-        /// Hostname for this peer (random if not specified)
+        /// Your hostname within the network (e.g. "bob" → bob.gaming.pi). Random if not set
         #[arg(long)]
         hostname: Option<String>,
     },
@@ -227,14 +230,14 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::List => cmd_list().await,
         Command::Leave { name } => ipc_leave(&name).await,
-        Command::Create { mode, hostname } => ipc_create(mode, hostname).await,
+        Command::Create { mode, name, hostname } => ipc_create(mode, name, hostname).await,
         Command::Join { network_key, name, hostname } => ipc_join(&network_key, name.as_deref(), hostname).await,
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Status => ipc_status().await,
         Command::Daemon | Command::Up => {
             check_root();
             let token = shutdown::token();
-            let stats = stats::Stats::new();
+            let stats = std::sync::Arc::new(stats::ForwardMetrics::default());
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
@@ -310,9 +313,9 @@ async fn cmd_list() -> Result<()> {
 // IPC client commands (require daemon running)
 // ---------------------------------------------------------------------------
 
-async fn ipc_create(mode: GroupMode, hostname: Option<String>) -> Result<()> {
+async fn ipc_create(mode: GroupMode, name: Option<String>, hostname: Option<String>) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(&mut stream, &ipc::IpcRequest::Create { mode, hostname }).await?;
+    ipc::send_msg(&mut stream, &ipc::IpcRequest::Create { mode, name, hostname }).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
         ipc::IpcResponse::Created { name, network_key, my_ip } => {
@@ -384,7 +387,7 @@ async fn ipc_status() -> Result<()> {
     ipc::send_msg(&mut stream, &ipc::IpcRequest::Status).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Status { endpoint_id, networks } => {
+        ipc::IpcResponse::Status { endpoint_id, networks, packets_rx, packets_tx, bytes_rx, bytes_tx } => {
             println!("Endpoint: {}", endpoint_id);
             if networks.is_empty() {
                 println!("No active networks.");
@@ -435,6 +438,19 @@ async fn ipc_status() -> Result<()> {
                     }
                 }
             }
+            fn format_bytes(b: u64) -> String {
+                if b >= 1_073_741_824 {
+                    format!("{:.1} GB", b as f64 / 1_073_741_824.0)
+                } else if b >= 1_048_576 {
+                    format!("{:.1} MB", b as f64 / 1_048_576.0)
+                } else if b >= 1024 {
+                    format!("{:.1} KB", b as f64 / 1024.0)
+                } else {
+                    format!("{} B", b)
+                }
+            }
+            println!("  Traffic: rx:{} tx:{} ({})",
+                packets_rx, packets_tx, format_bytes(bytes_rx + bytes_tx));
         }
         ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),

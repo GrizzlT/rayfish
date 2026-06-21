@@ -235,10 +235,16 @@ In another terminal, create a network:
 pitopi create
 ```
 
+Or create with a custom name:
+
+```bash
+pitopi create --name gaming
+```
+
 This produces output like:
 
 ```
-Network 'gentle-amber-fox' created.
+Network 'gaming' created.
   IP: 100.64.23.142
 ```
 
@@ -314,7 +320,7 @@ TUN devices are virtual network interfaces. Creating them requires root privileg
 |---------|-------------|:---:|
 | `sudo pitopi daemon` | Start the daemon (owns TUN + endpoint) | — |
 | `sudo pitopi up` | Alias for `daemon` | — |
-| `pitopi create` | Create a network (generates name + join code) | Yes |
+| `pitopi create [--name NAME]` | Create a network (custom or random name + join code) | Yes |
 | `pitopi join KEY [--name ALIAS]` | Join a network by public key | Yes |
 | `pitopi leave NAME` | Leave a network and remove config | Yes |
 | `pitopi nuke NAME [--force]` | Publish empty record to DHT then leave | Yes |
@@ -1426,35 +1432,49 @@ audit.log_disconnect(peer_ip, &endpoint_id);
 
 ---
 
-## 16. Statistics
+## 16. Metrics
 
 **Module:** `src/stats.rs`
 
-The stats module tracks packet and byte counters for monitoring forwarding performance.
+Pitopi uses `iroh-metrics` for Prometheus-compatible metrics collection and export. The `ForwardMetrics` struct is defined with the `#[derive(MetricsGroup)]` macro and registered alongside iroh's own endpoint metrics in a shared `Registry`.
 
 ### Counters
 
-Five atomic counters track activity:
-
 | Counter | Meaning |
 |---------|---------|
-| `packets_rx` | Packets received from peers |
-| `packets_tx` | Packets sent to peers |
-| `bytes_rx` | Total bytes received |
-| `bytes_tx` | Total bytes sent |
-| `drops` | Packets that couldn't be routed (unknown destination or send failure) |
+| `pitopi_packets_rx_total` | Packets received from peers |
+| `pitopi_packets_tx_total` | Packets sent to peers |
+| `pitopi_bytes_rx_total` | Total bytes received |
+| `pitopi_bytes_tx_total` | Total bytes sent |
+| `pitopi_drops_total{reason="..."}` | Dropped packets, labeled by reason |
 
-All counters use `AtomicU64` with `Ordering::Relaxed`, since exact ordering between counters isn't important for monitoring.
+Drop reasons: `acl` (network ACL denied), `firewall` (local firewall denied), `send_failure` (QUIC send error), `no_peer` (no route to destination), `malformed` (oversized or non-IPv4 packet).
+
+### Prometheus endpoint
+
+The daemon starts an HTTP metrics server on port 9090. Scrape it with Prometheus or curl:
+
+```bash
+curl http://localhost:9090/metrics
+```
+
+The output includes both pitopi-level metrics (`pitopi_*`) and iroh endpoint metrics (`socket_*`, `net_report_*`) in OpenMetrics text format.
 
 ### Periodic logging
 
-The `spawn_logger` method starts a background task that logs stats every 30 seconds as deltas (not cumulative totals). This shows recent activity rather than all-time totals:
+The `spawn_logger` method starts a background task that logs stats every 30 seconds as deltas (not cumulative totals):
 
 ```
 INFO (30s) rx=42 tx=38 bytes_rx=49356 bytes_tx=44100 drops=0
 ```
 
-Byte counts are logged as raw values (no formatting) for easy parsing and scripting.
+### CLI status
+
+`pitopi status` shows aggregate traffic stats alongside per-peer connection info:
+
+```
+  Traffic: rx:142 tx:138 (98.2 KB)
+```
 
 ---
 
