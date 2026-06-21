@@ -27,7 +27,7 @@ use crate::dns_config;
 use crate::firewall::{self, SharedFirewall};
 use crate::forward;
 use crate::identity;
-use crate::ipc::{self, IpcRequest, IpcResponse, NetworkRole, NetworkStatus, PeerStatus};
+use crate::ipc::{self, IpcMessage, NetworkRole, NetworkStatus, PeerStatus};
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
     MemberList, MembershipPolicy, canonical_group_bytes, derive_ipv6, group_blob_hash,
@@ -794,15 +794,15 @@ impl DaemonState {
         dns_config::update_search_domains(&network_names, &self.tun_name);
     }
 
-    async fn handle_request(&self, req: IpcRequest, peer_cred: Option<(u32, u32)>) -> IpcResponse {
+    async fn handle_request(&self, req: IpcMessage, peer_cred: Option<(u32, u32)>) -> IpcMessage {
         match req {
-            IpcRequest::Create {
+            IpcMessage::Create {
                 mode,
                 name,
                 hostname,
                 transport: _,
             } => self.create_network(mode, name, hostname).await,
-            IpcRequest::Join {
+            IpcMessage::Join {
                 network_key,
                 name,
                 hostname,
@@ -811,32 +811,32 @@ impl DaemonState {
                 self.join_network(&network_key, name.as_deref(), hostname)
                     .await
             }
-            IpcRequest::Leave { name } => self.leave_network(&name).await,
-            IpcRequest::Nuke { name, force } => self.nuke_network(&name, force).await,
-            IpcRequest::Status => self.status(),
-            IpcRequest::Shutdown => {
+            IpcMessage::Leave { name } => self.leave_network(&name).await,
+            IpcMessage::Nuke { name, force } => self.nuke_network(&name, force).await,
+            IpcMessage::Status => self.status(),
+            IpcMessage::Shutdown => {
                 self.shutdown_token.cancel();
-                IpcResponse::Ok {
+                IpcMessage::Ok {
                     message: "shutting down".to_string(),
                 }
             }
-            IpcRequest::AclTag {
+            IpcMessage::AclTag {
                 network,
                 tag,
                 peer_ids,
             } => self.acl_tag(&network, &tag, &peer_ids).await,
-            IpcRequest::AclUntag {
+            IpcMessage::AclUntag {
                 network,
                 tag,
                 peer_id,
             } => self.acl_untag(&network, &tag, &peer_id).await,
-            IpcRequest::AclAllow { network, src, dst } => {
+            IpcMessage::AclAllow { network, src, dst } => {
                 self.acl_allow(&network, &src, &dst).await
             }
-            IpcRequest::AclRemove { network, index } => self.acl_remove(&network, index).await,
-            IpcRequest::AclShow { network } => self.acl_show(&network),
-            IpcRequest::AclApply { network } => self.acl_apply(&network).await,
-            IpcRequest::FirewallAdd {
+            IpcMessage::AclRemove { network, index } => self.acl_remove(&network, index).await,
+            IpcMessage::AclShow { network } => self.acl_show(&network),
+            IpcMessage::AclApply { network } => self.acl_apply(&network).await,
+            IpcMessage::FirewallAdd {
                 direction,
                 action,
                 protocol,
@@ -849,15 +849,18 @@ impl DaemonState {
                 port.as_deref(),
                 peer.as_deref(),
             ),
-            IpcRequest::FirewallRemove { index } => self.firewall_remove(index),
-            IpcRequest::FirewallShow => self.firewall_show(),
-            IpcRequest::FirewallDefault { action } => self.firewall_default(&action),
-            IpcRequest::SetHostname { network, hostname } => {
+            IpcMessage::FirewallRemove { index } => self.firewall_remove(index),
+            IpcMessage::FirewallShow => self.firewall_show(),
+            IpcMessage::FirewallDefault { action } => self.firewall_default(&action),
+            IpcMessage::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await
             }
-            IpcRequest::SendFile { path, peer } => self.send_file(&path, &peer).await,
-            IpcRequest::ListFiles => self.list_files(),
-            IpcRequest::AcceptFile { id, output } => self.accept_file(id, output, peer_cred).await,
+            IpcMessage::SendFile { path, peer } => self.send_file(&path, &peer).await,
+            IpcMessage::ListFiles => self.list_files(),
+            IpcMessage::AcceptFile { id, output } => self.accept_file(id, output, peer_cred).await,
+            other => IpcMessage::Error {
+                message: format!("unexpected message: {:?}", other),
+            },
         }
     }
 
@@ -866,10 +869,10 @@ impl DaemonState {
         mode: GroupMode,
         name: Option<String>,
         hostname: Option<String>,
-    ) -> IpcResponse {
+    ) -> IpcMessage {
         match self.create_network_inner(mode, name, hostname).await {
             Ok(resp) => resp,
-            Err(e) => IpcResponse::Error {
+            Err(e) => IpcMessage::Error {
                 message: format!("{e:#}"),
             },
         }
@@ -880,7 +883,7 @@ impl DaemonState {
         mode: GroupMode,
         custom_name: Option<String>,
         hostname: Option<String>,
-    ) -> Result<IpcResponse> {
+    ) -> Result<IpcMessage> {
         let name = match custom_name {
             Some(n) => {
                 anyhow::ensure!(
@@ -897,7 +900,7 @@ impl DaemonState {
         let net_public_key = net_secret_key.public();
 
         if self.networks.contains_key(&name) {
-            return Ok(IpcResponse::Error {
+            return Ok(IpcMessage::Error {
                 message: format!("network '{name}' already active"),
             });
         }
@@ -1092,7 +1095,7 @@ impl DaemonState {
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network created");
 
-        Ok(IpcResponse::Created {
+        Ok(IpcMessage::Created {
             name,
             network_key: net_public_key,
             my_ip,
@@ -1105,10 +1108,10 @@ impl DaemonState {
         network_key: &str,
         name: Option<&str>,
         hostname: Option<String>,
-    ) -> IpcResponse {
+    ) -> IpcMessage {
         match self.join_network_inner(network_key, name, hostname).await {
             Ok(resp) => resp,
-            Err(e) => IpcResponse::Error {
+            Err(e) => IpcMessage::Error {
                 message: format!("{e:#}"),
             },
         }
@@ -1119,13 +1122,13 @@ impl DaemonState {
         network_key: &str,
         alias: Option<&str>,
         hostname: Option<String>,
-    ) -> Result<IpcResponse> {
+    ) -> Result<IpcMessage> {
         let net_pubkey: EndpointId = network_key.parse().context("invalid network key")?;
 
         if let Some(a) = alias
             && self.networks.contains_key(a)
         {
-            return Ok(IpcResponse::Error {
+            return Ok(IpcMessage::Error {
                 message: format!("already in network '{a}'"),
             });
         }
@@ -1137,7 +1140,7 @@ impl DaemonState {
             .context("failed to resolve network record")?;
 
         if peer_ids.is_empty() {
-            return Ok(IpcResponse::Error {
+            return Ok(IpcMessage::Error {
                 message: "no peers found in network record".to_string(),
             });
         }
@@ -1171,7 +1174,7 @@ impl DaemonState {
         let display_name = display_name_owned.as_str();
 
         if self.networks.contains_key(display_name) {
-            return Ok(IpcResponse::Error {
+            return Ok(IpcMessage::Error {
                 message: format!("already in network '{display_name}'"),
             });
         }
@@ -1363,7 +1366,7 @@ impl DaemonState {
 
         tracing::info!(network = %display_name, key = %network_key, ip = %my_ip, "joined network");
 
-        Ok(IpcResponse::Joined {
+        Ok(IpcMessage::Joined {
             name: display_name.to_string(),
             my_ip,
             my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
@@ -1401,7 +1404,7 @@ impl DaemonState {
         network_name: &str,
         net_pubkey: EndpointId,
         alpn: &[u8],
-    ) -> Result<IpcResponse> {
+    ) -> Result<IpcMessage> {
         tracing::info!(network = %network_name, "trying DHT fallback");
 
         let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
@@ -1542,7 +1545,7 @@ impl DaemonState {
             self.networks.insert(network_name.to_string(), handle);
             self.refresh_alpns();
 
-            return Ok(IpcResponse::Joined {
+            return Ok(IpcMessage::Joined {
                 name: network_name.to_string(),
                 my_ip,
                 my_ipv6: Some(derive_ipv6(&self.identity.local_identity())),
@@ -1557,10 +1560,10 @@ impl DaemonState {
         &self,
         name: &str,
         mode: GroupMode,
-    ) -> Result<IpcResponse> {
+    ) -> Result<IpcMessage> {
         {
             if self.networks.contains_key(name) {
-                return Ok(IpcResponse::Error {
+                return Ok(IpcMessage::Error {
                     message: format!("network '{name}' already active"),
                 });
             }
@@ -1795,7 +1798,7 @@ impl DaemonState {
 
         tracing::info!(name = %name, key = %net_public_key, ip = %my_ip, "network restored (coordinator)");
 
-        Ok(IpcResponse::Created {
+        Ok(IpcMessage::Created {
             name: name.to_string(),
             network_key: net_public_key,
             my_ip,
@@ -1803,13 +1806,13 @@ impl DaemonState {
         })
     }
 
-    async fn nuke_network(&self, name: &str, force: bool) -> IpcResponse {
+    async fn nuke_network(&self, name: &str, force: bool) -> IpcMessage {
         // Check we're the coordinator and whether other members exist
         let (is_coordinator, has_other_members) = {
             let handle = match self.networks.get(name) {
                 Some(h) => h,
                 None => {
-                    return IpcResponse::Error {
+                    return IpcMessage::Error {
                         message: format!("not in network '{name}'"),
                     };
                 }
@@ -1826,13 +1829,13 @@ impl DaemonState {
         };
 
         if !is_coordinator {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: "only the coordinator can nuke a network".to_string(),
             };
         }
 
         if has_other_members && !force {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: "network has other members — use --force to destroy, or transfer ownership first".to_string(),
             };
         }
@@ -1865,10 +1868,10 @@ impl DaemonState {
         self.leave_network(name).await
     }
 
-    async fn leave_network(&self, name: &str) -> IpcResponse {
+    async fn leave_network(&self, name: &str) -> IpcMessage {
         let handle = self.networks.remove(name).map(|(_, v)| v);
         let Some(handle) = handle else {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: format!("network '{}' not active", name),
             };
         };
@@ -1892,12 +1895,12 @@ impl DaemonState {
         }
 
         tracing::info!(network = %name, "left network");
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: format!("left network '{}'", name),
         }
     }
 
-    fn status(&self) -> IpcResponse {
+    fn status(&self) -> IpcMessage {
         let hostname_snapshot = self.hostname_table.try_read().ok();
         let statuses: Vec<NetworkStatus> = self
             .networks
@@ -1948,7 +1951,7 @@ impl DaemonState {
             })
             .collect();
 
-        IpcResponse::Status {
+        IpcMessage::StatusResponse {
             endpoint_id: self.endpoint.id(),
             mdns_enabled: self.mdns_enabled,
             networks: statuses,
@@ -1996,11 +1999,11 @@ impl DaemonState {
     // Hostname
     // -----------------------------------------------------------------------
 
-    async fn set_hostname(&self, network: &str, hostname: &str) -> IpcResponse {
+    async fn set_hostname(&self, network: &str, hostname: &str) -> IpcMessage {
         use crate::hostname;
 
         if !hostname::is_valid_hostname(hostname) {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: "invalid hostname (lowercase ASCII, 1-63 chars)".to_string(),
             };
         }
@@ -2008,7 +2011,7 @@ impl DaemonState {
         let handle = match self.networks.get(network) {
             Some(h) => h,
             None => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("network '{}' not found", network),
                 };
             }
@@ -2057,7 +2060,7 @@ impl DaemonState {
         }
 
         let dns_name = format!("{}.{}.{}", new_hostname, network, crate::DNS_DOMAIN);
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: format!("hostname set to {} ({})", new_hostname, dns_name),
         }
     }
@@ -2175,13 +2178,13 @@ impl DaemonState {
         broadcast_control_msg(&self.peers, &msg).await;
     }
 
-    async fn acl_tag(&self, network: &str, tag: &str, peer_ids: &[String]) -> IpcResponse {
+    async fn acl_tag(&self, network: &str, tag: &str, peer_ids: &[String]) -> IpcMessage {
         let mut resolved = Vec::new();
         for short in peer_ids {
             match self.resolve_short_id(network, short) {
                 Some(id) => resolved.push(id),
                 None => {
-                    return IpcResponse::Error {
+                    return IpcMessage::Error {
                         message: format!("unknown peer '{short}'"),
                     };
                 }
@@ -2190,7 +2193,7 @@ impl DaemonState {
 
         {
             let Some(handle) = self.networks.get(network) else {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("network '{network}' not active"),
                 };
             };
@@ -2220,21 +2223,21 @@ impl DaemonState {
             .clone();
         self.persist_acl(network, &acl);
         self.publish_and_broadcast_acl(network, &acl).await;
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: format!("tagged '{tag}'"),
         }
     }
 
-    async fn acl_untag(&self, network: &str, tag: &str, peer_id: &str) -> IpcResponse {
+    async fn acl_untag(&self, network: &str, tag: &str, peer_id: &str) -> IpcMessage {
         let Some(id) = self.resolve_short_id(network, peer_id) else {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: format!("unknown peer '{peer_id}'"),
             };
         };
 
         {
             let Some(handle) = self.networks.get(network) else {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("network '{network}' not active"),
                 };
             };
@@ -2256,12 +2259,12 @@ impl DaemonState {
             .clone();
         self.persist_acl(network, &acl);
         self.publish_and_broadcast_acl(network, &acl).await;
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: format!("untagged '{peer_id}' from '{tag}'"),
         }
     }
 
-    async fn acl_allow(&self, network: &str, src: &str, dst: &str) -> IpcResponse {
+    async fn acl_allow(&self, network: &str, src: &str, dst: &str) -> IpcMessage {
         let resolve = |s: &str| -> Option<acl::Target> {
             if s == "all" {
                 return Some(acl::Target::All);
@@ -2273,19 +2276,19 @@ impl DaemonState {
         };
 
         let Some(src_target) = resolve(src) else {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: format!("unknown src '{src}'"),
             };
         };
         let Some(dst_target) = resolve(dst) else {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: format!("unknown dst '{dst}'"),
             };
         };
 
         {
             let Some(handle) = self.networks.get(network) else {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("network '{network}' not active"),
                 };
             };
@@ -2307,21 +2310,21 @@ impl DaemonState {
             .clone();
         self.persist_acl(network, &acl);
         self.publish_and_broadcast_acl(network, &acl).await;
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: format!("added allow {src} -> {dst}"),
         }
     }
 
-    async fn acl_remove(&self, network: &str, index: usize) -> IpcResponse {
+    async fn acl_remove(&self, network: &str, index: usize) -> IpcMessage {
         {
             let Some(handle) = self.networks.get(network) else {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("network '{network}' not active"),
                 };
             };
             let mut state = handle.state.write().unwrap();
             if index >= state.acl.rules.len() {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("rule index {index} out of range"),
                 };
             }
@@ -2339,29 +2342,29 @@ impl DaemonState {
             .clone();
         self.persist_acl(network, &acl);
         self.publish_and_broadcast_acl(network, &acl).await;
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: format!("removed rule {index}"),
         }
     }
 
-    fn acl_show(&self, network: &str) -> IpcResponse {
+    fn acl_show(&self, network: &str) -> IpcMessage {
         let Some(handle) = self.networks.get(network) else {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: format!("network '{network}' not active"),
             };
         };
         let state = handle.state.read().unwrap();
         let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
         let display = acl::format_acl_show(&state.acl, &short_id);
-        IpcResponse::AclState { display }
+        IpcMessage::AclState { display }
     }
 
-    async fn acl_apply(&self, network: &str) -> IpcResponse {
+    async fn acl_apply(&self, network: &str) -> IpcMessage {
         let path = self.acl_file_path(network);
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("failed to read {}: {e}", path.display()),
                 };
             }
@@ -2372,7 +2375,7 @@ impl DaemonState {
         let data = match acl::parse_acl_file(&content, &resolver) {
             Ok(d) => d,
             Err(e) => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("parse error: {e}"),
                 };
             }
@@ -2380,7 +2383,7 @@ impl DaemonState {
 
         {
             let Some(handle) = self.networks.get(network) else {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("network '{network}' not active"),
                 };
             };
@@ -2389,7 +2392,7 @@ impl DaemonState {
         }
 
         self.publish_and_broadcast_acl(network, &data).await;
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: "ACL applied".to_string(),
         }
     }
@@ -2405,11 +2408,11 @@ impl DaemonState {
         protocol: &str,
         port: Option<&str>,
         peer: Option<&str>,
-    ) -> IpcResponse {
+    ) -> IpcMessage {
         let direction = match firewall::parse_direction(direction) {
             Ok(d) => d,
             Err(e) => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: e.to_string(),
                 };
             }
@@ -2417,7 +2420,7 @@ impl DaemonState {
         let action = match firewall::parse_action(action) {
             Ok(a) => a,
             Err(e) => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: e.to_string(),
                 };
             }
@@ -2425,7 +2428,7 @@ impl DaemonState {
         let protocol = match firewall::parse_protocol(protocol) {
             Ok(p) => p,
             Err(e) => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: e.to_string(),
                 };
             }
@@ -2434,7 +2437,7 @@ impl DaemonState {
             Some(s) => match firewall::parse_port_range(s) {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    return IpcResponse::Error {
+                    return IpcMessage::Error {
                         message: e.to_string(),
                     };
                 }
@@ -2445,7 +2448,7 @@ impl DaemonState {
             Some(s) => match self.resolve_short_id_any_network(s) {
                 Some(id) => firewall::PeerFilter::Identity(id),
                 None => {
-                    return IpcResponse::Error {
+                    return IpcMessage::Error {
                         message: format!("unknown peer '{s}'"),
                     };
                 }
@@ -2466,15 +2469,15 @@ impl DaemonState {
         if let Err(e) = firewall::save_firewall(&config) {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: "rule added".to_string(),
         }
     }
 
-    fn firewall_remove(&self, index: usize) -> IpcResponse {
+    fn firewall_remove(&self, index: usize) -> IpcMessage {
         let current = self.firewall.get_config();
         if index >= current.rules.len() {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: format!(
                     "index {index} out of range (have {} rules)",
                     current.rules.len()
@@ -2487,23 +2490,23 @@ impl DaemonState {
         if let Err(e) = firewall::save_firewall(&config) {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: "rule removed".to_string(),
         }
     }
 
-    fn firewall_show(&self) -> IpcResponse {
+    fn firewall_show(&self) -> IpcMessage {
         let config = self.firewall.get_config();
         let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
         let display = firewall::format_firewall_show(&config, &short_id);
-        IpcResponse::FirewallState { display }
+        IpcMessage::FirewallState { display }
     }
 
-    fn firewall_default(&self, action: &str) -> IpcResponse {
+    fn firewall_default(&self, action: &str) -> IpcMessage {
         let action = match firewall::parse_action(action) {
             Ok(a) => a,
             Err(e) => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: e.to_string(),
                 };
             }
@@ -2514,7 +2517,7 @@ impl DaemonState {
         if let Err(e) = firewall::save_firewall(&config) {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: format!(
                 "default set to {}",
                 if action == firewall::Action::Allow {
@@ -2553,11 +2556,11 @@ impl DaemonState {
         self.resolve_short_id_any_network(name)
     }
 
-    async fn send_file(&self, path: &str, peer: &str) -> IpcResponse {
+    async fn send_file(&self, path: &str, peer: &str) -> IpcMessage {
         let peer_id = match self.resolve_peer_name(peer).await {
             Some(id) => id,
             None => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("unknown peer '{peer}'"),
                 };
             }
@@ -2567,7 +2570,7 @@ impl DaemonState {
         let file_bytes = match std::fs::read(file_path) {
             Ok(b) => b,
             Err(e) => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("cannot read '{}': {e}", file_path.display()),
                 };
             }
@@ -2582,7 +2585,7 @@ impl DaemonState {
         let hash = blake3::hash(&file_bytes);
 
         if let Err(e) = self.blob_store.blobs().add_slice(&file_bytes).await {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: format!("blob store error: {e}"),
             };
         }
@@ -2601,7 +2604,7 @@ impl DaemonState {
             Ok(conn) => match conn.open_bi().await {
                 Ok((mut send, _)) => {
                     if let Err(e) = control::send_msg(&mut send, &msg).await {
-                        return IpcResponse::Error {
+                        return IpcMessage::Error {
                             message: format!("failed to send offer: {e}"),
                         };
                     }
@@ -2609,24 +2612,24 @@ impl DaemonState {
                     let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
                 }
                 Err(e) => {
-                    return IpcResponse::Error {
+                    return IpcMessage::Error {
                         message: format!("failed to open stream: {e}"),
                     };
                 }
             },
             Err(e) => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("cannot reach peer '{peer}': {e}"),
                 };
             }
         }
 
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: format!("offered {} ({}) to {}", filename, format_size(size), peer),
         }
     }
 
-    fn list_files(&self) -> IpcResponse {
+    fn list_files(&self) -> IpcMessage {
         let pending = self.protocol_router.pending_files.lock().unwrap();
         let files = pending
             .iter()
@@ -2638,17 +2641,17 @@ impl DaemonState {
                 mime_type: f.mime_type.clone(),
             })
             .collect();
-        IpcResponse::FileList { files }
+        IpcMessage::FileList { files }
     }
 
-    async fn accept_file(&self, id: u64, output: Option<String>, peer_cred: Option<(u32, u32)>) -> IpcResponse {
+    async fn accept_file(&self, id: u64, output: Option<String>, peer_cred: Option<(u32, u32)>) -> IpcMessage {
         let pending_file = {
             let mut pending = self.protocol_router.pending_files.lock().unwrap();
             let idx = pending.iter().position(|f| f.id == id);
             match idx {
                 Some(i) => pending.remove(i),
                 None => {
-                    return IpcResponse::Error {
+                    return IpcMessage::Error {
                         message: format!("no pending file with id {id}"),
                     };
                 }
@@ -2666,7 +2669,7 @@ impl DaemonState {
         {
             Ok(c) => c,
             Err(e) => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("cannot reach sender: {e}"),
                 };
             }
@@ -2678,7 +2681,7 @@ impl DaemonState {
             .fetch(conn, iroh_blobs::HashAndFormat::raw(blob_hash))
             .await
         {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: format!("blob fetch failed: {e}"),
             };
         }
@@ -2686,7 +2689,7 @@ impl DaemonState {
         let bytes = match self.blob_store.blobs().get_bytes(blob_hash).await {
             Ok(b) => b,
             Err(e) => {
-                return IpcResponse::Error {
+                return IpcMessage::Error {
                     message: format!("blob read failed: {e}"),
                 };
             }
@@ -2702,14 +2705,14 @@ impl DaemonState {
         };
 
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: format!("cannot create directory '{}': {e}", dir.display()),
             };
         }
 
         let dest = dir.join(&pending_file.filename);
         if let Err(e) = std::fs::write(&dest, &bytes) {
-            return IpcResponse::Error {
+            return IpcMessage::Error {
                 message: format!("write failed: {e}"),
             };
         }
@@ -2724,7 +2727,7 @@ impl DaemonState {
             }
         }
 
-        IpcResponse::Ok {
+        IpcMessage::Ok {
             message: format!("saved to {}", dest.display()),
         }
     }
@@ -2927,10 +2930,10 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
             let daemon_c = daemon.clone();
             tokio::spawn(async move {
                 match daemon_c.restore_coordinator_network(&name, mode).await {
-                    Ok(IpcResponse::Created { name, .. }) => {
+                    Ok(IpcMessage::Created { name, .. }) => {
                         tracing::info!(network = %name, "restored coordinator network");
                     }
-                    Ok(IpcResponse::Error { message }) => {
+                    Ok(IpcMessage::Error { message }) => {
                         tracing::warn!(network = %name, error = %message, "failed to restore network");
                     }
                     Err(e) => {
@@ -2956,10 +2959,10 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
                     .join_network_inner(&net_pubkey, Some(&name), persisted_hostname)
                     .await
                 {
-                    Ok(IpcResponse::Joined { name, my_ip, .. }) => {
+                    Ok(IpcMessage::Joined { name, my_ip, .. }) => {
                         tracing::info!(network = %name, ip = %my_ip, "restored member network");
                     }
-                    Ok(IpcResponse::Error { message }) => {
+                    Ok(IpcMessage::Error { message }) => {
                         tracing::warn!(network = %name, error = %message, "failed to restore network");
                     }
                     Err(e) => {
@@ -3041,11 +3044,12 @@ fn set_socket_group_permissions(path: &std::path::Path) {
     tracing::info!("socket owned by root:pitopi (0660)");
 }
 
-async fn handle_ipc_client(mut stream: UnixStream, daemon: &DaemonState) -> Result<()> {
+async fn handle_ipc_client(stream: UnixStream, daemon: &DaemonState) -> Result<()> {
     let peer_cred = stream.peer_cred().ok().map(|c| (c.uid(), c.gid()));
-    let req: IpcRequest = ipc::recv_msg(&mut stream).await?;
+    let mut framed = ipc::framed(stream);
+    let req = ipc::recv(&mut framed).await?;
     let resp = daemon.handle_request(req, peer_cred).await;
-    ipc::send_msg(&mut stream, &resp).await?;
+    ipc::send(&mut framed, resp).await?;
     Ok(())
 }
 

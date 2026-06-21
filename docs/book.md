@@ -1731,7 +1731,7 @@ This chapter ties the modules together by walking through the complete lifecycle
 
 ### Creating a network
 
-When a user runs `pitopi create` (optionally with `--mode open`), the CLI sends an `IpcRequest::Create` to the daemon. The daemon:
+When a user runs `pitopi create` (optionally with `--mode open`), the CLI sends an `IpcMessage::Create` to the daemon. The daemon:
 
 1. **Generate three-word name.** Call `network_name::generate_name()` to produce a random adjective-noun-noun name like `gentle-amber-fox`.
 
@@ -1753,11 +1753,11 @@ When a user runs `pitopi create` (optionally with `--mode open`), the CLI sends 
 
 10. **Save config.** Write the network to `~/.config/pitopi/networks.toml` with `network_secret_key` (hex) and `network_public_key`.
 
-11. **Return response.** Send `IpcResponse::Created` with the generated name, join code (public key), and IP back to the CLI.
+11. **Return response.** Send `IpcMessage::Created` with the generated name, join code (public key), and IP back to the CLI.
 
 ### Joining a network
 
-When a user runs `pitopi join <public-key> --name gaming`, the CLI sends an `IpcRequest::Join { network_key, name }` to the daemon. The daemon:
+When a user runs `pitopi join <public-key> --name gaming`, the CLI sends an `IpcMessage::Join { network_key, name }` to the daemon. The daemon:
 
 1. **Parse join code.** Parse the public key string → `EndpointId`.
 
@@ -1781,11 +1781,11 @@ When a user runs `pitopi join <public-key> --name gaming`, the CLI sends an `Ipc
 
 11. **Save config.** Write the network membership, approved list, and `network_public_key` to disk.
 
-12. **Return response.** Send `IpcResponse::Joined` with assigned IP back to the CLI.
+12. **Return response.** Send `IpcMessage::Joined` with assigned IP back to the CLI.
 
 ### Nuking a network
 
-When a user runs `pitopi nuke gentle-amber-fox`, the CLI sends an `IpcRequest::Nuke { name, force }` to the daemon. The daemon:
+When a user runs `pitopi nuke gentle-amber-fox`, the CLI sends an `IpcMessage::Nuke { name, force }` to the daemon. The daemon:
 
 1. **Publish empty record.** Publish a pkarr record with an empty GroupBlob hash and no seed peers. This signals to any future joiner that the network is gone.
 
@@ -1912,10 +1912,10 @@ Each active network has:
 
 ### IPC protocol
 
-The Unix socket at `/var/run/pitopi/pitopi.sock` uses the same wire format as the peer-to-peer control protocol: 4-byte big-endian length prefix + JSON body. The types are defined in `src/ipc.rs`:
+The Unix socket at `/var/run/pitopi/pitopi.sock` uses the same wire format as the peer-to-peer control protocol: 4-byte big-endian length prefix + msgpack body, framed via `tokio_util::codec::Framed` with a `MsgpackCodec`. A single `IpcMessage` enum carries both request and response variants:
 
-- **`IpcRequest`** — `Create` (no name field), `Join { network_key, name: Option }`, `Leave`, `Nuke { name, force }`, `Status`, `Shutdown`
-- **`IpcResponse`** — `Ok`, `Error`, `Created` (with generated name + join code + IP), `Joined`, `Status`
+- **Request variants** — `Create`, `Join`, `Leave`, `Nuke`, `Status`, `Shutdown`, `AclTag`, `AclUntag`, `AclAllow`, `AclRemove`, `AclShow`, `AclApply`, `FirewallAdd`, `FirewallRemove`, `FirewallShow`, `FirewallDefault`, `SetHostname`, `SendFile`, `ListFiles`, `AcceptFile`
+- **Response variants** — `Ok`, `Error`, `Created` (with generated name + join code + IP), `Joined`, `StatusResponse`, `AclState`, `FirewallState`, `FileList`
 
 The daemon accepts one connection at a time, reads a request, processes it, and sends a response. The CLI helpers (`ipc_create`, `ipc_join`, etc.) in `main.rs` handle the client side.
 

@@ -1,32 +1,30 @@
+use std::marker::PhantomData;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use bytes::{Buf, BufMut, BytesMut};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio_util::codec::{Decoder, Encoder, Framed};
 
 use crate::config::TransportMode;
 use crate::membership::GroupMode;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum IpcRequest {
+pub enum IpcMessage {
+    // Requests
     Create {
         mode: GroupMode,
-        #[serde(default)]
         name: Option<String>,
-        #[serde(default)]
         hostname: Option<String>,
-        #[serde(default)]
         transport: Option<TransportMode>,
     },
     Join {
         network_key: String,
         name: Option<String>,
-        #[serde(default)]
         hostname: Option<String>,
-        #[serde(default)]
         transport: Option<TransportMode>,
     },
     Leave {
@@ -90,10 +88,8 @@ pub enum IpcRequest {
         id: u64,
         output: Option<String>,
     },
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum IpcResponse {
+    // Responses
     Ok {
         message: String,
     },
@@ -104,27 +100,20 @@ pub enum IpcResponse {
         name: String,
         network_key: EndpointId,
         my_ip: Ipv4Addr,
-        #[serde(default)]
         my_ipv6: Option<Ipv6Addr>,
     },
     Joined {
         name: String,
         my_ip: Ipv4Addr,
-        #[serde(default)]
         my_ipv6: Option<Ipv6Addr>,
     },
-    Status {
+    StatusResponse {
         endpoint_id: EndpointId,
-        #[serde(default)]
         mdns_enabled: bool,
         networks: Vec<NetworkStatus>,
-        #[serde(default)]
         packets_rx: u64,
-        #[serde(default)]
         packets_tx: u64,
-        #[serde(default)]
         bytes_rx: u64,
-        #[serde(default)]
         bytes_tx: u64,
     },
     AclState {
@@ -152,11 +141,8 @@ pub struct NetworkStatus {
     pub name: String,
     pub role: NetworkRole,
     pub my_ip: Ipv4Addr,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub my_ipv6: Option<Ipv6Addr>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub my_hostname: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_key: Option<String>,
     pub member_count: usize,
     pub peers: Vec<PeerStatus>,
@@ -172,20 +158,15 @@ pub enum NetworkRole {
 pub struct PeerStatus {
     pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv6: Option<Ipv6Addr>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<ConnectionInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     pub conn_type: ConnType,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_addr: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<f64>,
     pub bytes_tx: u64,
     pub bytes_rx: u64,
@@ -202,6 +183,46 @@ pub enum ConnType {
     Unknown,
 }
 
+pub struct MsgpackCodec<T>(PhantomData<T>);
+
+impl<T> MsgpackCodec<T> {
+    pub fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Serialize> Encoder<T> for MsgpackCodec<T> {
+    type Error = anyhow::Error;
+
+    fn encode(&mut self, item: T, dst: &mut BytesMut) -> Result<()> {
+        let body = rmp_serde::to_vec(&item).context("serialize IPC message")?;
+        dst.put_u32(body.len() as u32);
+        dst.extend_from_slice(&body);
+        Ok(())
+    }
+}
+
+impl<T: DeserializeOwned> Decoder for MsgpackCodec<T> {
+    type Item = T;
+    type Error = anyhow::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<T>> {
+        if src.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes(src[..4].try_into().unwrap()) as usize;
+        anyhow::ensure!(len <= 1_048_576, "IPC message too large");
+        if src.len() < 4 + len {
+            return Ok(None);
+        }
+        src.advance(4);
+        let body = src.split_to(len);
+        Ok(Some(rmp_serde::from_slice(&body).context("decode IPC message")?))
+    }
+}
+
+pub type IpcFramed = Framed<UnixStream, MsgpackCodec<IpcMessage>>;
+
 pub fn socket_path() -> PathBuf {
     if cfg!(target_os = "macos") {
         PathBuf::from("/var/run/pitopi.sock")
@@ -210,36 +231,29 @@ pub fn socket_path() -> PathBuf {
     }
 }
 
-pub async fn connect() -> Result<UnixStream> {
+pub async fn connect() -> Result<IpcFramed> {
     let path = socket_path();
-    UnixStream::connect(&path)
+    let stream = UnixStream::connect(&path)
         .await
-        .context("daemon not running — start it with: sudo pitopi daemon")
+        .context("daemon not running — start it with: sudo pitopi daemon")?;
+    Ok(Framed::new(stream, MsgpackCodec::new()))
 }
 
-pub async fn send_msg<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<()> {
-    let body = rmp_serde::to_vec(msg).context("serialize IPC message")?;
-    let len = (body.len() as u32).to_be_bytes();
-    stream.write_all(&len).await.context("write IPC length")?;
-    stream.write_all(&body).await.context("write IPC body")?;
-    stream.flush().await.context("flush IPC")?;
-    Ok(())
+pub fn framed(stream: UnixStream) -> IpcFramed {
+    Framed::new(stream, MsgpackCodec::new())
 }
 
-pub async fn recv_msg<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
+pub async fn send(framed: &mut IpcFramed, msg: IpcMessage) -> Result<()> {
+    use futures::SinkExt;
+    framed.send(msg).await
+}
+
+pub async fn recv(framed: &mut IpcFramed) -> Result<IpcMessage> {
+    use futures::StreamExt;
+    framed
+        .next()
         .await
-        .context("read IPC length")?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    anyhow::ensure!(len <= 1_048_576, "IPC message too large");
-    let mut body = vec![0u8; len];
-    stream
-        .read_exact(&mut body)
-        .await
-        .context("read IPC body")?;
-    rmp_serde::from_slice(&body).context("decode IPC message")
+        .context("connection closed")?
 }
 
 #[cfg(test)]
@@ -248,16 +262,16 @@ mod tests {
 
     #[test]
     fn test_request_roundtrip() {
-        let req = IpcRequest::Create {
+        let req = IpcMessage::Create {
             mode: GroupMode::Open,
             name: None,
             hostname: None,
             transport: None,
         };
-        let json = rmp_serde::to_vec(&req).unwrap();
-        let decoded: IpcRequest = rmp_serde::from_slice(&json).unwrap();
+        let bytes = rmp_serde::to_vec(&req).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
-            IpcRequest::Create { mode, .. } => {
+            IpcMessage::Create { mode, .. } => {
                 assert_eq!(mode, GroupMode::Open);
             }
             _ => panic!("wrong variant"),
@@ -267,16 +281,16 @@ mod tests {
     #[test]
     fn test_response_roundtrip() {
         let key = iroh::SecretKey::generate().public();
-        let resp = IpcResponse::Created {
+        let resp = IpcMessage::Created {
             name: "test".to_string(),
             network_key: key,
             my_ip: Ipv4Addr::new(100, 64, 10, 5),
             my_ipv6: None,
         };
-        let json = rmp_serde::to_vec(&resp).unwrap();
-        let decoded: IpcResponse = rmp_serde::from_slice(&json).unwrap();
+        let bytes = rmp_serde::to_vec(&resp).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
-            IpcResponse::Created {
+            IpcMessage::Created {
                 name,
                 network_key,
                 my_ip,
@@ -292,15 +306,15 @@ mod tests {
 
     #[test]
     fn test_acl_tag_roundtrip() {
-        let req = IpcRequest::AclTag {
+        let req = IpcMessage::AclTag {
             network: "gentle-amber-fox".to_string(),
             tag: "servers".to_string(),
             peer_ids: vec!["ab3f".to_string(), "d92c".to_string()],
         };
-        let json = rmp_serde::to_vec(&req).unwrap();
-        let decoded: IpcRequest = rmp_serde::from_slice(&json).unwrap();
+        let bytes = rmp_serde::to_vec(&req).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
-            IpcRequest::AclTag {
+            IpcMessage::AclTag {
                 network,
                 tag,
                 peer_ids,
@@ -314,14 +328,14 @@ mod tests {
     }
 
     #[test]
-    fn test_acl_state_response_roundtrip() {
-        let resp = IpcResponse::AclState {
+    fn test_acl_state_roundtrip() {
+        let resp = IpcMessage::AclState {
             display: "Tags:\n  servers: ab3f\n".to_string(),
         };
-        let json = rmp_serde::to_vec(&resp).unwrap();
-        let decoded: IpcResponse = rmp_serde::from_slice(&json).unwrap();
+        let bytes = rmp_serde::to_vec(&resp).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
-            IpcResponse::AclState { display } => {
+            IpcMessage::AclState { display } => {
                 assert!(display.contains("servers"));
             }
             _ => panic!("wrong variant"),
@@ -332,7 +346,7 @@ mod tests {
     fn test_status_response_roundtrip() {
         let ep_id = iroh::SecretKey::generate().public();
         let peer_id = iroh::SecretKey::generate().public();
-        let resp = IpcResponse::Status {
+        let resp = IpcMessage::StatusResponse {
             endpoint_id: ep_id,
             mdns_enabled: true,
             networks: vec![NetworkStatus {
@@ -356,10 +370,10 @@ mod tests {
             bytes_rx: 0,
             bytes_tx: 0,
         };
-        let json = rmp_serde::to_vec(&resp).unwrap();
-        let decoded: IpcResponse = rmp_serde::from_slice(&json).unwrap();
+        let bytes = rmp_serde::to_vec(&resp).unwrap();
+        let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
-            IpcResponse::Status {
+            IpcMessage::StatusResponse {
                 endpoint_id,
                 networks,
                 ..

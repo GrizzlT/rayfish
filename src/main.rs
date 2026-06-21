@@ -335,10 +335,10 @@ fn cmd_mdns(state: &str) -> Result<()> {
 
 async fn cmd_list() -> Result<()> {
     if let Ok(mut stream) = ipc::connect().await {
-        ipc::send_msg(&mut stream, &ipc::IpcRequest::Status).await?;
-        let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+        ipc::send(&mut stream, ipc::IpcMessage::Status).await?;
+        let resp = ipc::recv(&mut stream).await?;
         match resp {
-            ipc::IpcResponse::Status { networks, .. } => {
+            ipc::IpcMessage::StatusResponse { networks, .. } => {
                 if networks.is_empty() {
                     println!("No active networks.");
                 } else {
@@ -369,7 +369,7 @@ async fn cmd_list() -> Result<()> {
                     }
                 }
             }
-            ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+            ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
             other => eprintln!("Unexpected response: {:?}", other),
         }
         return Ok(());
@@ -412,9 +412,9 @@ async fn ipc_create(
         None
     };
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(
+    ipc::send(
         &mut stream,
-        &ipc::IpcRequest::Create {
+        ipc::IpcMessage::Create {
             mode,
             name,
             hostname,
@@ -422,9 +422,9 @@ async fn ipc_create(
         },
     )
     .await?;
-    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Created {
+        ipc::IpcMessage::Created {
             name,
             network_key,
             my_ip,
@@ -438,7 +438,7 @@ async fn ipc_create(
             println!("  Join code: {}", network_key);
             println!("  Share this join code to invite others");
         }
-        ipc::IpcResponse::Error { message } => {
+        ipc::IpcMessage::Error { message } => {
             eprintln!("Error: {}", message);
         }
         other => eprintln!("Unexpected response: {:?}", other),
@@ -458,9 +458,9 @@ async fn ipc_join(
         None
     };
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(
+    ipc::send(
         &mut stream,
-        &ipc::IpcRequest::Join {
+        ipc::IpcMessage::Join {
             network_key: network_key.to_string(),
             name: name.map(|s| s.to_string()),
             hostname,
@@ -468,9 +468,9 @@ async fn ipc_join(
         },
     )
     .await?;
-    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Joined {
+        ipc::IpcMessage::Joined {
             name,
             my_ip,
             my_ipv6,
@@ -481,7 +481,7 @@ async fn ipc_join(
                 println!("  IPv6: {}", v6);
             }
         }
-        ipc::IpcResponse::Error { message } => {
+        ipc::IpcMessage::Error { message } => {
             eprintln!("Error: {}", message);
         }
         other => eprintln!("Unexpected response: {:?}", other),
@@ -491,18 +491,18 @@ async fn ipc_join(
 
 async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(
+    ipc::send(
         &mut stream,
-        &ipc::IpcRequest::Nuke {
+        ipc::IpcMessage::Nuke {
             name: name.to_string(),
             force,
         },
     )
     .await?;
-    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Ok { message } => println!("{}", message),
-        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -510,17 +510,17 @@ async fn ipc_nuke(name: &str, force: bool) -> Result<()> {
 
 async fn ipc_leave(name: &str) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(
+    ipc::send(
         &mut stream,
-        &ipc::IpcRequest::Leave {
+        ipc::IpcMessage::Leave {
             name: name.to_string(),
         },
     )
     .await?;
-    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Ok { message } => println!("{}", message),
-        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -528,10 +528,10 @@ async fn ipc_leave(name: &str) -> Result<()> {
 
 async fn ipc_status() -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(&mut stream, &ipc::IpcRequest::Status).await?;
-    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    ipc::send(&mut stream,ipc::IpcMessage::Status).await?;
+    let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Status {
+        ipc::IpcMessage::StatusResponse {
             endpoint_id,
             mdns_enabled,
             networks,
@@ -620,7 +620,7 @@ async fn ipc_status() -> Result<()> {
                 format_bytes(bytes_rx + bytes_tx)
             );
         }
-        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -628,11 +628,11 @@ async fn ipc_status() -> Result<()> {
 
 async fn ipc_down() -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(&mut stream, &ipc::IpcRequest::Shutdown).await?;
-    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    ipc::send(&mut stream,ipc::IpcMessage::Shutdown).await?;
+    let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Ok { message } => println!("{}", message),
-        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -640,18 +640,18 @@ async fn ipc_down() -> Result<()> {
 
 async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(
+    ipc::send(
         &mut stream,
-        &ipc::IpcRequest::SetHostname {
+        ipc::IpcMessage::SetHostname {
             network: network.to_string(),
             hostname: hostname.to_string(),
         },
     )
     .await?;
-    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Ok { message } => println!("{}", message),
-        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -660,38 +660,38 @@ async fn ipc_set_hostname(network: &str, hostname: &str) -> Result<()> {
 async fn ipc_acl(network: &str, action: AclAction) -> Result<()> {
     let mut stream = ipc::connect().await?;
     let req = match action {
-        AclAction::Tag { tag, peer_ids } => ipc::IpcRequest::AclTag {
+        AclAction::Tag { tag, peer_ids } => ipc::IpcMessage::AclTag {
             network: network.to_string(),
             tag,
             peer_ids,
         },
-        AclAction::Untag { tag, peer_id } => ipc::IpcRequest::AclUntag {
+        AclAction::Untag { tag, peer_id } => ipc::IpcMessage::AclUntag {
             network: network.to_string(),
             tag,
             peer_id,
         },
-        AclAction::Allow { src, dst } => ipc::IpcRequest::AclAllow {
+        AclAction::Allow { src, dst } => ipc::IpcMessage::AclAllow {
             network: network.to_string(),
             src,
             dst,
         },
-        AclAction::Remove { index } => ipc::IpcRequest::AclRemove {
+        AclAction::Remove { index } => ipc::IpcMessage::AclRemove {
             network: network.to_string(),
             index,
         },
-        AclAction::Show => ipc::IpcRequest::AclShow {
+        AclAction::Show => ipc::IpcMessage::AclShow {
             network: network.to_string(),
         },
-        AclAction::Apply => ipc::IpcRequest::AclApply {
+        AclAction::Apply => ipc::IpcMessage::AclApply {
             network: network.to_string(),
         },
     };
-    ipc::send_msg(&mut stream, &req).await?;
-    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    ipc::send(&mut stream,req).await?;
+    let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Ok { message } => println!("{}", message),
-        ipc::IpcResponse::AclState { display } => print!("{}", display),
-        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::AclState { display } => print!("{}", display),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -706,23 +706,23 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
             proto,
             port,
             peer,
-        } => ipc::IpcRequest::FirewallAdd {
+        } => ipc::IpcMessage::FirewallAdd {
             direction,
             action,
             protocol: proto,
             port,
             peer,
         },
-        FirewallAction::Remove { index } => ipc::IpcRequest::FirewallRemove { index },
-        FirewallAction::Show => ipc::IpcRequest::FirewallShow,
-        FirewallAction::Default { action } => ipc::IpcRequest::FirewallDefault { action },
+        FirewallAction::Remove { index } => ipc::IpcMessage::FirewallRemove { index },
+        FirewallAction::Show => ipc::IpcMessage::FirewallShow,
+        FirewallAction::Default { action } => ipc::IpcMessage::FirewallDefault { action },
     };
-    ipc::send_msg(&mut stream, &req).await?;
-    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    ipc::send(&mut stream,req).await?;
+    let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Ok { message } => println!("{}", message),
-        ipc::IpcResponse::FirewallState { display } => print!("{}", display),
-        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::FirewallState { display } => print!("{}", display),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -730,18 +730,18 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
 
 async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {
     let mut stream = ipc::connect().await?;
-    ipc::send_msg(
+    ipc::send(
         &mut stream,
-        &ipc::IpcRequest::SendFile {
+        ipc::IpcMessage::SendFile {
             path: file.to_string(),
             peer: peer.to_string(),
         },
     )
     .await?;
-    let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+    let resp = ipc::recv(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Ok { message } => println!("{}", message),
-        ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+        ipc::IpcMessage::Ok { message } => println!("{}", message),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
@@ -751,10 +751,10 @@ async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
     let mut stream = ipc::connect().await?;
     match action {
         None => {
-            ipc::send_msg(&mut stream, &ipc::IpcRequest::ListFiles).await?;
-            let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+            ipc::send(&mut stream,ipc::IpcMessage::ListFiles).await?;
+            let resp = ipc::recv(&mut stream).await?;
             match resp {
-                ipc::IpcResponse::FileList { files } => {
+                ipc::IpcMessage::FileList { files } => {
                     if files.is_empty() {
                         println!("No pending file transfers.");
                     } else {
@@ -769,7 +769,7 @@ async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                         println!("Accept with: pitopi files accept <id>");
                     }
                 }
-                ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+                ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
                 other => eprintln!("Unexpected response: {:?}", other),
             }
         }
@@ -779,15 +779,15 @@ async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                     .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
                     .map(|p| p.to_string_lossy().to_string())
             });
-            ipc::send_msg(
+            ipc::send(
                 &mut stream,
-                &ipc::IpcRequest::AcceptFile { id, output },
+                ipc::IpcMessage::AcceptFile { id, output },
             )
             .await?;
-            let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
+            let resp = ipc::recv(&mut stream).await?;
             match resp {
-                ipc::IpcResponse::Ok { message } => println!("{}", message),
-                ipc::IpcResponse::Error { message } => eprintln!("Error: {}", message),
+                ipc::IpcMessage::Ok { message } => println!("{}", message),
+                ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
                 other => eprintln!("Unexpected response: {:?}", other),
             }
         }
