@@ -110,6 +110,10 @@ impl MemberList {
         self.members.get(identity)
     }
 
+    pub fn get_mut(&mut self, identity: &EndpointId) -> Option<&mut Member> {
+        self.members.get_mut(identity)
+    }
+
     pub fn get_by_ip(&self, ip: Ipv4Addr) -> Option<&Member> {
         self.members.values().find(|m| m.ip == ip)
     }

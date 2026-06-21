@@ -271,11 +271,12 @@ Once you have networks running, query the daemon for live state:
 ```bash
 pitopi status
 # > Endpoint: <your-endpoint-id>
-# >   gaming [coordinator]
-# >     IP: 100.64.23.142
+# >   gaming [coordinator] — alice.gaming.pi
 # >     Peers:
-# >       100.64.7.201 (<peer-endpoint-id>)
+# >       bob.gaming.pi (b3f2)
 ```
+
+Peers are shown by DNS name when available (hostname.network.pi), falling back to IP for peers without a hostname.
 
 ### Leaving a network
 
@@ -317,7 +318,7 @@ TUN devices are virtual network interfaces. Creating them requires root privileg
 | `pitopi join KEY [--name ALIAS]` | Join a network by public key | Yes |
 | `pitopi leave NAME` | Leave a network and remove config | Yes |
 | `pitopi nuke NAME [--force]` | Publish empty record to DHT then leave | Yes |
-| `pitopi status` | Show active networks, peers, and IPs | Yes |
+| `pitopi status` | Show active networks, peers (DNS names when available) | Yes |
 | `pitopi down` | Shut down the daemon | Yes |
 | `pitopi list` | Show networks (queries daemon if running) | No |
 | `pitopi acl NAME tag TAG PEERS…` | Assign a tag to one or more peers | Yes |
@@ -1334,9 +1335,11 @@ The daemon runs a minimal UDP DNS responder bound to `127.0.0.1:53`. It only han
 
 ### Hostname assignment
 
-Hostnames are stored in the `Member` struct and propagated via the GroupBlob (the same mechanism used for membership and ACLs). This means hostnames are available even when the named peer is offline — any peer that has fetched the blob can resolve the name.
+Hostnames are stored in the `Member` struct and propagated via the GroupBlob (the same mechanism used for membership and ACLs) and via MeshHello messages when peers connect. This means hostnames are available even when the named peer is offline — any peer that has fetched the blob can resolve the name.
 
-Hostnames are also persisted in `~/.config/pitopi/networks.toml` (the `my_hostname` field) so they survive daemon restarts. If no hostname is chosen and none was previously assigned, a random one is generated from a word list.
+Hostnames are persisted in `~/.config/pitopi/networks.toml` (the `my_hostname` field) so they survive daemon restarts. If no hostname is chosen and none was previously assigned, a random one is generated from a word list.
+
+If two peers choose the same hostname, collision resolution appends a numeric suffix (e.g., `alice` → `alice2` → `alice3`).
 
 ```bash
 pitopi create --hostname alice       # choose your hostname

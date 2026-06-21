@@ -494,6 +494,17 @@ impl DaemonState {
 
         let conn = initial_conn.context("could not connect to any peer in the network")?;
 
+        let my_hostname = match hostname {
+            Some(h) => {
+                anyhow::ensure!(
+                    crate::hostname::is_valid_hostname(&h),
+                    "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+                );
+                h
+            }
+            None => crate::hostname::generate_hostname(),
+        };
+
         let cancel = self.shutdown_token.child_token();
         let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
 
@@ -504,6 +515,7 @@ impl DaemonState {
             display_name.to_string(),
             self.identity.local_identity(),
             my_ip,
+            Some(my_hostname.clone()),
             self.peers.clone(),
             self.tun_tx.clone(),
             disconnect_tx.clone(),
@@ -523,6 +535,7 @@ impl DaemonState {
             display_name,
             &self.identity,
             &alpn,
+            Some(my_hostname.clone()),
             self.peers.clone(),
             self.tun_tx.clone(),
             disconnect_tx,
@@ -533,6 +546,7 @@ impl DaemonState {
             self.firewall.clone(),
             net_pubkey,
             conn_rx,
+            self.hostname_table.clone(),
         ).await?;
 
         // Set the network public key and ACL on the state
@@ -584,20 +598,10 @@ impl DaemonState {
         self.refresh_alpns();
 
         // Register hostnames in DNS table
-        let my_hostname = match hostname {
-            Some(h) => {
-                anyhow::ensure!(
-                    crate::hostname::is_valid_hostname(&h),
-                    "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
-                );
-                h
-            }
-            None => crate::hostname::generate_hostname(),
-        };
         {
             let mut table = self.hostname_table.write().await;
             let network_hosts = table.entry(display_name.to_string()).or_default();
-            network_hosts.insert(my_hostname, my_ip);
+            network_hosts.insert(my_hostname.clone(), my_ip);
             // Add any members with known hostnames
             for member in &data.members {
                 if let Some(ref h) = member.hostname {
@@ -668,6 +672,7 @@ impl DaemonState {
             tracing::info!(network = %network_name, members = data.members.len(), "group blob resolved via DHT fallback");
 
             let my_ip = self.identity.local_ip();
+            let my_hostname = net_config.my_hostname.clone();
             let cancel = self.shutdown_token.child_token();
             let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
 
@@ -678,6 +683,7 @@ impl DaemonState {
                 network_name.to_string(),
                 my_identity,
                 my_ip,
+                my_hostname.clone(),
                 self.peers.clone(),
                 self.tun_tx.clone(),
                 disconnect_tx.clone(),
@@ -693,7 +699,7 @@ impl DaemonState {
                 if m.identity == my_identity { continue; }
                 if let Ok(peer_conn) = transport::connect_to_peer_with_alpn(&self.endpoint, m.identity, alpn).await {
                     if let Ok((mut s, _)) = peer_conn.open_bi().await {
-                        let _ = control::send_msg(&mut s, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: None }).await;
+                        let _ = control::send_msg(&mut s, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: my_hostname.clone() }).await;
                     }
                     crate::spawn_path_logger(peer_conn.clone(), m.identity.fmt_short().to_string());
                     self.peers.add(m.ip, peer_conn.clone(), m.identity, network_name);
@@ -2030,6 +2036,7 @@ async fn join_mesh_shared(
     network_name: &str,
     identity: &IrohIdentityProvider,
     alpn: &[u8],
+    my_hostname: Option<String>,
     peers: PeerTable,
     tun_tx: mpsc::Sender<Vec<u8>>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
@@ -2040,6 +2047,7 @@ async fn join_mesh_shared(
     firewall: SharedFirewall,
     net_pubkey: EndpointId,
     conn_rx: mpsc::Receiver<Connection>,
+    hostname_table: dns::HostnameTable,
 ) -> Result<Arc<std::sync::RwLock<NetworkState>>> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
@@ -2077,15 +2085,16 @@ async fn join_mesh_shared(
     let approved_config: Vec<config::ApprovedConfigEntry> = approved.iter().map(|a| config::ApprovedConfigEntry {
         identity: a.identity, ip: a.ip, hostname: a.hostname.clone(),
     }).collect();
-    let my_hostname = members.iter()
+    let persisted_hostname = members.iter()
         .find(|m| m.identity == my_identity)
-        .and_then(|m| m.hostname.clone());
+        .and_then(|m| m.hostname.clone())
+        .or(my_hostname.clone());
     let mut app_config = config::load()?;
     config::upsert_network(&mut app_config, config::NetworkConfig {
         name: network_name.to_string(),
         group_mode: GroupMode::Restricted,
         my_ip: Some(my_ip),
-        my_hostname,
+        my_hostname: persisted_hostname,
         members: member_entries,
         approved: approved_config,
         network_secret_key: None,
@@ -2112,7 +2121,7 @@ async fn join_mesh_shared(
         match transport::connect_to_peer_with_alpn(ep, member.identity, alpn).await {
             Ok(conn) => {
                 let (mut send, _recv) = conn.open_bi().await?;
-                control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: None }).await?;
+                control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: my_hostname.clone() }).await?;
                 peers.add(member.ip, conn.clone(), member.identity, network_name);
                 forward::spawn_peer_reader(conn, member.identity, member.ip, ep.id(), network_name.to_string(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                 tracing::info!(peer_ip = %member.ip, "connected to mesh peer");
@@ -2234,6 +2243,7 @@ async fn join_mesh_shared(
         let network_name = network_name.to_string();
         let blob_store = blob_store.clone();
         let shared_acl = shared_acl.clone();
+        let hostname_table = hostname_table.clone();
         let mut conn_rx = conn_rx;
         async move {
             loop {
@@ -2255,11 +2265,31 @@ async fn join_mesh_shared(
                                 let s = live_state.read().unwrap();
                                 (s.members.is_member(&peer_identity), s.approved.is_approved(&peer_identity))
                             };
+                            // Resolve hostname collisions
+                            let final_hostname = if let Some(desired) = hostname {
+                                let taken: Vec<String> = {
+                                    let s = live_state.read().unwrap();
+                                    s.members.all().iter()
+                                        .filter(|m| m.identity != peer_identity)
+                                        .filter_map(|m| m.hostname.clone())
+                                        .collect()
+                                };
+                                let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+                                Some(crate::hostname::resolve_collision(&desired, &taken_refs))
+                            } else {
+                                None
+                            };
+                            // Update DNS table
+                            if let Some(ref h) = final_hostname {
+                                let mut table = hostname_table.write().await;
+                                let network_hosts = table.entry(network_name.clone()).or_default();
+                                network_hosts.insert(h.clone(), ip);
+                            }
                             if is_approved {
                                 let snap_bytes = {
                                     let mut s = live_state.write().unwrap();
                                     s.approved.remove(&peer_identity);
-                                    let _ = s.members.add(Member { identity: peer_identity, ip, is_coordinator: false, hostname: hostname.clone() });
+                                    let _ = s.members.add(Member { identity: peer_identity, ip, is_coordinator: false, hostname: final_hostname.clone() });
                                     s.refresh_snapshot();
                                     s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
                                 };
@@ -2280,6 +2310,13 @@ async fn join_mesh_shared(
                                 forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                                 broadcast_member_sync(&peers, &members, Some(ip)).await;
                             } else if is_member {
+                                // Update hostname for existing member
+                                if final_hostname.is_some() {
+                                    let mut s = live_state.write().unwrap();
+                                    if let Some(m) = s.members.get_mut(&peer_identity) {
+                                        m.hostname = final_hostname;
+                                    }
+                                }
                                 peers.add(ip, conn.clone(), peer_identity, &network_name);
                                 forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), firewall.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                             }
@@ -2314,6 +2351,7 @@ fn spawn_reconnect_loop(
     network_name: String,
     my_identity: EndpointId,
     my_ip: Ipv4Addr,
+    my_hostname: Option<String>,
     peers: PeerTable,
     tun_tx: mpsc::Sender<Vec<u8>>,
     disconnect_tx: mpsc::Sender<forward::DisconnectEvent>,
@@ -2346,6 +2384,7 @@ fn spawn_reconnect_loop(
             let stats = stats.clone();
             let shared_acl = shared_acl.clone();
             let firewall = firewall.clone();
+            let my_hostname = my_hostname.clone();
 
             tokio::spawn(async move {
                 let mut backoff = BACKOFF_INITIAL;
@@ -2364,7 +2403,7 @@ fn spawn_reconnect_loop(
                                 Ok(bi) => bi,
                                 Err(e) => { tracing::warn!(error = %e, "reconnect handshake failed"); continue; }
                             };
-                            if let Err(e) = control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: None }).await {
+                            if let Err(e) = control::send_msg(&mut send, &ControlMsg::MeshHello { identity: my_identity, ip: my_ip, hostname: my_hostname.clone() }).await {
                                 tracing::warn!(error = %e, "reconnect MeshHello failed");
                                 continue;
                             }

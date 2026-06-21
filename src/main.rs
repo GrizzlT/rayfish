@@ -267,10 +267,17 @@ async fn cmd_list() -> Result<()> {
                             ipc::NetworkRole::Coordinator => "coordinator",
                             ipc::NetworkRole::Member => "member",
                         };
-                        println!(
-                            "{} (role: {}, ip: {}, peers: {})",
-                            net.name, role, net.my_ip, net.peers.len(),
-                        );
+                        if let Some(ref h) = net.my_hostname {
+                            println!(
+                                "{} (role: {}, dns: {}.{}.{}, peers: {})",
+                                net.name, role, h, net.name, DNS_DOMAIN, net.peers.len(),
+                            );
+                        } else {
+                            println!(
+                                "{} (role: {}, ip: {}, peers: {})",
+                                net.name, role, net.my_ip, net.peers.len(),
+                            );
+                        }
                     }
                 }
             }
@@ -386,18 +393,18 @@ async fn ipc_status() -> Result<()> {
                         ipc::NetworkRole::Coordinator => "coordinator",
                         ipc::NetworkRole::Member => "member",
                     };
-                    println!("  {} [{}]", net.name, role);
                     if let Some(ref h) = net.my_hostname {
-                        println!("    Hostname: {}.{}.{}", h, net.name, DNS_DOMAIN);
+                        println!("  {} [{}] — {}.{}.{}", net.name, role, h, net.name, DNS_DOMAIN);
+                    } else {
+                        println!("  {} [{}] — {}", net.name, role, net.my_ip);
                     }
-                    println!("    IP: {}", net.my_ip);
                     if !net.peers.is_empty() {
                         println!("    Peers:");
                         for peer in &net.peers {
                             if let Some(ref h) = peer.hostname {
-                                println!("      {} ({}) [{}]", peer.ip, peer.endpoint_id, h);
+                                println!("      {}.{}.{} ({})", h, net.name, DNS_DOMAIN, peer.endpoint_id.fmt_short());
                             } else {
-                                println!("      {} ({})", peer.ip, peer.endpoint_id);
+                                println!("      {} ({})", peer.ip, peer.endpoint_id.fmt_short());
                             }
                         }
                     }

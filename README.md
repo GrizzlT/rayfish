@@ -152,7 +152,7 @@ ping alice.gentle-amber-fox.pi    # fully qualified
 ping alice.pi                     # flat lookup (searches all networks)
 ```
 
-Hostnames propagate via the membership blob — they're resolvable even when the named peer is offline. The daemon configures your system DNS to route only `.pi` queries to its local resolver; all other DNS is untouched.
+Hostnames propagate via the membership blob and MeshHello messages — they're resolvable even when the named peer is offline. If two peers choose the same hostname, a numeric suffix is appended automatically (e.g., `alice` → `alice2`). Hostnames persist across daemon restarts. The daemon configures your system DNS to route only `.pi` queries to its local resolver; all other DNS is untouched.
 
 ## Commands
 
@@ -164,7 +164,7 @@ Hostnames propagate via the membership blob — they're resolvable even when the
 | `pitopi join KEY [--name ALIAS]` | Join a network by public key join code | Yes |
 | `pitopi leave NAME` | Leave a network and remove config | Yes |
 | `pitopi nuke NAME [--force]` | Publish empty records to DHT then leave | Yes |
-| `pitopi status` | Show active networks, peers, and IPs | Yes |
+| `pitopi status` | Show active networks, peers (DNS names when available) | Yes |
 | `pitopi down` | Shut down the daemon | Yes |
 | `pitopi list` | Show networks (queries daemon if running) | No |
 | `pitopi acl NAME tag TAG PEERS…` | Assign a tag to peers (coordinator) | Yes |
