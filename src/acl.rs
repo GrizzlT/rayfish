@@ -70,7 +70,8 @@ fn target_matches(target: &Target, peer: &EndpointId, peer_tags: &[String]) -> b
     }
 }
 
-pub fn canonical_acl_bytes(data: &AclData) -> Vec<u8> {
+#[cfg(test)]
+fn canonical_acl_bytes(data: &AclData) -> Vec<u8> {
     let mut sorted = data.clone();
     sorted.tags.sort_by(|a, b| a.tag.cmp(&b.tag));
     for assignment in &mut sorted.tags {
@@ -79,15 +80,18 @@ pub fn canonical_acl_bytes(data: &AclData) -> Vec<u8> {
     rmp_serde::to_vec_named(&sorted).expect("msgpack serialize")
 }
 
-pub fn acl_hash(data: &AclData) -> String {
+#[cfg(test)]
+fn acl_hash(data: &AclData) -> String {
     blake3::hash(&canonical_acl_bytes(data)).to_hex().to_string()
 }
 
-pub fn decode_acl_data(bytes: &[u8]) -> Result<AclData> {
+#[cfg(test)]
+fn decode_acl_data(bytes: &[u8]) -> Result<AclData> {
     rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid ACL data: {e}"))
 }
 
-pub fn verify_acl_data(bytes: &[u8], expected_hash: &str) -> Result<AclData> {
+#[cfg(test)]
+fn verify_acl_data(bytes: &[u8], expected_hash: &str) -> Result<AclData> {
     let actual = blake3::hash(bytes).to_hex().to_string();
     if actual != expected_hash {
         bail!("ACL hash mismatch: expected {expected_hash}, got {actual}");

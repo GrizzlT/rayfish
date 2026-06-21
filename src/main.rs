@@ -73,10 +73,13 @@ enum Command {
         #[arg(long, default_value = "restricted")]
         mode: GroupMode,
     },
-    /// Join an existing network using its three-word name
+    /// Join an existing network using its public key
     Join {
-        /// The three-word network name (e.g., gentle-amber-fox)
-        name: String,
+        /// The network public key (join code)
+        network_key: String,
+        /// Optional local alias for the network
+        #[arg(long)]
+        name: Option<String>,
     },
     /// List networks (queries daemon if running, falls back to saved config)
     List,
@@ -174,7 +177,7 @@ async fn main() -> Result<()> {
         Command::List => cmd_list().await,
         Command::Leave { name } => ipc_leave(&name).await,
         Command::Create { mode } => ipc_create(mode).await,
-        Command::Join { name } => ipc_join(&name).await,
+        Command::Join { network_key, name } => ipc_join(&network_key, name.as_deref()).await,
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Status => ipc_status().await,
         Command::Daemon | Command::Up => {
@@ -253,10 +256,11 @@ async fn ipc_create(mode: GroupMode) -> Result<()> {
     ipc::send_msg(&mut stream, &ipc::IpcRequest::Create { mode }).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {
-        ipc::IpcResponse::Created { name, my_ip } => {
+        ipc::IpcResponse::Created { name, network_key, my_ip } => {
             println!("Network created: {}", name);
             println!("  IP: {}", my_ip);
-            println!("  Share this name to invite others");
+            println!("  Join code: {}", network_key);
+            println!("  Share this join code to invite others");
         }
         ipc::IpcResponse::Error { message } => {
             eprintln!("Error: {}", message);
@@ -266,10 +270,11 @@ async fn ipc_create(mode: GroupMode) -> Result<()> {
     Ok(())
 }
 
-async fn ipc_join(name: &str) -> Result<()> {
+async fn ipc_join(network_key: &str, name: Option<&str>) -> Result<()> {
     let mut stream = ipc::connect().await?;
     ipc::send_msg(&mut stream, &ipc::IpcRequest::Join {
-        name: name.to_string(),
+        network_key: network_key.to_string(),
+        name: name.map(|s| s.to_string()),
     }).await?;
     let resp: ipc::IpcResponse = ipc::recv_msg(&mut stream).await?;
     match resp {

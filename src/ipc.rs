@@ -14,7 +14,8 @@ pub enum IpcRequest {
         mode: GroupMode,
     },
     Join {
-        name: String,
+        network_key: String,
+        name: Option<String>,
     },
     Leave {
         name: String,
@@ -62,6 +63,7 @@ pub enum IpcResponse {
     },
     Created {
         name: String,
+        network_key: String,
         my_ip: Ipv4Addr,
     },
     Joined {
@@ -160,13 +162,15 @@ mod tests {
     fn test_response_roundtrip() {
         let resp = IpcResponse::Created {
             name: "test".to_string(),
+            network_key: "abc123key".to_string(),
             my_ip: Ipv4Addr::new(100, 64, 10, 5),
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let decoded: IpcResponse = serde_json::from_slice(&json).unwrap();
         match decoded {
-            IpcResponse::Created { name, my_ip } => {
+            IpcResponse::Created { name, network_key, my_ip } => {
                 assert_eq!(name, "test");
+                assert_eq!(network_key, "abc123key");
                 assert_eq!(my_ip, Ipv4Addr::new(100, 64, 10, 5));
             }
             _ => panic!("wrong variant"),

@@ -11,8 +11,8 @@ But it's not just for games. Pitopi gives you a private, encrypted network betwe
 ## How it works
 
 1. **Create a network** — one peer starts a network and becomes the coordinator
-2. **Share the code** — the creator gets a short room code (like `ybnj-raqe-...`) to share with friends
-3. **Join** — peers connect using the room code. iroh handles NAT traversal, hole-punching, and encrypted transport automatically
+2. **Share the join code** — the creator gets a public key string to share with friends
+3. **Join** — peers connect using the join code. iroh handles NAT traversal, hole-punching, and encrypted transport automatically
 4. **Full mesh** — the coordinator assigns virtual IPs and broadcasts the peer list. Every peer connects directly to every other peer
 5. **Use it** — every peer gets a virtual IP (100.64.x.x). Any app that uses TCP/UDP just works
 
@@ -46,13 +46,14 @@ sudo pitopi daemon &    # start the daemon in the background
 
 ```bash
 # Create a network — you become the coordinator
-pitopi create --name gaming
-# > Network 'gaming' created.
+pitopi create
+# > Network created: gentle-amber-fox
 # >   IP: 100.64.23.142
-# >   Room code: gaming/ybnj-raqe-c5s6-...
+# >   Join code: 3f8a...c7d2
+# >   Share this join code to invite others
 
-# On another machine, join using the room code
-pitopi join gaming/ybnj-raqe-c5s6-...
+# On another machine, join using the join code
+pitopi join 3f8a...c7d2 --name gaming
 # > Joined network 'gaming'.
 # >   IP: 100.64.7.201
 
@@ -80,8 +81,8 @@ pitopi down
 You can run multiple isolated networks simultaneously through a single daemon:
 
 ```bash
-pitopi create --name gaming
-pitopi create --name work
+pitopi create
+pitopi create
 pitopi status    # shows both networks with live peer info
 ```
 
@@ -115,8 +116,8 @@ ACL rules are distributed to all peers via iroh-blobs and enforced at the packet
 |---------|-------------|:---:|
 | `sudo pitopi daemon` | Start the daemon (owns TUN + endpoint) | — |
 | `sudo pitopi up` | Alias for `daemon` | — |
-| `pitopi create` | Create a network (generates three-word name) | Yes |
-| `pitopi join NAME` | Join a network by three-word name via DHT | Yes |
+| `pitopi create` | Create a network (generates three-word name + join code) | Yes |
+| `pitopi join KEY [--name ALIAS]` | Join a network by public key join code | Yes |
 | `pitopi leave NAME` | Leave a network and remove config | Yes |
 | `pitopi nuke NAME [--force]` | Publish empty records to DHT then leave | Yes |
 | `pitopi status` | Show active networks, peers, and IPs | Yes |
@@ -181,8 +182,8 @@ See [TODO.md](TODO.md) for the full roadmap. Current status:
 - [x] Multi-peer full mesh (N peers in one network)
 - [x] Multiple simultaneous networks with isolation
 - [x] Persistent network config
-- [x] Room codes for easy sharing
-- [x] DHT membership publishing for offline coordinator resilience
+- [x] Public key join codes for secure network sharing
+- [x] DHT network records for offline coordinator resilience
 - [x] Distributed ACLs with tag-based allow rules (coordinator-managed, enforced on all peers)
 - [x] Systemd/launchd service integration
 - [x] Daemon architecture with Unix socket IPC

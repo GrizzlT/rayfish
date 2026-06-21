@@ -2766,6 +2766,7 @@ dependencies = [
  "clap_complete",
  "dirs",
  "futures",
+ "hex",
  "iroh",
  "iroh-blobs",
  "iroh-dns",

@@ -18,6 +18,100 @@
   - Abstract transport and TUN behind traits for injectable simulated network fabric
   - Seed-based deterministic replay of failure sequences
   - Scenarios: network partitions, ACL propagation under churn, reconnect behavior, split-brain, membership convergence after partition heal, race conditions between ACL updates and peer joins
-- [ ] Social discovery (Discord, Slack, Steam)
+- [ ] Social discovery & pitopi as a social P2P platform
+  - **Slack/Discord bot (privately hosted)**: closed-source hosted service that bridges chat platform identity to pitopi networks
+    - Admin installs Slack/Discord app → authenticates → bot creates/maps pitopi network to a workspace/channel
+    - Slash commands (`/pitopi create`, `/pitopi join`) for zero-friction network setup
+    - Bot stores mappings (workspace/channel → base58 network code) in a private database
+    - CLI `--slack`/`--discord` flag: authenticates via OAuth, calls bot API to get base58 code, joins via DHT as normal
+    - Only authenticated workspace/channel members can discover network codes — base58 never publicly exposed through the bot
+    - Channel membership can optionally drive the pitopi approved list (join channel → approved, leave → revoked)
+  - **Open-source social connector**: generic self-hostable version of the bot for communities that want to run their own
+  - **Voice/calls over mesh**: UDP audio streams over the pitopi mesh, with a UI — pitopi becomes a P2P alternative to Discord calls
+  - **Game lobby integration**: game communities create pitopi networks per session/server — the bot is the onramp ("click to join game night")
+  - **SDK/API for developers**: let game devs and app devs embed pitopi discovery directly (e.g., game lobby creates pitopi network automatically)
+  - **Architecture**: discovery is centralized (Slack/Discord identity as trust anchors), but once connected everything is P2P — the bot is just a lookup service, the mesh does the real work
+  - **Steam integration**: discover pitopi networks through Steam friends/groups
+- [ ] Magic DNS
+  - Resolve peers by human-readable names instead of IPs (e.g., `alice.pitopi` → `100.64.x.x`)
+  - Pitopi daemon runs a local DNS resolver, intercepts `.pitopi` queries
+  - Each peer gets a name (random word or user-chosen) registered when they join a network
+  - Names are per-network: `alice.gaming.pitopi` or flat within a network context
+  - Apps built on top of pitopi (voice, games, file sharing) just use standard sockets — resolve a DNS name, open a connection, pitopi is invisible plumbing
+  - Enables the "pitopi as infrastructure" model: no SDK or library needed, any app that can resolve DNS and open sockets works over the mesh
+  - Example: a voice call app creates a pitopi network, participants join, the app connects to peers via `bob.pitopi:4000` over regular UDP — NAT traversal, encryption, relay fallback all handled transparently
+- [ ] Per-network TUN devices for IP isolation
+  - Each network gets its own TUN interface instead of sharing one global device
+  - Eliminates cross-network IP collisions (same FNV-1a hash in different groups is fine)
+  - True OS-level network isolation — no packet can route to the wrong network
+  - NetworkHandle owns its own TunReader/TunWriter, created on join, torn down on leave
+  - PeerTable becomes per-network; forwarding loop runs per-network
+  - Enables future per-network MTU, routing, or firewall rules
+- [ ] Exit nodes
+  - A peer opts in with `pitopi exit-node enable`, advertising itself as an exit node to the network
+  - Other peers route internet traffic through them: `pitopi exit-node use alice`
+  - Traffic flows: app → TUN → pitopi mesh → exit node peer → internet → response back through the mesh
+  - Use cases: gaming (route through a peer closer to the game server for lower latency), privacy, accessing geo-restricted content
+  - Exit node peer needs to NAT/masquerade outbound traffic on its real interface
+  - ACL integration: control who can use exit nodes and who can offer them
+- [ ] Subnet routing
+  - A peer exposes its local LAN to the mesh: `pitopi subnet advertise 192.168.1.0/24`
+  - Other mesh peers can reach devices on that LAN (NAS, printer, home server) without installing pitopi on every device
+  - The advertising peer acts as a gateway — receives mesh traffic destined for the subnet, forwards it to the local network
+  - Routing table updates propagated to all peers via control messages
+  - ACL integration: control which peers can access which subnets
+- [ ] File sharing via iroh-blobs
+  - `pitopi send file.zip alice` — direct peer-to-peer encrypted file transfer using iroh-blobs (already a dependency for membership/ACL exchange)
+  - Receiver gets a prompt or auto-accepts based on config
+  - Progress bar, resume on disconnect, verified by content hash
+  - No cloud storage, no size limits — just a direct transfer over the mesh
+  - Could support directory sends: `pitopi send ./project bob`
+- [ ] Web dashboard
+  - `pitopi dashboard` starts a lightweight local web UI (localhost only)
+  - Shows network topology: which peers are connected, connection type (direct/relay), latency between peers
+  - Per-peer stats: packets/bytes sent/received, drops, connection uptime
+  - NAT type detection: show users their NAT situation and whether they're using relay fallback
+  - Network health overview: all networks, their members, ACL status
+  - Useful for debugging connectivity issues and for non-technical users who want a visual interface
+- [ ] Invite links
+  - `pitopi invite` generates a `pitopi://join/<base58-code>` URI
+  - Register a URI scheme handler so clicking the link on any platform auto-opens pitopi and joins
+  - Works in Slack, Discord, email, browser — paste the link, click to join
+  - Optional expiry and single-use invites for security
+  - Lower friction than sharing codes manually — especially for non-technical users
+- [ ] Split tunneling
+  - Only route specific traffic through pitopi, not everything
+  - By destination: `pitopi route add 10.0.0.0/8` — only route matching traffic through the mesh
+  - By application (platform-dependent): route only specific apps through pitopi
+  - Important for gaming: game traffic on the mesh for P2P connectivity, browser/streaming on the normal connection for bandwidth
+  - Default mode could be "mesh only" (only route pitopi peer IPs) vs "full tunnel" (everything through an exit node)
+- [ ] Smart relay routing (fastest path selection)
+  - Peers periodically measure latency to all other peers in the mesh (lightweight QUIC pings)
+  - Build a latency graph of the full mesh topology — each peer knows the cost of every link
+  - When the direct path (Spain → Tokyo, 280ms) is slower than a multi-hop relay (Spain → Dubai → Tokyo, 180ms), automatically route through the faster peer
+  - Dijkstra/Bellman-Ford shortest-path over the latency graph to find optimal routes
+  - Relay peers forward datagrams transparently — the relayed peer's traffic looks like normal mesh traffic
+  - Dynamic re-routing: if the Dubai peer goes offline or its latency degrades, fall back to direct path instantly
+  - Opt-in for relay peers: `pitopi relay enable` — a peer consents to forwarding others' traffic (bandwidth cost)
+  - Latency measurements shared via control messages so all peers can compute routes independently
+  - Pairs well with exit nodes: route to an exit node via the fastest multi-hop path, not just direct
+  - Privacy consideration: relay peers can see traffic metadata (src/dst IPs, volume) but not content (already encrypted by QUIC)
+- [ ] Multicast/broadcast relay
+  - Relay broadcast and multicast packets across the mesh so LAN protocols work transparently
+  - Game discovery (Minecraft LAN mode, Steam LAN, etc.) — a friend's game server shows up in the LAN tab automatically
+  - mDNS/Bonjour service discovery works across the mesh — printers, media servers, anything that advertises via mDNS
+  - Forwarding loop replicates broadcast/multicast datagrams to all peers in the network instead of single-peer routing
+  - Scoped per-network: broadcasts only propagate within a pitopi network, not across networks
+  - Rate limiting to prevent broadcast storms from flooding the mesh
+  - This is the "LAN games over the internet, zero config" feature
+- [ ] Local peer discovery via mDNS
+  - Pitopi daemon advertises itself on the local network via mDNS (`_pitopi._udp.local`)
+  - Detects other pitopi users on the same LAN (same WiFi, same office)
+  - Notification: "Detected user X nearby. Invite them to network Y?"
+  - Accept flow: invited user gets a prompt, one click to join — no codes, no setup
+  - Also enables direct LAN connections between peers who are on the same network — skip the relay/NAT traversal entirely for lower latency
+  - Privacy: only advertises presence to the local network, can be disabled with `pitopi mdns off`
+  - Pairs with Magic DNS: discovered peers immediately get a resolvable name
 - [ ] macOS Network Extension (no sudo)
+- [ ] Protocol obfuscation (TCP/443, WebSocket, obfs4-style) for restrictive networks
 - [ ] Windows, iOS, Android

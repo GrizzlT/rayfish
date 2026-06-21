@@ -294,45 +294,24 @@ impl IdentityProvider for IrohIdentityProvider {
 // Canonical membership serialization + hashing
 // ---------------------------------------------------------------------------
 
-/// Serializable snapshot of membership state for hashing and peer exchange.
+use crate::acl::AclData;
+
+/// The single authoritative blob for a network, published by the coordinator.
+/// Contains all state a joiner needs: members, approved list, and ACL rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MembershipData {
+pub struct GroupBlob {
     pub members: Vec<Member>,
     pub approved: Vec<ApprovedEntry>,
-    #[serde(default)]
-    pub network_secret: [u8; 32],
-    #[serde(default)]
-    pub membership_signing_key: [u8; 32],
+    pub acl: AclData,
 }
 
-/// Produces a deterministic msgpack encoding of membership state.
+/// Produces a deterministic msgpack encoding of a group blob.
 /// Members and approved entries are sorted by identity string to ensure
 /// identical output regardless of HashMap iteration order.
-pub fn canonical_membership_bytes(members: &MemberList, approved: &ApprovedList) -> Vec<u8> {
-    let mut sorted_members: Vec<Member> = members.all().into_iter().cloned().collect();
-    sorted_members.sort_by_key(|m| m.identity.to_string());
-
-    let mut sorted_approved: Vec<ApprovedEntry> = approved.all().into_iter().cloned().collect();
-    sorted_approved.sort_by_key(|a| a.identity.to_string());
-
-    let data = MembershipData {
-        members: sorted_members,
-        approved: sorted_approved,
-        network_secret: [0u8; 32],
-        membership_signing_key: [0u8; 32],
-    };
-    rmp_serde::to_vec_named(&data).expect("msgpack serialize")
-}
-
-/// Produces a deterministic msgpack encoding of membership state including secrets.
-/// Members and approved entries are sorted by identity string to ensure
-/// identical output regardless of HashMap iteration order.
-#[allow(dead_code)]
-pub fn canonical_membership_bytes_with_secrets(
+pub fn canonical_group_bytes(
     members: &MemberList,
     approved: &ApprovedList,
-    network_secret: &[u8; 32],
-    membership_signing_key: &[u8; 32],
+    acl: &AclData,
 ) -> Vec<u8> {
     let mut sorted_members: Vec<Member> = members.all().into_iter().cloned().collect();
     sorted_members.sort_by_key(|m| m.identity.to_string());
@@ -340,35 +319,32 @@ pub fn canonical_membership_bytes_with_secrets(
     let mut sorted_approved: Vec<ApprovedEntry> = approved.all().into_iter().cloned().collect();
     sorted_approved.sort_by_key(|a| a.identity.to_string());
 
-    let data = MembershipData {
+    let data = GroupBlob {
         members: sorted_members,
         approved: sorted_approved,
-        network_secret: *network_secret,
-        membership_signing_key: *membership_signing_key,
+        acl: acl.clone(),
     };
     rmp_serde::to_vec_named(&data).expect("msgpack serialize")
 }
 
-/// Computes the blake3 hash of the canonical membership encoding.
-pub fn membership_hash(members: &MemberList, approved: &ApprovedList) -> String {
-    let bytes = canonical_membership_bytes(members, approved);
+/// Computes the blake3 hash of the canonical group blob encoding.
+pub fn group_blob_hash(members: &MemberList, approved: &ApprovedList, acl: &AclData) -> String {
+    let bytes = canonical_group_bytes(members, approved, acl);
     blake3::hash(&bytes).to_hex().to_string()
 }
 
-/// Deserializes canonical msgpack bytes into [`MembershipData`].
-#[allow(dead_code)]
-pub fn decode_membership_data(bytes: &[u8]) -> Result<MembershipData> {
-    rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid membership data: {e}"))
+/// Deserializes canonical msgpack bytes into [`GroupBlob`].
+pub fn decode_group_blob(bytes: &[u8]) -> Result<GroupBlob> {
+    rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid group blob: {e}"))
 }
 
 /// Verifies that bytes match the expected hash, then deserializes.
-#[allow(dead_code)]
-pub fn verify_membership_data(bytes: &[u8], expected_hash: &str) -> Result<MembershipData> {
+pub fn verify_group_blob(bytes: &[u8], expected_hash: &str) -> Result<GroupBlob> {
     let actual = blake3::hash(bytes).to_hex().to_string();
     if actual != expected_hash {
-        bail!("membership hash mismatch: expected {expected_hash}, got {actual}");
+        bail!("group blob hash mismatch: expected {expected_hash}, got {actual}");
     }
-    decode_membership_data(bytes)
+    decode_group_blob(bytes)
 }
 
 #[cfg(test)]
@@ -700,8 +676,9 @@ mod tests {
     fn test_canonical_bytes_deterministic() {
         let members = make_member_list(&[1, 2, 3]);
         let approved = ApprovedList::new();
-        let a = canonical_membership_bytes(&members, &approved);
-        let b = canonical_membership_bytes(&members, &approved);
+        let acl = crate::acl::AclData::empty();
+        let a = canonical_group_bytes(&members, &approved, &acl);
+        let b = canonical_group_bytes(&members, &approved, &acl);
         assert_eq!(a, b);
     }
 
@@ -710,95 +687,74 @@ mod tests {
         let m1 = make_member_list(&[1, 2, 3]);
         let m2 = make_member_list(&[3, 1, 2]);
         let approved = ApprovedList::new();
+        let acl = crate::acl::AclData::empty();
         assert_eq!(
-            canonical_membership_bytes(&m1, &approved),
-            canonical_membership_bytes(&m2, &approved),
+            canonical_group_bytes(&m1, &approved, &acl),
+            canonical_group_bytes(&m2, &approved, &acl),
         );
     }
 
     #[test]
-    fn test_membership_hash_changes_on_mutation() {
+    fn test_group_blob_hash_changes_on_mutation() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let h1 = membership_hash(&members, &approved);
+        let acl = crate::acl::AclData::empty();
+        let h1 = group_blob_hash(&members, &approved, &acl);
         let members2 = make_member_list(&[1, 2, 3]);
-        let h2 = membership_hash(&members2, &approved);
+        let h2 = group_blob_hash(&members2, &approved, &acl);
         assert_ne!(h1, h2);
     }
 
     #[test]
-    fn test_membership_data_roundtrip() {
+    fn test_group_blob_roundtrip() {
         let members = make_member_list(&[1, 2]);
         let mut approved = ApprovedList::new();
         let id3 = test_id(3);
         approved.approve(ApprovedEntry { identity: id3, ip: derive_ip(&id3) }, &members).unwrap();
+        let acl = crate::acl::AclData::empty();
 
-        let bytes = canonical_membership_bytes(&members, &approved);
-        let data = decode_membership_data(&bytes).unwrap();
+        let bytes = canonical_group_bytes(&members, &approved, &acl);
+        let data = decode_group_blob(&bytes).unwrap();
         assert_eq!(data.members.len(), 2);
         assert_eq!(data.approved.len(), 1);
     }
 
     #[test]
-    fn test_verify_membership_data_ok() {
+    fn test_verify_group_blob_ok() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let bytes = canonical_membership_bytes(&members, &approved);
-        let hash = membership_hash(&members, &approved);
-        let data = verify_membership_data(&bytes, &hash).unwrap();
+        let acl = crate::acl::AclData::empty();
+        let bytes = canonical_group_bytes(&members, &approved, &acl);
+        let hash = group_blob_hash(&members, &approved, &acl);
+        let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members.len(), 2);
     }
 
     #[test]
-    fn test_verify_membership_data_bad_hash() {
+    fn test_verify_group_blob_bad_hash() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let bytes = canonical_membership_bytes(&members, &approved);
-        let result = verify_membership_data(&bytes, "badhash");
+        let acl = crate::acl::AclData::empty();
+        let bytes = canonical_group_bytes(&members, &approved, &acl);
+        let result = verify_group_blob(&bytes, "badhash");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("hash mismatch"));
     }
 
     #[test]
-    fn membership_data_includes_secrets() {
-        let key = iroh::SecretKey::generate();
-        let mut members = MemberList::new();
-        members.add(Member {
-            identity: key.public(),
-            ip: Ipv4Addr::new(100, 64, 0, 1),
-            is_coordinator: true,
-        }).unwrap();
+    fn test_group_blob_acl_changes_hash() {
+        let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let secret = [42u8; 32];
-        let signing_key = [99u8; 32];
-
-        let bytes = canonical_membership_bytes_with_secrets(
-            &members, &approved, &secret, &signing_key,
-        );
-        let data: MembershipData = rmp_serde::from_slice(&bytes).unwrap();
-        assert_eq!(data.network_secret, secret);
-        assert_eq!(data.membership_signing_key, signing_key);
-    }
-
-    #[test]
-    fn different_secrets_produce_different_hashes() {
-        let key = iroh::SecretKey::generate();
-        let mut members = MemberList::new();
-        members.add(Member {
-            identity: key.public(),
-            ip: Ipv4Addr::new(100, 64, 0, 1),
-            is_coordinator: true,
-        }).unwrap();
-        let approved = ApprovedList::new();
-
-        let bytes_a = canonical_membership_bytes_with_secrets(
-            &members, &approved, &[1u8; 32], &[2u8; 32],
-        );
-        let bytes_b = canonical_membership_bytes_with_secrets(
-            &members, &approved, &[3u8; 32], &[2u8; 32],
-        );
-        let hash_a = blake3::hash(&bytes_a).to_hex().to_string();
-        let hash_b = blake3::hash(&bytes_b).to_hex().to_string();
-        assert_ne!(hash_a, hash_b);
+        let acl_empty = crate::acl::AclData::empty();
+        let acl_with_rule = crate::acl::AclData {
+            tags: vec![],
+            rules: vec![crate::acl::AclRule {
+                src: crate::acl::Target::All,
+                dst: crate::acl::Target::All,
+            }],
+        };
+        let h1 = group_blob_hash(&members, &approved, &acl_empty);
+        let h2 = group_blob_hash(&members, &approved, &acl_with_rule);
+        assert_ne!(h1, h2);
     }
 }

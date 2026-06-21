@@ -24,8 +24,8 @@ use crate::identity;
 use crate::ipc::{self, IpcRequest, IpcResponse, NetworkRole, NetworkStatus, PeerStatus};
 use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
-    MemberList, MembershipPolicy, policy_for_mode, canonical_membership_bytes_with_secrets,
-    membership_hash, verify_membership_data,
+    MemberList, MembershipPolicy, policy_for_mode, canonical_group_bytes,
+    group_blob_hash, verify_group_blob,
 };
 use crate::network_name;
 use crate::peers::PeerTable;
@@ -37,7 +37,7 @@ const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
-struct MembershipSnapshot {
+struct GroupSnapshot {
     hash: String,
     msgpack_bytes: Vec<u8>,
 }
@@ -45,20 +45,17 @@ struct MembershipSnapshot {
 struct NetworkState {
     members: MemberList,
     approved: ApprovedList,
-    snapshot: Option<MembershipSnapshot>,
-    network_secret: [u8; 32],
-    membership_signing_key: [u8; 32],
+    snapshot: Option<GroupSnapshot>,
     acl: acl::AclData,
+    network_secret_key: Option<SecretKey>,
+    network_public_key: EndpointId,
 }
 
 impl NetworkState {
     fn refresh_snapshot(&mut self) {
-        let bytes = canonical_membership_bytes_with_secrets(
-            &self.members, &self.approved,
-            &self.network_secret, &self.membership_signing_key,
-        );
+        let bytes = canonical_group_bytes(&self.members, &self.approved, &self.acl);
         let hash = blake3::hash(&bytes).to_hex().to_string();
-        self.snapshot = Some(MembershipSnapshot { hash, msgpack_bytes: bytes });
+        self.snapshot = Some(GroupSnapshot { hash, msgpack_bytes: bytes });
     }
 }
 
@@ -74,7 +71,6 @@ pub struct NetworkHandle {
 
 pub struct DaemonState {
     endpoint: Endpoint,
-    secret_key: SecretKey,
     identity: IrohIdentityProvider,
     peers: PeerTable,
     stats: Arc<Stats>,
@@ -100,7 +96,7 @@ impl DaemonState {
     async fn handle_request(&self, req: IpcRequest) -> IpcResponse {
         match req {
             IpcRequest::Create { mode } => self.create_network(mode).await,
-            IpcRequest::Join { name } => self.join_network(&name).await,
+            IpcRequest::Join { network_key, name } => self.join_network(&network_key, name.as_deref()).await,
             IpcRequest::Leave { name } => self.leave_network(&name).await,
             IpcRequest::Nuke { name, force } => self.nuke_network(&name, force).await,
             IpcRequest::Status => self.status(),
@@ -127,6 +123,10 @@ impl DaemonState {
     async fn create_network_inner(&self, mode: GroupMode) -> Result<IpcResponse> {
         let name = network_name::generate_name();
 
+        // Generate per-network keypair
+        let net_secret_key = SecretKey::generate();
+        let net_public_key = net_secret_key.public();
+
         {
             let networks = self.networks.read().unwrap();
             if networks.contains_key(&name) {
@@ -136,14 +136,6 @@ impl DaemonState {
             }
         }
 
-        // Generate network secret (for seed list publishing)
-        let network_secret: [u8; 32] = rand::random();
-        let network_secret_key = SecretKey::from_bytes(&network_secret);
-
-        // Derive membership signing key
-        let membership_key = dht::derive_membership_key(&self.secret_key, &name);
-        let membership_signing_key = membership_key.to_bytes();
-        let dht_id = dht::membership_dht_id(&self.secret_key, &name).to_string();
         let my_ip = self.identity.local_ip();
         let policy = policy_for_mode(mode);
 
@@ -160,13 +152,12 @@ impl DaemonState {
             members: member_list,
             approved: ApprovedList::new(),
             snapshot: None,
-            network_secret,
-            membership_signing_key,
             acl: acl::AclData::empty(),
+            network_secret_key: Some(net_secret_key.clone()),
+            network_public_key: net_public_key,
         };
 
-        // Load ACL from file if it exists.
-        // Note: network is not yet registered, so resolve short IDs directly from net_state.members.
+        // Load ACL from file if it exists
         let acl_path = self.acl_file_path(&name);
         if acl_path.exists()
             && let Ok(content) = std::fs::read_to_string(&acl_path)
@@ -187,35 +178,16 @@ impl DaemonState {
             let _ = self.blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
         }
 
-        // Publish directory and seed list to DHT
+        // Publish single pkarr record
         if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
-            let dir_key = dht::derive_directory_key(&name);
-            if let Err(e) = dht::publish_directory(
+            let blob_hash = net_state.snapshot.as_ref().map(|s| s.hash.clone()).unwrap_or_default();
+            if let Err(e) = dht::publish_network(
                 &pkarr_client,
-                &dir_key,
-                &network_secret_key.public(),
-                &membership_key.public(),
-            ).await {
-                tracing::warn!(error = %e, "failed to publish directory record");
-            }
-
-            if let Err(e) = dht::publish_seed_list(
-                &pkarr_client,
-                &SecretKey::from_bytes(&network_secret),
+                &net_secret_key,
+                &blob_hash,
                 &[self.endpoint.id()],
             ).await {
-                tracing::warn!(error = %e, "failed to publish seed list");
-            }
-
-            // Publish ACL to DHT if non-empty
-            if !net_state.acl.tags.is_empty() || !net_state.acl.rules.is_empty() {
-                let acl_bytes = acl::canonical_acl_bytes(&net_state.acl);
-                let acl_hash = acl::acl_hash(&net_state.acl);
-                let _ = self.blob_store.blobs().add_slice(&acl_bytes).await;
-                let acl_key = dht::derive_acl_key(&self.secret_key, &name);
-                if let Err(e) = dht::publish_acl(&pkarr_client, &acl_key, &acl_hash).await {
-                    tracing::warn!(error = %e, "failed to publish ACL on create");
-                }
+                tracing::warn!(error = %e, "failed to publish network record");
             }
         }
 
@@ -236,9 +208,8 @@ impl DaemonState {
             my_ip: Some(my_ip),
             members: member_entries,
             approved: approved_entries,
-            membership_dht_id: Some(dht_id.clone()),
-            network_pkarr_pubkey: Some(network_secret_key.public().to_string()),
-            membership_dht_pubkey: Some(membership_key.public().to_string()),
+            network_secret_key: Some(hex::encode(net_secret_key.to_bytes())),
+            network_public_key: Some(net_public_key.to_string()),
         });
         config::save(&app_config)?;
 
@@ -246,26 +217,17 @@ impl DaemonState {
         let state = Arc::new(std::sync::RwLock::new(net_state));
         let mut tasks = Vec::new();
 
-        // DHT publisher
+        // Network publisher (single pkarr record: blob hash + seed peers)
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
-            tasks.push(spawn_dht_publisher(
-                pkarr_client.clone(),
-                membership_key,
-                state.clone(),
-                dht_notify.clone(),
-                cancel.clone(),
-            ));
-
-            // Seed list publisher
-            let seed_notify = Arc::new(tokio::sync::Notify::new());
-            tasks.push(spawn_seed_list_publisher(
+            tasks.push(spawn_network_publisher(
                 pkarr_client,
-                network_secret,
+                net_secret_key.clone(),
+                state.clone(),
                 self.endpoint.id(),
                 self.peers.clone(),
                 name.clone(),
-                seed_notify,
+                dht_notify.clone(),
                 cancel.clone(),
             ));
         }
@@ -275,7 +237,6 @@ impl DaemonState {
         tasks.push(spawn_peer_cleanup(disconnect_rx, self.peers.clone(), cancel.clone()));
 
         // Accept loop for this network
-        let acl_dht_id_str = Some(dht::acl_dht_id(&self.secret_key, &name).to_string());
         let accept_handle = spawn_coordinator_accept(
             self.endpoint.clone(),
             name.clone(),
@@ -288,8 +249,6 @@ impl DaemonState {
             cancel.clone(),
             self.stats.clone(),
             Some(dht_notify),
-            Some(dht_id),
-            acl_dht_id_str,
             self.blob_store.clone(),
             self.blobs_proto.clone(),
             self.shared_acl.clone(),
@@ -308,22 +267,28 @@ impl DaemonState {
         self.networks.write().unwrap().insert(name.clone(), handle);
         self.refresh_alpns();
 
-        tracing::info!(name = %name, ip = %my_ip, "network created");
+        let network_key = net_public_key.to_string();
+        tracing::info!(name = %name, key = %network_key, ip = %my_ip, "network created");
 
         Ok(IpcResponse::Created {
             name,
+            network_key,
             my_ip,
         })
     }
 
-    async fn join_network(&self, name: &str) -> IpcResponse {
-        match self.join_network_inner(name).await {
+    async fn join_network(&self, network_key: &str, name: Option<&str>) -> IpcResponse {
+        match self.join_network_inner(network_key, name).await {
             Ok(resp) => resp,
             Err(e) => IpcResponse::Error { message: format!("{e:#}") },
         }
     }
 
-    async fn join_network_inner(&self, name: &str) -> Result<IpcResponse> {
+    async fn join_network_inner(&self, network_key: &str, alias: Option<&str>) -> Result<IpcResponse> {
+        let net_pubkey: EndpointId = network_key.parse()
+            .context("invalid network key")?;
+        let name = alias.unwrap_or(network_key);
+
         {
             let networks = self.networks.read().unwrap();
             if networks.contains_key(name) {
@@ -333,39 +298,29 @@ impl DaemonState {
             }
         }
 
-        // Step 1: Resolve directory record (name → network pkarr pubkey + membership DHT pubkey)
+        // Resolve single pkarr record → (blob_hash, seed_peers)
         let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
-        let (network_pkarr_pubkey, membership_dht_pubkey) =
-            dht::resolve_directory(&pkarr_client, name).await
-                .context("failed to resolve network directory")?;
-
-        // Step 2: Resolve seed list and membership hash in parallel
-        let (seed_result, hash_result) = tokio::join!(
-            dht::resolve_seed_list(&pkarr_client, network_pkarr_pubkey),
-            dht::resolve_membership_hash(&pkarr_client, membership_dht_pubkey),
-        );
-
-        let peer_ids = seed_result.context("failed to resolve seed list")?;
-        let expected_hash = hash_result.context("failed to resolve membership hash")?;
+        let (expected_hash, peer_ids) = dht::resolve_network(&pkarr_client, net_pubkey).await
+            .context("failed to resolve network record")?;
 
         if peer_ids.is_empty() {
             return Ok(IpcResponse::Error {
-                message: "no peers found in seed list".to_string(),
+                message: "no peers found in network record".to_string(),
             });
         }
 
-        // Step 3: Connect to a peer and fetch membership blob
+        // Fetch group blob from a seed peer
         let blob_hash = {
             let b3_hash: blake3::Hash = expected_hash.parse()
-                .context("invalid membership hash from DHT")?;
+                .context("invalid blob hash from DHT")?;
             iroh_blobs::Hash::from_bytes(*b3_hash.as_bytes())
         };
 
-        let mut membership_data = None;
+        let mut group_blob = None;
         for peer_id in &peer_ids {
-            match self.try_fetch_blob_from_peer(*peer_id, blob_hash).await {
+            match self.try_fetch_group_blob(*peer_id, blob_hash).await {
                 Ok(data) => {
-                    membership_data = Some(data);
+                    group_blob = Some(data);
                     break;
                 }
                 Err(e) => {
@@ -375,12 +330,12 @@ impl DaemonState {
             }
         }
 
-        let data = membership_data.context("could not fetch membership from any peer")?;
+        let data = group_blob.context("could not fetch group blob from any peer")?;
 
         let alpn = transport::network_alpn(name);
         let my_ip = self.identity.local_ip();
 
-        // Try to connect to the first reachable peer via the network ALPN
+        // Connect to the first reachable peer
         let mut initial_conn = None;
         for peer_id in &peer_ids {
             if *peer_id == self.endpoint.id() { continue; }
@@ -395,7 +350,7 @@ impl DaemonState {
             }
         }
 
-        // Fall back to connecting to known members from the membership data
+        // Fall back to known members from the group blob
         if initial_conn.is_none() {
             let my_identity = self.identity.local_identity();
             for member in &data.members {
@@ -417,7 +372,6 @@ impl DaemonState {
         let cancel = self.shutdown_token.child_token();
         let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
 
-        // Reconnect loop
         let tasks = vec![spawn_reconnect_loop(
             disconnect_rx,
             self.endpoint.clone(),
@@ -433,7 +387,9 @@ impl DaemonState {
             self.shared_acl.clone(),
         )];
 
-        // Join mesh via the connected peer
+        // Apply ACL from group blob
+        self.shared_acl.set(name, data.acl.clone());
+
         let state = join_mesh_shared(
             conn,
             &self.endpoint,
@@ -448,14 +404,14 @@ impl DaemonState {
             self.blob_store.clone(),
             self.blobs_proto.clone(),
             self.shared_acl.clone(),
+            net_pubkey,
         ).await?;
 
-        // Store the secrets from the fetched membership data and refresh snapshot
-        // so the blob store has a hash that matches what the DHT publishes.
+        // Set the network public key and ACL on the state
         {
             let mut s = state.write().unwrap();
-            s.network_secret = data.network_secret;
-            s.membership_signing_key = data.membership_signing_key;
+            s.network_public_key = net_pubkey;
+            s.acl = data.acl;
             s.refresh_snapshot();
         }
         let snap_bytes = state.read().unwrap().snapshot.as_ref().map(|s| s.msgpack_bytes.clone());
@@ -463,26 +419,26 @@ impl DaemonState {
             let _ = self.blob_store.blobs().add_slice(&bytes).await;
         }
 
-        // Save config with the DHT pubkeys
+        // Save config with network public key
         if let Ok(mut app_config) = config::load() {
             if let Some(net) = app_config.networks.iter_mut().find(|n| n.name == name) {
-                net.network_pkarr_pubkey = Some(network_pkarr_pubkey.to_string());
-                net.membership_dht_pubkey = Some(membership_dht_pubkey.to_string());
+                net.network_public_key = Some(net_pubkey.to_string());
             }
             let _ = config::save(&app_config);
         }
 
-        // Membership poller — periodically checks for membership changes via DHT
+        // Membership poller
         let mut tasks = tasks;
         if let Ok(poller_client) = dht::create_pkarr_client(&self.endpoint) {
-            tasks.push(spawn_membership_poller(
+            tasks.push(spawn_group_poller(
                 poller_client,
-                membership_dht_pubkey,
+                net_pubkey,
                 state.clone(),
                 self.endpoint.clone(),
                 self.blob_store.clone(),
                 self.peers.clone(),
                 name.to_string(),
+                self.shared_acl.clone(),
                 cancel.clone(),
             ));
         }
@@ -506,11 +462,11 @@ impl DaemonState {
         })
     }
 
-    async fn try_fetch_blob_from_peer(
+    async fn try_fetch_group_blob(
         &self,
         peer_id: EndpointId,
         blob_hash: iroh_blobs::Hash,
-    ) -> Result<crate::membership::MembershipData> {
+    ) -> Result<crate::membership::GroupBlob> {
         let conn = transport::connect_to_peer_with_alpn(
             &self.endpoint, peer_id, iroh_blobs::protocol::ALPN,
         ).await?;
@@ -519,32 +475,27 @@ impl DaemonState {
         ).await.map_err(|e| anyhow::anyhow!("blob fetch failed: {e}"))?;
         let bytes = self.blob_store.blobs().get_bytes(blob_hash).await
             .map_err(|e| anyhow::anyhow!("blob read failed: {e}"))?;
-        rmp_serde::from_slice(&bytes).context("invalid membership data")
+        crate::membership::decode_group_blob(&bytes)
     }
 
     #[allow(dead_code)]
-    async fn try_dht_fallback_join(&self, network_name: &str, alpn: &[u8]) -> Result<IpcResponse> {
+    async fn try_dht_fallback_join(&self, network_name: &str, net_pubkey: EndpointId, alpn: &[u8]) -> Result<IpcResponse> {
+        tracing::info!(network = %network_name, "trying DHT fallback");
+
+        let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
+        let (expected_hash, _peer_ids) = dht::resolve_network(&pkarr_client, net_pubkey).await?;
+
+        let my_identity = self.identity.local_identity();
+        let blob_hash = {
+            let b3_hash: blake3::Hash = expected_hash.parse()
+                .context("invalid blob hash from DHT")?;
+            iroh_blobs::Hash::from_bytes(*b3_hash.as_bytes())
+        };
+
         let app_config = config::load()?;
         let net_config = app_config.networks.iter()
             .find(|n| n.name == network_name)
             .context("network not in config")?;
-        let dht_id_str = net_config.membership_dht_id.as_ref()
-            .context("no DHT ID known for this network")?;
-        let dht_id: EndpointId = dht_id_str.parse()
-            .context("invalid DHT ID in config")?;
-
-        tracing::info!(network = %network_name, "coordinator unreachable, trying DHT fallback");
-
-        let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
-        let expected_hash = dht::resolve_membership_hash(&pkarr_client, dht_id).await?;
-
-        // Try connecting to known members from config to fetch membership blob
-        let my_identity = self.identity.local_identity();
-        let blob_hash = {
-            let b3_hash: blake3::Hash = expected_hash.parse()
-                .context("invalid membership hash from DHT")?;
-            iroh_blobs::Hash::from_bytes(*b3_hash.as_bytes())
-        };
 
         for member in &net_config.members {
             if member.identity == my_identity { continue; }
@@ -565,8 +516,8 @@ impl DaemonState {
                 Err(_) => continue,
             };
 
-            let data = verify_membership_data(&blob_bytes, &expected_hash)?;
-            tracing::info!(network = %network_name, members = data.members.len(), "membership resolved via DHT fallback");
+            let data = verify_group_blob(&blob_bytes, &expected_hash)?;
+            tracing::info!(network = %network_name, members = data.members.len(), "group blob resolved via DHT fallback");
 
             let my_ip = self.identity.local_ip();
             let cancel = self.shutdown_token.child_token();
@@ -587,7 +538,8 @@ impl DaemonState {
                 self.shared_acl.clone(),
             )];
 
-            // Connect to the same peer via network ALPN for mesh data
+            self.shared_acl.set(network_name, data.acl.clone());
+
             for m in &data.members {
                 if m.identity == my_identity { continue; }
                 if let Ok(peer_conn) = transport::connect_to_peer_with_alpn(&self.endpoint, m.identity, alpn).await {
@@ -604,9 +556,9 @@ impl DaemonState {
                 members: MemberList::from_members(data.members),
                 approved: ApprovedList::from_entries(data.approved),
                 snapshot: None,
-                network_secret: data.network_secret,
-                membership_signing_key: data.membership_signing_key,
-                acl: acl::AclData::empty(),
+                acl: data.acl,
+                network_secret_key: None,
+                network_public_key: net_pubkey,
             };
             ns.refresh_snapshot();
             let live_state = Arc::new(std::sync::RwLock::new(ns));
@@ -642,22 +594,22 @@ impl DaemonState {
             }
         }
 
-        let membership_key = dht::derive_membership_key(&self.secret_key, name);
-        let membership_signing_key = membership_key.to_bytes();
-        let dht_id = dht::membership_dht_id(&self.secret_key, name).to_string();
         let my_ip = self.identity.local_ip();
         let policy = policy_for_mode(mode);
 
-        // The network secret was originally random; on restore we generate a fresh one
-        // and re-publish the seed list / directory with the new key.
-        let network_secret: [u8; 32] = rand::random();
-        let network_secret_key = SecretKey::from_bytes(&network_secret);
-
-        // Load persisted members and approved entries from config so we restore
-        // the full membership state, not just the coordinator.
+        // Load persisted network secret key from config
         let app_config = config::load()?;
         let net_config = app_config.networks.iter().find(|n| n.name == name);
+        let net_secret_key = net_config
+            .and_then(|nc| nc.network_secret_key.as_ref())
+            .and_then(|hex_str| {
+                let bytes: [u8; 32] = hex::decode(hex_str).ok()?.try_into().ok()?;
+                Some(SecretKey::from_bytes(&bytes))
+            })
+            .context("no network secret key in config — cannot restore as coordinator")?;
+        let net_public_key = net_secret_key.public();
 
+        // Load persisted members and approved entries
         let mut member_list = MemberList::new();
         if let Some(nc) = net_config {
             for entry in &nc.members {
@@ -668,7 +620,6 @@ impl DaemonState {
                 });
             }
         }
-        // Ensure the coordinator is always present (in case config is missing or incomplete).
         if !member_list.is_member(&self.identity.local_identity()) {
             member_list
                 .add(Member {
@@ -691,9 +642,9 @@ impl DaemonState {
             members: member_list,
             approved: approved_list,
             snapshot: None,
-            network_secret,
-            membership_signing_key,
             acl: acl::AclData::empty(),
+            network_secret_key: Some(net_secret_key.clone()),
+            network_public_key: net_public_key,
         };
 
         // Load persisted ACL file if it exists
@@ -720,39 +671,20 @@ impl DaemonState {
             let _ = self.blob_store.blobs().add_slice(&snap.msgpack_bytes).await;
         }
 
-        // Re-publish directory and seed list
+        // Publish single pkarr record
         if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
-            let dir_key = dht::derive_directory_key(name);
-            if let Err(e) = dht::publish_directory(
+            let blob_hash = net_state.snapshot.as_ref().map(|s| s.hash.clone()).unwrap_or_default();
+            if let Err(e) = dht::publish_network(
                 &pkarr_client,
-                &dir_key,
-                &network_secret_key.public(),
-                &membership_key.public(),
-            ).await {
-                tracing::warn!(error = %e, "failed to publish directory record on restore");
-            }
-
-            if let Err(e) = dht::publish_seed_list(
-                &pkarr_client,
-                &SecretKey::from_bytes(&network_secret),
+                &net_secret_key,
+                &blob_hash,
                 &[self.endpoint.id()],
             ).await {
-                tracing::warn!(error = %e, "failed to publish seed list on restore");
-            }
-
-            // Publish ACL to DHT if non-empty
-            if !net_state.acl.tags.is_empty() || !net_state.acl.rules.is_empty() {
-                let acl_bytes = acl::canonical_acl_bytes(&net_state.acl);
-                let _ = self.blob_store.blobs().add_slice(&acl_bytes).await;
-                let acl_key = dht::derive_acl_key(&self.secret_key, name);
-                let hash = acl::acl_hash(&net_state.acl);
-                if let Err(e) = dht::publish_acl(&pkarr_client, &acl_key, &hash).await {
-                    tracing::warn!(error = %e, "failed to publish ACL on restore");
-                }
+                tracing::warn!(error = %e, "failed to publish network record on restore");
             }
         }
 
-        // Update config with refreshed secrets (members/approved are unchanged).
+        // Update config
         let member_entries = net_state.members.all().into_iter().map(|m| config::MemberEntry {
             identity: m.identity,
             ip: m.ip,
@@ -769,9 +701,8 @@ impl DaemonState {
             my_ip: Some(my_ip),
             members: member_entries,
             approved: approved_entries,
-            membership_dht_id: Some(dht_id.clone()),
-            network_pkarr_pubkey: Some(network_secret_key.public().to_string()),
-            membership_dht_pubkey: Some(membership_key.public().to_string()),
+            network_secret_key: Some(hex::encode(net_secret_key.to_bytes())),
+            network_public_key: Some(net_public_key.to_string()),
         });
         config::save(&app_config)?;
 
@@ -781,10 +712,13 @@ impl DaemonState {
 
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         if let Ok(pkarr_client) = dht::create_pkarr_client(&self.endpoint) {
-            tasks.push(spawn_dht_publisher(
+            tasks.push(spawn_network_publisher(
                 pkarr_client,
-                membership_key,
+                net_secret_key.clone(),
                 state.clone(),
+                self.endpoint.id(),
+                self.peers.clone(),
+                name.to_string(),
                 dht_notify.clone(),
                 cancel.clone(),
             ));
@@ -792,8 +726,6 @@ impl DaemonState {
 
         let (disconnect_tx, disconnect_rx) = mpsc::channel::<forward::DisconnectEvent>(64);
         tasks.push(spawn_peer_cleanup(disconnect_rx, self.peers.clone(), cancel.clone()));
-
-        let acl_dht_id_str = Some(dht::acl_dht_id(&self.secret_key, name).to_string());
 
         // Sync the restored ACL into the shared ACL state for enforcement
         {
@@ -813,8 +745,6 @@ impl DaemonState {
             cancel.clone(),
             self.stats.clone(),
             Some(dht_notify),
-            Some(dht_id),
-            acl_dht_id_str,
             self.blob_store.clone(),
             self.blobs_proto.clone(),
             self.shared_acl.clone(),
@@ -832,10 +762,12 @@ impl DaemonState {
         self.networks.write().unwrap().insert(name.to_string(), handle);
         self.refresh_alpns();
 
-        tracing::info!(name = %name, ip = %my_ip, "network restored (coordinator)");
+        let network_key = net_public_key.to_string();
+        tracing::info!(name = %name, key = %network_key, ip = %my_ip, "network restored (coordinator)");
 
         Ok(IpcResponse::Created {
             name: name.to_string(),
+            network_key,
             my_ip,
         })
     }
@@ -871,36 +803,19 @@ impl DaemonState {
             };
         }
 
-        // Publish empty membership and empty seed list to DHT
-        if let Ok(client) = dht::create_pkarr_client(&self.endpoint) {
-            let membership_key = dht::derive_membership_key(&self.secret_key, name);
-
-            // Publish empty membership hash
-            let empty_members = MemberList::new();
-            let empty_approved = ApprovedList::new();
-            let empty_hash = membership_hash(&empty_members, &empty_approved);
-            if let Err(e) = dht::publish_membership(&client, &membership_key, &empty_hash).await {
-                tracing::warn!(error = %e, "failed to publish empty membership on nuke");
-            }
-
-            // Publish empty seed list
-            let network_secret = {
-                let networks = self.networks.read().unwrap();
-                let handle = networks.get(name).unwrap();
-                let state = handle.state.read().unwrap();
-                state.network_secret
-            };
-            let seed_key = SecretKey::from_bytes(&network_secret);
-            if let Err(e) = dht::publish_seed_list(&client, &seed_key, &[]).await {
-                tracing::warn!(error = %e, "failed to publish empty seed list on nuke");
-            }
-
-            // Publish empty ACL
-            let acl_key = dht::derive_acl_key(&self.secret_key, name);
-            let empty_acl = acl::AclData::empty();
-            let empty_acl_hash = acl::acl_hash(&empty_acl);
-            if let Err(e) = dht::publish_acl(&client, &acl_key, &empty_acl_hash).await {
-                tracing::warn!(error = %e, "failed to publish empty ACL on nuke");
+        // Publish empty pkarr record
+        let net_secret_key = {
+            let networks = self.networks.read().unwrap();
+            let handle = networks.get(name).unwrap();
+            let state = handle.state.read().unwrap();
+            state.network_secret_key.clone()
+        };
+        if let Some(key) = net_secret_key
+            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
+        {
+            let empty_hash = group_blob_hash(&MemberList::new(), &ApprovedList::new(), &acl::AclData::empty());
+            if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[]).await {
+                tracing::warn!(error = %e, "failed to publish empty network record on nuke");
             }
         }
 
@@ -998,21 +913,51 @@ impl DaemonState {
     }
 
     async fn publish_and_broadcast_acl(&self, network: &str, data: &acl::AclData) {
-        // Sync into the shared ACL used by the forwarding layer
         self.shared_acl.set(network, data.clone());
 
-        let hash = acl::acl_hash(data);
-        let bytes = acl::canonical_acl_bytes(data);
-        let _ = self.blob_store.blobs().add_slice(&bytes).await;
+        // Refresh the group blob snapshot and publish to DHT
+        let (hash, net_key) = {
+            let networks = self.networks.read().unwrap();
+            if let Some(handle) = networks.get(network) {
+                let mut state = handle.state.write().unwrap();
+                state.acl = data.clone();
+                state.refresh_snapshot();
+                let h = state.snapshot.as_ref().map(|s| s.hash.clone()).unwrap_or_default();
+                (h, state.network_secret_key.clone())
+            } else {
+                return;
+            }
+        };
 
-        if let Ok(client) = dht::create_pkarr_client(&self.endpoint) {
-            let acl_key = dht::derive_acl_key(&self.secret_key, network);
-            if let Err(e) = dht::publish_acl(&client, &acl_key, &hash).await {
-                tracing::warn!(error = %e, "failed to publish ACL to DHT");
+        // Store updated blob
+        let snap_bytes = {
+            let networks = self.networks.read().unwrap();
+            networks.get(network).and_then(|h| {
+                h.state.read().unwrap().snapshot.as_ref().map(|s| s.msgpack_bytes.clone())
+            })
+        };
+        if let Some(bytes) = snap_bytes {
+            let _ = self.blob_store.blobs().add_slice(&bytes).await;
+        }
+
+        // Publish to pkarr if we have the secret key
+        if let Some(key) = net_key
+            && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
+        {
+            let mut seed_peers: Vec<EndpointId> = self.peers
+                .peers_for_network(network)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            seed_peers.push(self.endpoint.id());
+            seed_peers.sort_by_key(|id| id.to_string());
+            seed_peers.dedup();
+            if let Err(e) = dht::publish_network(&client, &key, &hash, &seed_peers).await {
+                tracing::warn!(error = %e, "failed to publish network record after ACL update");
             }
         }
 
-        let msg = ControlMsg::AclUpdated { acl_hash: hash };
+        let msg = ControlMsg::BlobUpdated { hash };
         broadcast_control_msg(&self.peers, &msg).await;
     }
 
@@ -1175,7 +1120,6 @@ impl DaemonState {
 pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<()> {
     let key = identity::load_or_create()?;
     let public_key = key.public();
-    let secret_key = key.clone();
     let identity = IrohIdentityProvider::new(public_key);
     let my_ip = identity.local_ip();
 
@@ -1219,7 +1163,6 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
 
     let daemon = Arc::new(DaemonState {
         endpoint: ep,
-        secret_key,
         identity,
         peers,
         stats: stats.clone(),
@@ -1236,11 +1179,18 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
     // Restore saved networks
     for net in &app_config.networks {
         if net.my_ip.is_some() {
-            // We're a member — rejoin via DHT name lookup
+            // We're a member — rejoin via DHT lookup
             let name = net.name.clone();
+            let net_pubkey = match &net.network_public_key {
+                Some(k) => k.clone(),
+                None => {
+                    tracing::warn!(network = %name, "no network public key in config, skipping restore");
+                    continue;
+                }
+            };
             let daemon_c = daemon.clone();
             tokio::spawn(async move {
-                match daemon_c.join_network_inner(&name).await {
+                match daemon_c.join_network_inner(&net_pubkey, Some(&name)).await {
                     Ok(IpcResponse::Joined { name, my_ip }) => {
                         tracing::info!(network = %name, ip = %my_ip, "restored member network");
                     }
@@ -1352,10 +1302,14 @@ async fn handle_ipc_client(mut stream: UnixStream, daemon: &DaemonState) -> Resu
 // Network task helpers (extracted from main.rs patterns)
 // ---------------------------------------------------------------------------
 
-fn spawn_dht_publisher(
+#[allow(clippy::too_many_arguments)]
+fn spawn_network_publisher(
     client: PkarrRelayClient,
-    membership_key: SecretKey,
+    net_secret_key: SecretKey,
     state: Arc<std::sync::RwLock<NetworkState>>,
+    endpoint_id: EndpointId,
+    peers: PeerTable,
+    network_name: String,
     notify: Arc<tokio::sync::Notify>,
     token: CancellationToken,
 ) -> JoinHandle<()> {
@@ -1364,47 +1318,21 @@ fn spawn_dht_publisher(
             let hash = {
                 let s = state.read().unwrap();
                 s.snapshot.as_ref().map(|snap| snap.hash.clone())
-                    .unwrap_or_else(|| membership_hash(&s.members, &s.approved))
+                    .unwrap_or_else(|| group_blob_hash(&s.members, &s.approved, &s.acl))
             };
-            match dht::publish_membership(&client, &membership_key, &hash).await {
-                Ok(()) => tracing::info!("published membership hash to DHT"),
-                Err(e) => tracing::warn!(error = %e, "failed to publish membership to DHT"),
-            }
-            tokio::select! {
-                _ = token.cancelled() => break,
-                _ = notify.notified() => {},
-                _ = tokio::time::sleep(Duration::from_secs(300)) => {},
-            }
-        }
-    })
-}
-
-fn spawn_seed_list_publisher(
-    client: PkarrRelayClient,
-    network_secret: [u8; 32],
-    endpoint_id: EndpointId,
-    peers: PeerTable,
-    network_name: String,
-    notify: Arc<tokio::sync::Notify>,
-    token: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let key = SecretKey::from_bytes(&network_secret);
-        loop {
-            let mut peer_ids: Vec<EndpointId> = peers
+            let mut seed_peers: Vec<EndpointId> = peers
                 .peers_for_network(&network_name)
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect();
-            peer_ids.push(endpoint_id);
-            peer_ids.sort_by_key(|id| id.to_string());
-            peer_ids.dedup();
+            seed_peers.push(endpoint_id);
+            seed_peers.sort_by_key(|id| id.to_string());
+            seed_peers.dedup();
 
-            match dht::publish_seed_list(&client, &key, &peer_ids).await {
-                Ok(()) => tracing::info!(count = peer_ids.len(), "published seed list"),
-                Err(e) => tracing::warn!(error = %e, "failed to publish seed list"),
+            match dht::publish_network(&client, &net_secret_key, &hash, &seed_peers).await {
+                Ok(()) => tracing::info!(peers = seed_peers.len(), "published network record"),
+                Err(e) => tracing::warn!(error = %e, "failed to publish network record"),
             }
-
             tokio::select! {
                 _ = token.cancelled() => break,
                 _ = notify.notified() => {},
@@ -1415,14 +1343,15 @@ fn spawn_seed_list_publisher(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_membership_poller(
+fn spawn_group_poller(
     client: PkarrRelayClient,
-    membership_dht_pubkey: EndpointId,
+    net_pubkey: EndpointId,
     state: Arc<std::sync::RwLock<NetworkState>>,
     endpoint: Endpoint,
     blob_store: FsStore,
     peers: PeerTable,
     network_name: String,
+    shared_acl: forward::SharedAcl,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1437,10 +1366,10 @@ fn spawn_membership_poller(
                 s.snapshot.as_ref().map(|snap| snap.hash.clone())
             };
 
-            let remote_hash = match dht::resolve_membership_hash(&client, membership_dht_pubkey).await {
-                Ok(h) => h,
+            let (remote_hash, _seed_peers) = match dht::resolve_network(&client, net_pubkey).await {
+                Ok(r) => r,
                 Err(e) => {
-                    tracing::debug!(error = %e, "membership poll failed");
+                    tracing::debug!(error = %e, "group poll failed");
                     continue;
                 }
             };
@@ -1449,17 +1378,16 @@ fn spawn_membership_poller(
                 continue;
             }
 
-            tracing::info!(old = ?current_hash, new = %remote_hash, "membership changed");
+            tracing::info!(old = ?current_hash, new = %remote_hash, "group blob changed");
 
             let blob_hash = match remote_hash.parse::<blake3::Hash>() {
                 Ok(h) => iroh_blobs::Hash::from_bytes(*h.as_bytes()),
                 Err(e) => {
-                    tracing::warn!(error = %e, "invalid membership hash");
+                    tracing::warn!(error = %e, "invalid blob hash");
                     continue;
                 }
             };
 
-            // Try fetching from any connected peer
             let peer_ids: Vec<EndpointId> = peers
                 .peers_for_network(&network_name)
                 .into_iter()
@@ -1481,7 +1409,7 @@ fn spawn_membership_poller(
                 }
                 match blob_store.blobs().get_bytes(blob_hash).await {
                     Ok(bytes) => {
-                        match rmp_serde::from_slice::<crate::membership::MembershipData>(&bytes) {
+                        match crate::membership::decode_group_blob(&bytes) {
                             Ok(data) => { new_data = Some(data); break; }
                             Err(_) => continue,
                         }
@@ -1491,7 +1419,7 @@ fn spawn_membership_poller(
             }
 
             let Some(data) = new_data else {
-                tracing::warn!("could not fetch updated membership from any peer");
+                tracing::warn!("could not fetch updated group blob from any peer");
                 continue;
             };
 
@@ -1513,7 +1441,6 @@ fn spawn_membership_poller(
                 }
             }
 
-            // Check if we were removed
             let my_id = endpoint.id();
             if !new_member_ids.contains(&my_id)
                 && !data.approved.iter().any(|a| a.identity == my_id)
@@ -1522,13 +1449,13 @@ fn spawn_membership_poller(
                 break;
             }
 
-            // Update state
+            // Update state including ACL
+            shared_acl.set(&network_name, data.acl.clone());
             {
                 let mut s = state.write().unwrap();
                 s.members = MemberList::from_members(data.members);
                 s.approved = ApprovedList::from_entries(data.approved);
-                s.network_secret = data.network_secret;
-                s.membership_signing_key = data.membership_signing_key;
+                s.acl = data.acl;
                 s.refresh_snapshot();
             }
         }
@@ -1571,8 +1498,6 @@ fn spawn_coordinator_accept(
     token: CancellationToken,
     stats: Arc<Stats>,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
-    dht_id: Option<String>,
-    acl_dht_id: Option<String>,
     blob_store: FsStore,
     blobs_proto: BlobsProtocol,
     shared_acl: forward::SharedAcl,
@@ -1591,8 +1516,6 @@ fn spawn_coordinator_accept(
             token,
             stats,
             dht_notify,
-            dht_id,
-            acl_dht_id,
             blob_store,
             blobs_proto,
             shared_acl,
@@ -1616,8 +1539,6 @@ async fn run_accept_loop(
     token: CancellationToken,
     stats: Arc<Stats>,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
-    dht_id: Option<String>,
-    acl_dht_id: Option<String>,
     blob_store: FsStore,
     blobs_proto: BlobsProtocol,
     shared_acl: forward::SharedAcl,
@@ -1667,12 +1588,11 @@ async fn run_accept_loop(
             let stats_c = stats.clone();
             let tun_tx_c = tun_tx.clone();
             let disconnect_tx_c = disconnect_tx.clone();
-            let dht_id_c = dht_id.clone();
             let local_id = ep.id();
             let network_c = network_name.to_string();
             let shared_acl_c = shared_acl.clone();
             tokio::spawn(async move {
-                send_member_sync(&conn, &members, dht_id_c).await;
+                send_member_sync(&conn, &members).await;
                 forward::spawn_peer_reader(conn, remote_id, peer_ip, local_id, network_c, shared_acl_c, tun_tx_c, disconnect_tx_c, token_c, stats_c);
             });
             continue;
@@ -1701,10 +1621,10 @@ async fn run_accept_loop(
             };
             if let Ok((mut send, _)) = conn.open_bi().await {
                 let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
-                    members: members.clone(), approved, membership_dht_id: dht_id.clone(), acl_dht_id: acl_dht_id.clone(),
+                    members: members.clone(), approved,
                 }).await;
             }
-            broadcast_member_sync(&peers, &members, Some(peer_ip), dht_id.clone()).await;
+            broadcast_member_sync(&peers, &members, Some(peer_ip)).await;
             peers.add(peer_ip, conn.clone(), remote_id, network_name);
             let token_c = token.clone();
             let stats_c = stats.clone();
@@ -1789,10 +1709,10 @@ async fn run_accept_loop(
 
         if let Ok((mut send, _)) = conn.open_bi().await {
             let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
-                members: members.clone(), approved, membership_dht_id: dht_id.clone(), acl_dht_id: acl_dht_id.clone(),
+                members: members.clone(), approved,
             }).await;
         }
-        broadcast_member_sync(&peers, &members, Some(peer_ip), dht_id.clone()).await;
+        broadcast_member_sync(&peers, &members, Some(peer_ip)).await;
         peers.add(peer_ip, conn.clone(), remote_id, network_name);
         let token_c = token.clone();
         let stats_c = stats.clone();
@@ -1822,27 +1742,28 @@ async fn join_mesh_shared(
     blob_store: FsStore,
     blobs_proto: BlobsProtocol,
     shared_acl: forward::SharedAcl,
+    net_pubkey: EndpointId,
 ) -> Result<Arc<std::sync::RwLock<NetworkState>>> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
 
     let (_send, mut recv) = initial_conn.accept_bi().await.context("accept control stream")?;
     let msg = control::recv_msg(&mut recv).await?;
-    let (members, approved, received_dht_id, received_acl_dht_id) = match msg {
-        ControlMsg::Welcome { members, approved, membership_dht_id, acl_dht_id } => {
+    let (members, approved) = match msg {
+        ControlMsg::Welcome { members, approved } => {
             tracing::info!(network = %network_name, "welcomed to network");
             if let Some(existing) = members.iter().find(|m| m.ip == my_ip && m.identity != my_identity) {
                 anyhow::bail!("IP collision: {} is already assigned to {}", my_ip, existing.identity);
             }
-            (members, approved, membership_dht_id, acl_dht_id)
+            (members, approved)
         }
         ControlMsg::JoinApproved { your_ip, members } => {
             tracing::info!(ip = %your_ip, network = %network_name, "joined network (legacy)");
-            (members, vec![], None, None)
+            (members, vec![])
         }
-        ControlMsg::MemberSync { members, membership_dht_id } => {
+        ControlMsg::MemberSync { members } => {
             tracing::info!(network = %network_name, "reconnected via peer");
-            (members, vec![], membership_dht_id, None)
+            (members, vec![])
         }
         ControlMsg::JoinDenied { reason } => {
             anyhow::bail!("join denied: {reason}");
@@ -1860,18 +1781,14 @@ async fn join_mesh_shared(
         identity: a.identity, ip: a.ip,
     }).collect();
     let mut app_config = config::load()?;
-    let dht_id_to_save = received_dht_id.clone().or_else(|| {
-        app_config.networks.iter().find(|n| n.name == network_name).and_then(|n| n.membership_dht_id.clone())
-    });
     config::upsert_network(&mut app_config, config::NetworkConfig {
         name: network_name.to_string(),
         group_mode: GroupMode::Restricted,
         my_ip: Some(my_ip),
         members: member_entries,
         approved: approved_config,
-        membership_dht_id: dht_id_to_save,
-        network_pkarr_pubkey: None,
-        membership_dht_pubkey: None,
+        network_secret_key: None,
+        network_public_key: Some(net_pubkey.to_string()),
     });
     config::save(&app_config)?;
 
@@ -1910,9 +1827,9 @@ async fn join_mesh_shared(
             members: MemberList::from_members(members.clone()),
             approved: ApprovedList::from_entries(approved),
             snapshot: None,
-            network_secret: [0u8; 32],
-            membership_signing_key: [0u8; 32],
             acl: acl::AclData::empty(),
+            network_secret_key: None,
+            network_public_key: net_pubkey,
         };
         ns.refresh_snapshot();
         if let Some(snap) = &ns.snapshot {
@@ -1920,56 +1837,6 @@ async fn join_mesh_shared(
         }
         Arc::new(std::sync::RwLock::new(ns))
     };
-
-    // Fetch ACL from DHT if coordinator provided an ACL DHT ID
-    if let Some(acl_id_str) = received_acl_dht_id
-        && let Ok(acl_dht_id_parsed) = acl_id_str.parse::<EndpointId>()
-        && let Ok(pkarr_client) = dht::create_pkarr_client(ep)
-    {
-            match dht::resolve_acl_hash(&pkarr_client, acl_dht_id_parsed).await {
-                Ok(acl_hash) => {
-                    match acl_hash.parse::<blake3::Hash>() {
-                        Ok(b3_hash) => {
-                            let blob_hash = iroh_blobs::Hash::from_bytes(*b3_hash.as_bytes());
-                            let peer_ids: Vec<EndpointId> = peers
-                                .peers_for_network(network_name)
-                                .into_iter()
-                                .map(|(id, _)| id)
-                                .collect();
-                            let mut fetched = false;
-                            for pid in &peer_ids {
-                                if let Ok(conn) = transport::connect_to_peer_with_alpn(
-                                    ep, *pid, iroh_blobs::protocol::ALPN,
-                                ).await
-                                    && blob_store.remote().fetch(
-                                        conn, HashAndFormat::raw(blob_hash),
-                                    ).await.is_ok()
-                                {
-                                    fetched = true;
-                                    break;
-                                }
-                            }
-                            if fetched {
-                                if let Ok(bytes) = blob_store.blobs().get_bytes(blob_hash).await {
-                                    match acl::verify_acl_data(&bytes, &acl_hash) {
-                                        Ok(data) => {
-                                            shared_acl.set(network_name, data.clone());
-                                            live_state.write().unwrap().acl = data;
-                                            tracing::info!(network = %network_name, "ACL loaded from DHT on join");
-                                        }
-                                        Err(e) => tracing::warn!(error = %e, "ACL verification failed on join"),
-                                    }
-                                }
-                            } else {
-                                tracing::warn!(network = %network_name, "could not fetch ACL blob from any peer on join");
-                            }
-                        }
-                        Err(e) => tracing::warn!(error = %e, "invalid ACL hash from DHT"),
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "failed to resolve ACL hash from DHT on join"),
-            }
-    }
 
     // Control listener
     tokio::spawn({
@@ -1995,7 +1862,7 @@ async fn join_mesh_shared(
                                         let members = s.members.clone();
                                         let _ = s.approved.approve(entry, &members);
                                     }
-                                    Ok(ControlMsg::MemberSync { members, membership_dht_id }) => {
+                                    Ok(ControlMsg::MemberSync { members }) => {
                                         tracing::info!(count = members.len(), "member list updated");
                                         let snap_bytes = {
                                             let mut s = live_state.write().unwrap();
@@ -2006,21 +1873,13 @@ async fn join_mesh_shared(
                                         if let Some(bytes) = snap_bytes {
                                             let _ = blob_store.blobs().add_slice(&bytes).await;
                                         }
-                                        if membership_dht_id.is_some()
-                                            && let Ok(mut cfg) = config::load()
-                                            && let Some(net) = cfg.networks.iter_mut().find(|n| n.name == network_name)
-                                        {
-                                            net.membership_dht_id = membership_dht_id;
-                                            let _ = config::save(&cfg);
-                                        }
                                     }
-                                    Ok(ControlMsg::AclUpdated { acl_hash }) => {
-                                        tracing::info!(hash = %acl_hash, "received ACL update");
-                                        let blob_hash = match acl_hash.parse::<blake3::Hash>() {
+                                    Ok(ControlMsg::BlobUpdated { hash }) => {
+                                        tracing::info!(hash = %hash, "received blob update");
+                                        let blob_hash = match hash.parse::<blake3::Hash>() {
                                             Ok(h) => iroh_blobs::Hash::from_bytes(*h.as_bytes()),
                                             Err(_) => continue,
                                         };
-                                        // Fetch from any connected peer
                                         let peer_ids: Vec<EndpointId> = peers_c.peers_for_network(&network_name)
                                             .into_iter().map(|(id, _)| id).collect();
                                         let mut fetched = false;
@@ -2039,13 +1898,17 @@ async fn join_mesh_shared(
                                         if fetched
                                             && let Ok(bytes) = blob_store.blobs().get_bytes(blob_hash).await
                                         {
-                                            match acl::verify_acl_data(&bytes, &acl_hash) {
+                                            match crate::membership::verify_group_blob(&bytes, &hash) {
                                                 Ok(data) => {
-                                                    shared_acl_ctrl.set(&network_name, data.clone());
-                                                    live_state.write().unwrap().acl = data;
-                                                    tracing::info!("ACL updated");
+                                                    shared_acl_ctrl.set(&network_name, data.acl.clone());
+                                                    let mut s = live_state.write().unwrap();
+                                                    s.members = MemberList::from_members(data.members);
+                                                    s.approved = ApprovedList::from_entries(data.approved);
+                                                    s.acl = data.acl;
+                                                    s.refresh_snapshot();
+                                                    tracing::info!("group blob updated");
                                                 }
-                                                Err(e) => tracing::warn!(error = %e, "ACL verification failed"),
+                                                Err(e) => tracing::warn!(error = %e, "group blob verification failed"),
                                             }
                                         }
                                     }
@@ -2114,12 +1977,12 @@ async fn join_mesh_shared(
                                             };
                                             if let Ok((mut send, _)) = conn.open_bi().await {
                                                 let _ = control::send_msg(&mut send, &ControlMsg::Welcome {
-                                                    members: members.clone(), approved: approved_list, membership_dht_id: None, acl_dht_id: None,
+                                                    members: members.clone(), approved: approved_list,
                                                 }).await;
                                             }
                                             peers.add(ip, conn.clone(), peer_identity, &network_name);
                                             forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
-                                            broadcast_member_sync(&peers, &members, Some(ip), None).await;
+                                            broadcast_member_sync(&peers, &members, Some(ip)).await;
                                         } else if is_member {
                                             peers.add(ip, conn.clone(), peer_identity, &network_name);
                                             forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
@@ -2132,7 +1995,7 @@ async fn join_mesh_shared(
                                             peers.add(ip, conn.clone(), peer_identity, &network_name);
                                             let current_members: Vec<Member> = live_state.read().unwrap().members.all().into_iter().cloned().collect();
                                             if let Ok((mut send, _)) = conn.open_bi().await {
-                                                let _ = control::send_msg(&mut send, &ControlMsg::MemberSync { members: current_members, membership_dht_id: None }).await;
+                                                let _ = control::send_msg(&mut send, &ControlMsg::MemberSync { members: current_members }).await;
                                             }
                                             forward::spawn_peer_reader(conn, peer_identity, ip, ep.id(), network_name.clone(), shared_acl.clone(), tun_tx.clone(), disconnect_tx.clone(), token.clone(), stats.clone());
                                         }
@@ -2227,14 +2090,14 @@ fn spawn_reconnect_loop(
 // Broadcast helpers (same as main.rs but local to daemon)
 // ---------------------------------------------------------------------------
 
-async fn send_member_sync(conn: &Connection, members: &[Member], dht_id: Option<String>) {
+async fn send_member_sync(conn: &Connection, members: &[Member]) {
     if let Ok((mut send, _)) = conn.open_bi().await {
-        let _ = control::send_msg(&mut send, &ControlMsg::MemberSync { members: members.to_vec(), membership_dht_id: dht_id }).await;
+        let _ = control::send_msg(&mut send, &ControlMsg::MemberSync { members: members.to_vec() }).await;
     }
 }
 
-async fn broadcast_member_sync(peers: &PeerTable, members: &[Member], exclude_ip: Option<Ipv4Addr>, dht_id: Option<String>) {
-    let msg = ControlMsg::MemberSync { members: members.to_vec(), membership_dht_id: dht_id };
+async fn broadcast_member_sync(peers: &PeerTable, members: &[Member], exclude_ip: Option<Ipv4Addr>) {
+    let msg = ControlMsg::MemberSync { members: members.to_vec() };
     for (ip, conn) in peers.all_connections() {
         if Some(ip) == exclude_ip { continue; }
         if let Ok((mut send, _)) = conn.open_bi().await
