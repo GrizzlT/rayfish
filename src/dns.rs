@@ -85,11 +85,10 @@ async fn resolve_name(name: &str, suffix: &str, table: &HostnameTable) -> Option
     let table_guard = table.read().await;
 
     // Try <hostname>.<network>.pi
-    if let Some((hostname, network)) = stripped.rsplit_once('.') {
-        if let Some(network_hosts) = table_guard.get(network) {
+    if let Some((hostname, network)) = stripped.rsplit_once('.')
+        && let Some(network_hosts) = table_guard.get(network) {
             return network_hosts.get(hostname).copied();
         }
-    }
 
     // Try <hostname>.pi (search all networks, return first match)
     for network_hosts in table_guard.values() {

@@ -237,7 +237,16 @@ impl DaemonState {
         let my_ip = self.identity.local_ip();
         let policy = policy_for_mode(mode);
 
-        let my_hostname = hostname.unwrap_or_else(crate::hostname::generate_hostname);
+        let my_hostname = match hostname {
+            Some(h) => {
+                anyhow::ensure!(
+                    crate::hostname::is_valid_hostname(&h),
+                    "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+                );
+                h
+            }
+            None => crate::hostname::generate_hostname(),
+        };
 
         let mut member_list = MemberList::new();
         member_list
@@ -574,7 +583,16 @@ impl DaemonState {
         self.refresh_alpns();
 
         // Register hostnames in DNS table
-        let my_hostname = hostname.unwrap_or_else(crate::hostname::generate_hostname);
+        let my_hostname = match hostname {
+            Some(h) => {
+                anyhow::ensure!(
+                    crate::hostname::is_valid_hostname(&h),
+                    "invalid hostname '{h}': use 1-63 lowercase ASCII letters, digits, or hyphens (no leading/trailing hyphen)"
+                );
+                h
+            }
+            None => crate::hostname::generate_hostname(),
+        };
         {
             let mut table = self.hostname_table.write().await;
             let network_hosts = table.entry(display_name.to_string()).or_default();
@@ -1511,11 +1529,10 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<Stats>) -> Result<(
         tokio::select! {
             _ = token.cancelled() => {
                 tracing::info!("daemon shutting down");
-                if let Some(ref configurator) = dns_configurator {
-                    if let Err(e) = configurator.revert() {
+                if let Some(ref configurator) = dns_configurator
+                    && let Err(e) = configurator.revert() {
                         tracing::warn!(error = %e, "failed to revert DNS configuration");
                     }
-                }
                 let _ = std::fs::remove_file(&socket_path);
                 return Ok(());
             }

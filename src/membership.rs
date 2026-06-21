@@ -336,8 +336,70 @@ pub fn group_blob_hash(members: &MemberList, approved: &ApprovedList, acl: &AclD
     blake3::hash(&bytes)
 }
 
+/// Validates that a [`Member`]'s virtual IP is consistent with its identity and
+/// lies in the CGNAT range, excluding the reserved network (`.0`) and gateway
+/// (`.1`) addresses.
+///
+/// This is the invariant the network *should* enforce at every trust boundary
+/// (GroupBlob decode, `Welcome`/`MemberSync` application, `MeshHello.ip`). Today
+/// the daemon trusts the `ip` field carried in those messages, which permits IP
+/// hijacking — see the security audit. This helper exists so enforcement can be
+/// added at the data layer without changing the on-wire format.
+pub fn validate_member(member: &Member) -> Result<()> {
+    let expected = derive_ip(&member.identity);
+    anyhow::ensure!(
+        member.ip == expected,
+        "member ip {} does not match identity-derived ip {}",
+        member.ip,
+        expected,
+    );
+    ensure_in_cgnat_range(member.ip)
+}
+
+/// Like [`validate_member`] but for [`ApprovedEntry`].
+pub fn validate_approved(entry: &ApprovedEntry) -> Result<()> {
+    let expected = derive_ip(&entry.identity);
+    anyhow::ensure!(
+        entry.ip == expected,
+        "approved entry ip {} does not match identity-derived ip {}",
+        entry.ip,
+        expected,
+    );
+    ensure_in_cgnat_range(entry.ip)
+}
+
+fn ensure_in_cgnat_range(ip: Ipv4Addr) -> Result<()> {
+    let o = ip.octets();
+    anyhow::ensure!(
+        o[0] == 100 && (o[1] & 0xC0) == 64,
+        "ip {} is outside the 100.64.0.0/10 CGNAT range",
+        ip,
+    );
+    anyhow::ensure!(
+        !(o[1] == 64 && o[2] == 0 && o[3] == 0),
+        "ip {} is the reserved network address",
+        ip,
+    );
+    anyhow::ensure!(
+        !(o[1] == 64 && o[2] == 0 && o[3] == 1),
+        "ip {} is the reserved TUN gateway address",
+        ip,
+    );
+    Ok(())
+}
+
 pub fn decode_group_blob(bytes: &[u8]) -> Result<GroupBlob> {
-    rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid group blob: {e}"))
+    let blob: GroupBlob = rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid group blob: {e}"))?;
+    // Enforce the identity<->IP binding at the decode boundary. Any blob that
+    // survives this check has self-consistent members/approved entries, so a
+    // malicious or buggy publisher cannot inject a spoofed or reserved IP.
+    for m in &blob.members {
+        validate_member(m)?;
+    }
+    for a in &blob.approved {
+        validate_approved(a)?;
+    }
+    Ok(blob)
 }
 
 pub fn verify_group_blob(bytes: &[u8], expected_hash: &blake3::Hash) -> Result<GroupBlob> {
@@ -781,5 +843,132 @@ mod tests {
         let h1 = group_blob_hash(&members, &approved, &acl_empty);
         let h2 = group_blob_hash(&members, &approved, &acl_with_rule);
         assert_ne!(h1, h2);
+    }
+
+    // -- validate_member / validate_approved ---------------------------------
+
+    #[test]
+    fn validate_member_accepts_consistent_ip() {
+        let id = test_id(7);
+        let member = Member {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: false,
+            hostname: None,
+        };
+        assert!(validate_member(&member).is_ok());
+    }
+
+    #[test]
+    fn validate_member_rejects_mismatched_ip() {
+        // A peer/ coordinator must not be able to assign an arbitrary IP to an
+        // identity. This is the invariant that prevents IP hijacking.
+        let id = test_id(7);
+        let member = Member {
+            identity: id,
+            ip: Ipv4Addr::new(100, 64, 10, 5), // does NOT equal derive_ip(test_id(7))
+            is_coordinator: false,
+            hostname: None,
+        };
+        let err = validate_member(&member).unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn validate_member_rejects_out_of_range_ip() {
+        let id = test_id(7);
+        let member = Member {
+            identity: id,
+            ip: Ipv4Addr::new(10, 0, 0, 5),
+            is_coordinator: false,
+            hostname: None,
+        };
+        assert!(validate_member(&member).is_err());
+    }
+
+    #[test]
+    fn validate_member_rejects_reserved_addresses() {
+        // .0 (network) and .1 (gateway) are reserved even if derive_ip avoids them.
+        let id = test_id(7);
+        let net = Member {
+            identity: id,
+            ip: Ipv4Addr::new(100, 64, 0, 0),
+            is_coordinator: false,
+            hostname: None,
+        };
+        let gw = Member {
+            identity: id,
+            ip: Ipv4Addr::new(100, 64, 0, 1),
+            is_coordinator: false,
+            hostname: None,
+        };
+        assert!(validate_member(&net).is_err());
+        assert!(validate_member(&gw).is_err());
+    }
+
+    #[test]
+    fn validate_approved_rejects_mismatched_ip() {
+        let id = test_id(9);
+        let entry = ApprovedEntry {
+            identity: id,
+            ip: Ipv4Addr::new(100, 64, 99, 99),
+            hostname: None,
+        };
+        assert!(validate_approved(&entry).is_err());
+    }
+
+    #[test]
+    fn validate_member_accepts_all_derived_ips_in_range() {
+        // Every derive_ip() output for a spread of identities must pass validation.
+        for seed in 0u8..=255 {
+            let id = test_id(seed);
+            let member = Member {
+                identity: id,
+                ip: derive_ip(&id),
+                is_coordinator: false,
+                hostname: None,
+            };
+            assert!(validate_member(&member).is_ok(), "seed {seed} -> {}", member.ip);
+        }
+    }
+
+    #[test]
+    fn decode_group_blob_rejects_mismatched_member_ip() {
+        // A tampered blob carrying a member whose IP doesn't match its identity
+        // must be rejected at the decode boundary, even if the bytes are
+        // otherwise valid msgpack.
+        let id = test_id(1);
+        let bad_member = Member {
+            identity: id,
+            ip: Ipv4Addr::new(100, 64, 10, 5), // not derive_ip(test_id(1))
+            is_coordinator: false,
+            hostname: None,
+        };
+        let blob = GroupBlob {
+            members: vec![bad_member],
+            approved: vec![],
+            acl: crate::acl::AclData::empty(),
+        };
+        let bytes = rmp_serde::to_vec_named(&blob).unwrap();
+        let err = decode_group_blob(&bytes).unwrap_err().to_string();
+        assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn decode_group_blob_rejects_reserved_gateway_ip() {
+        let id = test_id(2);
+        let bad_member = Member {
+            identity: id,
+            ip: Ipv4Addr::new(100, 64, 0, 1), // TUN gateway
+            is_coordinator: false,
+            hostname: None,
+        };
+        let blob = GroupBlob {
+            members: vec![bad_member],
+            approved: vec![],
+            acl: crate::acl::AclData::empty(),
+        };
+        let bytes = rmp_serde::to_vec_named(&blob).unwrap();
+        assert!(decode_group_blob(&bytes).is_err());
     }
 }
