@@ -1450,6 +1450,19 @@ Pitopi uses `iroh-metrics` for Prometheus-compatible metrics collection and expo
 
 Drop reasons: `acl` (network ACL denied), `firewall` (local firewall denied), `send_failure` (QUIC send error), `no_peer` (no route to destination), `malformed` (oversized or non-IPv4 packet).
 
+### Per-peer metrics
+
+A background collector polls iroh connection stats every 60 seconds and exports per-peer gauges:
+
+| Metric | Meaning |
+|--------|---------|
+| `pitopi_peer_rtt_us{peer="100.64.x.x"}` | Round-trip time in microseconds |
+| `pitopi_peer_bytes_tx{peer="100.64.x.x"}` | Total bytes sent to peer (from iroh) |
+| `pitopi_peer_bytes_rx{peer="100.64.x.x"}` | Total bytes received from peer (from iroh) |
+| `pitopi_peer_lost_packets{peer="100.64.x.x"}` | Packets lost to peer |
+
+These values come directly from iroh's QUIC connection stats — no manual counting needed.
+
 ### Prometheus endpoint
 
 The daemon starts an HTTP metrics server on port 9090. Scrape it with Prometheus or curl:

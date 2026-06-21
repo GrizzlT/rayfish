@@ -198,7 +198,7 @@ The daemon exposes Prometheus-compatible metrics on port 9090:
 curl http://localhost:9090/metrics
 ```
 
-Includes pitopi forwarding counters (`pitopi_packets_rx_total`, `pitopi_bytes_tx_total`, `pitopi_drops_total{reason="acl"}`, etc.) and iroh transport metrics (`socket_*`, `net_report_*`). `pitopi status` also shows aggregate traffic stats.
+Includes pitopi forwarding counters (`pitopi_packets_rx_total`, `pitopi_bytes_tx_total`, `pitopi_drops_total{reason="acl"}`, etc.), per-peer gauges (`pitopi_peer_rtt_us`, `pitopi_peer_bytes_tx/rx`, `pitopi_peer_lost_packets`), and iroh transport metrics (`socket_*`, `net_report_*`). `pitopi status` also shows aggregate traffic stats.
 
 ## Configuration
 

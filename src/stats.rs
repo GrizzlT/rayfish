@@ -7,8 +7,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use iroh_metrics::{Counter, EncodeLabelSet, EncodeLabelValue, Family, MetricsGroup};
+use iroh_metrics::{Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, MetricsGroup};
 use tokio_util::sync::CancellationToken;
+
+use crate::peers::PeerTable;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, EncodeLabelValue)]
 pub enum DropReason {
@@ -125,6 +127,59 @@ impl ForwardMetrics {
                         );
                         return;
                     }
+                }
+            }
+        });
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, EncodeLabelSet)]
+pub struct PeerLabels {
+    pub peer: String,
+}
+
+#[derive(Debug, MetricsGroup)]
+#[metrics(name = "pitopi_peer", default)]
+pub struct PeerMetrics {
+    /// RTT to peer in microseconds
+    pub rtt_us: Family<PeerLabels, Gauge>,
+    /// Bytes sent to peer (from iroh connection stats)
+    pub bytes_tx: Family<PeerLabels, Gauge>,
+    /// Bytes received from peer (from iroh connection stats)
+    pub bytes_rx: Family<PeerLabels, Gauge>,
+    /// Packets lost to peer
+    pub lost_packets: Family<PeerLabels, Gauge>,
+}
+
+impl PeerMetrics {
+    pub fn spawn_collector(
+        self: &Arc<Self>,
+        peers: PeerTable,
+        token: CancellationToken,
+    ) {
+        let metrics = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                        for (ip, conn) in peers.all_connections() {
+                            let label = PeerLabels {
+                                peer: ip.to_string(),
+                            };
+
+                            let paths = conn.paths();
+                            if let Some(path) = paths.iter().find(|p| p.is_selected()) {
+                                let rtt_us = path.rtt().as_micros() as i64;
+                                metrics.rtt_us.get_or_create(&label).set(rtt_us);
+                            }
+
+                            let stats = conn.stats();
+                            metrics.bytes_tx.get_or_create(&label).set(stats.udp_tx.bytes as i64);
+                            metrics.bytes_rx.get_or_create(&label).set(stats.udp_rx.bytes as i64);
+                            metrics.lost_packets.get_or_create(&label).set(stats.lost_packets as i64);
+                        }
+                    }
+                    _ = token.cancelled() => return,
                 }
             }
         });

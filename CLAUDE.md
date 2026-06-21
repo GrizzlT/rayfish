@@ -93,7 +93,7 @@ App (Minecraft, etc.) → TUN device (100.64.x.x) → pitopi → iroh QUIC datag
 - `src/dns_config.rs` — OS-level DNS configuration: `DnsConfigurator` trait with `apply()`/`revert()`, platform detection chain (macOS scoped resolver `/etc/resolver/pi`, Linux systemd-resolved/resolvconf/direct), resolver points to `127.0.0.1`, backup/restore of modified files (`.before-pitopi` suffix), crash recovery on daemon start
 - `src/hostname.rs` — hostname generation (`generate_hostname()` from NOUNS_B word list), validation (`is_valid_hostname()`), collision resolution (`resolve_collision()` — appends numeric suffix, wired into MeshHello handler)
 - `src/audit.rs` — append-only audit log at `~/.config/pitopi/audit.log` (not yet wired in)
-- `src/stats.rs` — `ForwardMetrics` (iroh-metrics `MetricsGroup`): `packets_rx/tx`, `bytes_rx/tx` counters + `Family<DropLabels, Counter>` for labeled drops (`Acl`, `Firewall`, `SendFailure`, `NoPeer`, `Malformed`); 30-second interval logger + session summary; registered with iroh-metrics `Registry` alongside iroh's endpoint metrics for Prometheus export on `:9090`
+- `src/stats.rs` — `ForwardMetrics` (iroh-metrics `MetricsGroup`): `packets_rx/tx`, `bytes_rx/tx` counters + `Family<DropLabels, Counter>` for labeled drops (`Acl`, `Firewall`, `SendFailure`, `NoPeer`, `Malformed`); 30-second interval logger + session summary; `PeerMetrics`: per-peer `Family<PeerLabels, Gauge>` for RTT (microseconds), bytes tx/rx, lost packets — polled every 60s from iroh connection stats; registered with iroh-metrics `Registry` alongside iroh's endpoint metrics for Prometheus export on `:9090`
 - `src/shutdown.rs` — SIGINT/SIGTERM handling via CancellationToken
 
 ### Key flows

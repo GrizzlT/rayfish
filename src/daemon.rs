@@ -1542,9 +1542,12 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // Accept loop — dispatches connections via ProtocolHandler by ALPN
     protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
 
-    // Metrics registry: pitopi counters + iroh endpoint metrics
+    // Metrics registry: pitopi counters + per-peer gauges + iroh endpoint metrics
     let mut registry = iroh_metrics::Registry::default();
     registry.register(stats.clone());
+    let peer_metrics = Arc::new(crate::stats::PeerMetrics::default());
+    registry.register(peer_metrics.clone());
+    peer_metrics.spawn_collector(daemon.peers.clone(), token.clone());
     registry.register_all(daemon.endpoint.metrics());
     let metrics_addr: std::net::SocketAddr = ([0, 0, 0, 0], 9090).into();
     let registry = Arc::new(registry);
