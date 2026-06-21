@@ -27,10 +27,31 @@ impl PeerTable {
         }
     }
 
-    pub fn add(&self, ip: Ipv4Addr, ipv6: Ipv6Addr, conn: Connection, endpoint_id: EndpointId, network: &str) {
+    pub fn add(
+        &self,
+        ip: Ipv4Addr,
+        ipv6: Ipv6Addr,
+        conn: Connection,
+        endpoint_id: EndpointId,
+        network: &str,
+    ) {
         let net = SmolStr::new(network);
-        self.v4.insert(ip, PeerEntry { conn: conn.clone(), endpoint_id, network: net.clone() });
-        self.v6.insert(ipv6, PeerEntry { conn, endpoint_id, network: net });
+        self.v4.insert(
+            ip,
+            PeerEntry {
+                conn: conn.clone(),
+                endpoint_id,
+                network: net.clone(),
+            },
+        );
+        self.v6.insert(
+            ipv6,
+            PeerEntry {
+                conn,
+                endpoint_id,
+                network: net,
+            },
+        );
     }
 
     pub fn lookup_v4(&self, ip: &Ipv4Addr) -> Option<(Connection, EndpointId, SmolStr)> {
@@ -51,10 +72,7 @@ impl PeerTable {
     }
 
     pub fn all_connections(&self) -> Vec<(Ipv4Addr, Connection)> {
-        self.v4
-            .iter()
-            .map(|e| (*e.key(), e.conn.clone()))
-            .collect()
+        self.v4.iter().map(|e| (*e.key(), e.conn.clone())).collect()
     }
 
     pub fn remove_by_network(&self, network: &str) -> Vec<Ipv4Addr> {
@@ -79,7 +97,10 @@ impl PeerTable {
             .collect()
     }
 
-    pub fn peers_for_network_with_conn(&self, network: &str) -> Vec<(EndpointId, Ipv4Addr, Connection)> {
+    pub fn peers_for_network_with_conn(
+        &self,
+        network: &str,
+    ) -> Vec<(EndpointId, Ipv4Addr, Connection)> {
         self.v4
             .iter()
             .filter(|e| e.network == network)
@@ -89,10 +110,7 @@ impl PeerTable {
 
     #[cfg(test)]
     pub fn all_peer_ids(&self) -> Vec<(Ipv4Addr, EndpointId)> {
-        self.v4
-            .iter()
-            .map(|e| (*e.key(), e.endpoint_id))
-            .collect()
+        self.v4.iter().map(|e| (*e.key(), e.endpoint_id)).collect()
     }
 }
 
@@ -104,7 +122,11 @@ mod tests {
     fn test_peer_table_empty_lookup() {
         let table = PeerTable::new();
         assert!(table.lookup_v4(&Ipv4Addr::new(100, 64, 0, 5)).is_none());
-        assert!(table.lookup_v6(&Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1)).is_none());
+        assert!(
+            table
+                .lookup_v6(&Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1))
+                .is_none()
+        );
     }
 
     #[test]

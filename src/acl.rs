@@ -31,7 +31,10 @@ pub struct AclData {
 
 impl AclData {
     pub fn empty() -> Self {
-        Self { tags: vec![], rules: vec![] }
+        Self {
+            tags: vec![],
+            rules: vec![],
+        }
     }
 
     pub fn is_allowed(&self, src: &EndpointId, dst: &EndpointId) -> bool {
@@ -82,7 +85,9 @@ fn canonical_acl_bytes(data: &AclData) -> Vec<u8> {
 
 #[cfg(test)]
 fn acl_hash(data: &AclData) -> String {
-    blake3::hash(&canonical_acl_bytes(data)).to_hex().to_string()
+    blake3::hash(&canonical_acl_bytes(data))
+        .to_hex()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -99,7 +104,10 @@ fn verify_acl_data(bytes: &[u8], expected_hash: &str) -> Result<AclData> {
     decode_acl_data(bytes)
 }
 
-pub fn parse_acl_file(content: &str, resolve_short_id: &dyn Fn(&str) -> Option<EndpointId>) -> Result<AclData> {
+pub fn parse_acl_file(
+    content: &str,
+    resolve_short_id: &dyn Fn(&str) -> Option<EndpointId>,
+) -> Result<AclData> {
     let mut tags: Vec<TagAssignment> = Vec::new();
     let mut rules: Vec<AclRule> = Vec::new();
 
@@ -112,26 +120,39 @@ pub fn parse_acl_file(content: &str, resolve_short_id: &dyn Fn(&str) -> Option<E
         if let Some(rest) = line.strip_prefix("tag ") {
             let parts: Vec<&str> = rest.splitn(2, ' ').collect();
             if parts.len() < 2 {
-                bail!("line {}: tag requires a name and at least one peer", line_num + 1);
+                bail!(
+                    "line {}: tag requires a name and at least one peer",
+                    line_num + 1
+                );
             }
             let tag_name = parts[0].to_string();
-            let member_strs: Vec<&str> = parts[1].split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let member_strs: Vec<&str> = parts[1]
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
             let mut members = Vec::new();
             for id_str in member_strs {
-                let id = resolve_short_id(id_str)
-                    .ok_or_else(|| anyhow::anyhow!("line {}: unknown peer '{}'", line_num + 1, id_str))?;
+                let id = resolve_short_id(id_str).ok_or_else(|| {
+                    anyhow::anyhow!("line {}: unknown peer '{}'", line_num + 1, id_str)
+                })?;
                 members.push(id);
             }
-            tags.push(TagAssignment { tag: tag_name, members });
+            tags.push(TagAssignment {
+                tag: tag_name,
+                members,
+            });
         } else if let Some(rest) = line.strip_prefix("allow ") {
             let parts: Vec<&str> = rest.split("->").map(|s| s.trim()).collect();
             if parts.len() != 2 {
                 bail!("line {}: allow rule must be 'src -> dst'", line_num + 1);
             }
-            let src = parse_target(parts[0], resolve_short_id)
-                .ok_or_else(|| anyhow::anyhow!("line {}: unknown src '{}'", line_num + 1, parts[0]))?;
-            let dst = parse_target(parts[1], resolve_short_id)
-                .ok_or_else(|| anyhow::anyhow!("line {}: unknown dst '{}'", line_num + 1, parts[1]))?;
+            let src = parse_target(parts[0], resolve_short_id).ok_or_else(|| {
+                anyhow::anyhow!("line {}: unknown src '{}'", line_num + 1, parts[0])
+            })?;
+            let dst = parse_target(parts[1], resolve_short_id).ok_or_else(|| {
+                anyhow::anyhow!("line {}: unknown dst '{}'", line_num + 1, parts[1])
+            })?;
             rules.push(AclRule { src, dst });
         } else {
             bail!("line {}: unrecognized directive '{}'", line_num + 1, line);
@@ -165,7 +186,11 @@ pub fn format_acl_file(data: &AclData, short_id: &dyn Fn(&EndpointId) -> String)
     }
 
     for rule in &data.rules {
-        out.push_str(&format!("allow {} -> {}\n", format_target(&rule.src, short_id), format_target(&rule.dst, short_id)));
+        out.push_str(&format!(
+            "allow {} -> {}\n",
+            format_target(&rule.src, short_id),
+            format_target(&rule.dst, short_id)
+        ));
     }
 
     out
@@ -243,12 +268,19 @@ mod tests {
     fn tag_based_rules() {
         let acl = AclData {
             tags: vec![
-                TagAssignment { tag: "servers".to_string(), members: vec![test_id(1), test_id(2)] },
-                TagAssignment { tag: "guests".to_string(), members: vec![test_id(3)] },
+                TagAssignment {
+                    tag: "servers".to_string(),
+                    members: vec![test_id(1), test_id(2)],
+                },
+                TagAssignment {
+                    tag: "guests".to_string(),
+                    members: vec![test_id(3)],
+                },
             ],
-            rules: vec![
-                AclRule { src: Target::Tag("servers".to_string()), dst: Target::Tag("servers".to_string()) },
-            ],
+            rules: vec![AclRule {
+                src: Target::Tag("servers".to_string()),
+                dst: Target::Tag("servers".to_string()),
+            }],
         };
         assert!(acl.is_allowed(&test_id(1), &test_id(2)));
         assert!(acl.is_allowed(&test_id(2), &test_id(1)));
@@ -259,7 +291,10 @@ mod tests {
     fn all_target_matches_everyone() {
         let acl = AclData {
             tags: vec![],
-            rules: vec![AclRule { src: Target::All, dst: Target::All }],
+            rules: vec![AclRule {
+                src: Target::All,
+                dst: Target::All,
+            }],
         };
         assert!(acl.is_allowed(&test_id(1), &test_id(2)));
         assert!(acl.is_allowed(&test_id(99), &test_id(100)));
@@ -269,12 +304,19 @@ mod tests {
     fn directional_rules() {
         let acl = AclData {
             tags: vec![
-                TagAssignment { tag: "servers".to_string(), members: vec![test_id(1)] },
-                TagAssignment { tag: "guests".to_string(), members: vec![test_id(2)] },
+                TagAssignment {
+                    tag: "servers".to_string(),
+                    members: vec![test_id(1)],
+                },
+                TagAssignment {
+                    tag: "guests".to_string(),
+                    members: vec![test_id(2)],
+                },
             ],
-            rules: vec![
-                AclRule { src: Target::Tag("guests".to_string()), dst: Target::Tag("servers".to_string()) },
-            ],
+            rules: vec![AclRule {
+                src: Target::Tag("guests".to_string()),
+                dst: Target::Tag("servers".to_string()),
+            }],
         };
         // guests -> servers allowed
         assert!(acl.is_allowed(&test_id(2), &test_id(1)));
@@ -286,12 +328,19 @@ mod tests {
     fn member_with_multiple_tags() {
         let acl = AclData {
             tags: vec![
-                TagAssignment { tag: "servers".to_string(), members: vec![test_id(1)] },
-                TagAssignment { tag: "admin".to_string(), members: vec![test_id(1)] },
+                TagAssignment {
+                    tag: "servers".to_string(),
+                    members: vec![test_id(1)],
+                },
+                TagAssignment {
+                    tag: "admin".to_string(),
+                    members: vec![test_id(1)],
+                },
             ],
-            rules: vec![
-                AclRule { src: Target::Tag("admin".to_string()), dst: Target::All },
-            ],
+            rules: vec![AclRule {
+                src: Target::Tag("admin".to_string()),
+                dst: Target::All,
+            }],
         };
         assert!(acl.is_allowed(&test_id(1), &test_id(99)));
     }
@@ -300,10 +349,19 @@ mod tests {
     fn canonical_bytes_deterministic() {
         let acl = AclData {
             tags: vec![
-                TagAssignment { tag: "b".to_string(), members: vec![test_id(2), test_id(1)] },
-                TagAssignment { tag: "a".to_string(), members: vec![test_id(3)] },
+                TagAssignment {
+                    tag: "b".to_string(),
+                    members: vec![test_id(2), test_id(1)],
+                },
+                TagAssignment {
+                    tag: "a".to_string(),
+                    members: vec![test_id(3)],
+                },
             ],
-            rules: vec![AclRule { src: Target::All, dst: Target::All }],
+            rules: vec![AclRule {
+                src: Target::All,
+                dst: Target::All,
+            }],
         };
         let a = canonical_acl_bytes(&acl);
         let b = canonical_acl_bytes(&acl);
@@ -314,15 +372,27 @@ mod tests {
     fn canonical_bytes_order_independent() {
         let acl1 = AclData {
             tags: vec![
-                TagAssignment { tag: "b".to_string(), members: vec![test_id(2), test_id(1)] },
-                TagAssignment { tag: "a".to_string(), members: vec![test_id(3)] },
+                TagAssignment {
+                    tag: "b".to_string(),
+                    members: vec![test_id(2), test_id(1)],
+                },
+                TagAssignment {
+                    tag: "a".to_string(),
+                    members: vec![test_id(3)],
+                },
             ],
             rules: vec![],
         };
         let acl2 = AclData {
             tags: vec![
-                TagAssignment { tag: "a".to_string(), members: vec![test_id(3)] },
-                TagAssignment { tag: "b".to_string(), members: vec![test_id(1), test_id(2)] },
+                TagAssignment {
+                    tag: "a".to_string(),
+                    members: vec![test_id(3)],
+                },
+                TagAssignment {
+                    tag: "b".to_string(),
+                    members: vec![test_id(1), test_id(2)],
+                },
             ],
             rules: vec![],
         };
@@ -332,8 +402,14 @@ mod tests {
     #[test]
     fn acl_data_roundtrip() {
         let acl = AclData {
-            tags: vec![TagAssignment { tag: "srv".to_string(), members: vec![test_id(1)] }],
-            rules: vec![AclRule { src: Target::Tag("srv".to_string()), dst: Target::All }],
+            tags: vec![TagAssignment {
+                tag: "srv".to_string(),
+                members: vec![test_id(1)],
+            }],
+            rules: vec![AclRule {
+                src: Target::Tag("srv".to_string()),
+                dst: Target::All,
+            }],
         };
         let bytes = canonical_acl_bytes(&acl);
         let decoded = decode_acl_data(&bytes).unwrap();
@@ -345,7 +421,10 @@ mod tests {
     fn verify_acl_data_ok() {
         let acl = AclData {
             tags: vec![],
-            rules: vec![AclRule { src: Target::All, dst: Target::All }],
+            rules: vec![AclRule {
+                src: Target::All,
+                dst: Target::All,
+            }],
         };
         let bytes = canonical_acl_bytes(&acl);
         let hash = acl_hash(&acl);
@@ -405,12 +484,14 @@ mod tests {
     #[test]
     fn format_roundtrip() {
         let data = AclData {
-            tags: vec![
-                TagAssignment { tag: "servers".to_string(), members: vec![test_id(1), test_id(2)] },
-            ],
-            rules: vec![
-                AclRule { src: Target::Tag("servers".to_string()), dst: Target::All },
-            ],
+            tags: vec![TagAssignment {
+                tag: "servers".to_string(),
+                members: vec![test_id(1), test_id(2)],
+            }],
+            rules: vec![AclRule {
+                src: Target::Tag("servers".to_string()),
+                dst: Target::All,
+            }],
         };
         let short_id = |id: &EndpointId| -> String { id.fmt_short().to_string() };
         let text = format_acl_file(&data, &short_id);

@@ -152,11 +152,7 @@ pub struct PeerMetrics {
 }
 
 impl PeerMetrics {
-    pub fn spawn_collector(
-        self: &Arc<Self>,
-        peers: PeerTable,
-        token: CancellationToken,
-    ) {
+    pub fn spawn_collector(self: &Arc<Self>, peers: PeerTable, token: CancellationToken) {
         let metrics = self.clone();
         tokio::spawn(async move {
             loop {

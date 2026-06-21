@@ -268,14 +268,18 @@ mod tests {
         p[0] = 0x45; // IPv4, IHL=5
         p[9] = 6; // TCP
         p[16..20].copy_from_slice(&[100, 64, 0, 3]); // dst ip
-        p[20] = 0; p[21] = 80; // src port 80
+        p[20] = 0;
+        p[21] = 80; // src port 80
         p[22] = (dst_port >> 8) as u8;
         p[23] = dst_port as u8;
         p
     }
 
     fn inbound_fw(default: Action, rules: Vec<firewall::FirewallRule>) -> SharedFirewall {
-        SharedFirewall::new(firewall::FirewallConfig { default_action: default, rules })
+        SharedFirewall::new(firewall::FirewallConfig {
+            default_action: default,
+            rules,
+        })
     }
 
     #[test]
@@ -312,7 +316,10 @@ mod tests {
         let me = iroh::SecretKey::generate().public();
         let acl = AclData {
             tags: vec![],
-            rules: vec![acl::AclRule { src: acl::Target::Identity(peer), dst: acl::Target::Identity(me) }],
+            rules: vec![acl::AclRule {
+                src: acl::Target::Identity(peer),
+                dst: acl::Target::Identity(me),
+            }],
         };
         // Rule allows peer->me, so a different src should be denied. Use a third id.
         let other = iroh::SecretKey::generate().public();

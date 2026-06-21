@@ -349,8 +349,17 @@ async fn cmd_list() -> Result<()> {
 // IPC client commands (require daemon running)
 // ---------------------------------------------------------------------------
 
-async fn ipc_create(mode: GroupMode, name: Option<String>, hostname: Option<String>, tor: bool) -> Result<()> {
-    let transport = if tor { Some(config::TransportMode::Tor) } else { None };
+async fn ipc_create(
+    mode: GroupMode,
+    name: Option<String>,
+    hostname: Option<String>,
+    tor: bool,
+) -> Result<()> {
+    let transport = if tor {
+        Some(config::TransportMode::Tor)
+    } else {
+        None
+    };
     let mut stream = ipc::connect().await?;
     ipc::send_msg(
         &mut stream,
@@ -386,8 +395,17 @@ async fn ipc_create(mode: GroupMode, name: Option<String>, hostname: Option<Stri
     Ok(())
 }
 
-async fn ipc_join(network_key: &str, name: Option<&str>, hostname: Option<String>, tor: bool) -> Result<()> {
-    let transport = if tor { Some(config::TransportMode::Tor) } else { None };
+async fn ipc_join(
+    network_key: &str,
+    name: Option<&str>,
+    hostname: Option<String>,
+    tor: bool,
+) -> Result<()> {
+    let transport = if tor {
+        Some(config::TransportMode::Tor)
+    } else {
+        None
+    };
     let mut stream = ipc::connect().await?;
     ipc::send_msg(
         &mut stream,

@@ -18,6 +18,7 @@ an item serves that socket/DNS surface.
 - [x] Magic DNS with .pi domain resolution (A + AAAA)
 - [x] Local device firewall with port/protocol/peer filtering
 - [x] Dual-stack IPv6/IPv4 with stable addresses
+- [x] Tor transport via `iroh-tor-transport` (optional `--features tor`)
 
 ---
 
@@ -48,11 +49,6 @@ an item serves that socket/DNS surface.
 
 ## Tier 1 — Prove the thesis (zero-SDK, existing apps work unmodified)
 
-- [ ] **Multicast/broadcast relay (PROMOTED — most demoable feature you have)**
-  - Relay broadcast/multicast so LAN protocols work transparently across the mesh
-  - Minecraft LAN, Steam LAN, mDNS/Bonjour discovery — friend's server shows up in LAN tab
-  - Scoped per-network; rate-limited to prevent broadcast storms
-  - This is "LAN games over the internet, zero config" — viral, thesis-proving
 - [ ] **Local peer discovery via mDNS**
   - Advertise `_pitopi._udp.local`; detect peers on the same LAN
   - Direct LAN connections skip NAT traversal entirely (lowest latency)
@@ -96,6 +92,13 @@ These are where bulk throughput matters and where the optional WG fast path appl
     control plane + fallback for hard-NAT peers
   - Prereq gates everything: port-mapping client (UPnP-IGD / NAT-PMP / PCP)
   - Linux/Windows only; macOS/iOS/Android stay on iroh (no kernel WG)
+- [ ] **Multicast/broadcast relay (DEMOTED — needs per-network scoping design)**
+  - Relay broadcast/multicast so LAN protocols work transparently across the mesh
+  - Minecraft LAN, Steam LAN, mDNS/Bonjour discovery — friend's server shows up in LAN tab
+  - Scoped per-network; rate-limited to prevent broadcast storms
+  - Open question: same identity IP across all networks means source IP can't disambiguate
+    which network a broadcast belongs to — relay to all networks the sender is in, or add
+    an explicit scoping mechanism?
 
 ---
 
@@ -155,6 +158,7 @@ Discovery is centralized (Slack/Discord identity as trust anchor); once connecte
 ## Tier 7 — Platform expansion
 
 - [ ] macOS Network Extension (no sudo)
+- [ ] BLE transport — local/offline mesh via `btleplug`, needs fragmentation layer (MTU 23-247)
 - [ ] Protocol obfuscation (TCP/443, WebSocket, obfs4-style) for restrictive networks
 - [ ] Windows, iOS, Android
 
@@ -164,5 +168,8 @@ Discovery is centralized (Slack/Discord identity as trust anchor); once connecte
 
 - [ ] Post-quantum handshake (harvest-now-decrypt-later) — check iroh/noq KEM support
 - [ ] Declarative signed network config ("GitOps for your mesh")
+- [ ] Nym mixnet transport — high-latency privacy transport via `nym-sdk`; packets are 20KB+,
+  seconds of latency, but strong metadata resistance
+- [ ] I2P transport — fully decentralized alternative to Tor; `i2p-rs` ecosystem less mature
 - [ ] Multipath bonding (WiFi + cellular failover) — QUIC migration gives a head start;
   a differentiator Tailscale structurally can't match

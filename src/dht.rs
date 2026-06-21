@@ -6,10 +6,7 @@
 
 use anyhow::{Context as _, Result, ensure};
 use iroh::{
-    EndpointId, SecretKey,
-    address_lookup::PkarrRelayClient,
-    dns::DnsResolver,
-    endpoint::Endpoint,
+    EndpointId, SecretKey, address_lookup::PkarrRelayClient, dns::DnsResolver, endpoint::Endpoint,
 };
 use iroh_dns::pkarr::SignedPacket;
 use url::Url;
@@ -45,10 +42,7 @@ pub fn encode_network_record(
     blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
 ) -> Result<SignedPacket> {
-    let mut values = vec![
-        RECORD_VERSION.to_string(),
-        format!("h,{blob_hash}"),
-    ];
+    let mut values = vec![RECORD_VERSION.to_string(), format!("h,{blob_hash}")];
     for peer in seed_peers {
         values.push(format!("p,{peer}"));
     }
@@ -70,16 +64,21 @@ pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec
 
     for record in &records[1..] {
         if let Some(hash_str) = record.strip_prefix("h,") {
-            blob_hash = Some(hash_str.parse::<blake3::Hash>().context("invalid blob hash")?);
+            blob_hash = Some(
+                hash_str
+                    .parse::<blake3::Hash>()
+                    .context("invalid blob hash")?,
+            );
         } else if let Some(id_str) = record.strip_prefix("p,") {
-            peers.push(id_str.parse::<EndpointId>().context("invalid peer endpoint ID")?);
+            peers.push(
+                id_str
+                    .parse::<EndpointId>()
+                    .context("invalid peer endpoint ID")?,
+            );
         }
     }
 
-    Ok((
-        blob_hash.context("missing blob hash (h,)")?,
-        peers,
-    ))
+    Ok((blob_hash.context("missing blob hash (h,)")?, peers))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +158,12 @@ mod tests {
         let packet = SignedPacket::from_txt_strings(&key, "_pitopi", values, 300).unwrap();
         let result = decode_network_record(&packet);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unsupported record version"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported record version")
+        );
     }
 
     #[test]
@@ -179,6 +183,11 @@ mod tests {
         let packet = SignedPacket::from_txt_strings(&key, "_pitopi", values, 300).unwrap();
         let result = decode_network_record(&packet);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("missing blob hash"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("missing blob hash")
+        );
     }
 }

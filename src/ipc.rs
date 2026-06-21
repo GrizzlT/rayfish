@@ -253,7 +253,12 @@ mod tests {
         let json = serde_json::to_vec(&resp).unwrap();
         let decoded: IpcResponse = serde_json::from_slice(&json).unwrap();
         match decoded {
-            IpcResponse::Created { name, network_key, my_ip, .. } => {
+            IpcResponse::Created {
+                name,
+                network_key,
+                my_ip,
+                ..
+            } => {
                 assert_eq!(name, "test");
                 assert_eq!(network_key, key);
                 assert_eq!(my_ip, Ipv4Addr::new(100, 64, 10, 5));
@@ -272,7 +277,11 @@ mod tests {
         let json = serde_json::to_vec(&req).unwrap();
         let decoded: IpcRequest = serde_json::from_slice(&json).unwrap();
         match decoded {
-            IpcRequest::AclTag { network, tag, peer_ids } => {
+            IpcRequest::AclTag {
+                network,
+                tag,
+                peer_ids,
+            } => {
                 assert_eq!(network, "gentle-amber-fox");
                 assert_eq!(tag, "servers");
                 assert_eq!(peer_ids.len(), 2);
@@ -326,7 +335,11 @@ mod tests {
         let json = serde_json::to_vec(&resp).unwrap();
         let decoded: IpcResponse = serde_json::from_slice(&json).unwrap();
         match decoded {
-            IpcResponse::Status { endpoint_id, networks, .. } => {
+            IpcResponse::Status {
+                endpoint_id,
+                networks,
+                ..
+            } => {
                 assert_eq!(endpoint_id, ep_id);
                 assert_eq!(networks.len(), 1);
                 assert_eq!(networks[0].peers[0].endpoint_id, peer_id);

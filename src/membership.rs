@@ -291,10 +291,8 @@ pub fn derive_ipv6(identity: &EndpointId) -> Ipv6Addr {
     let hash = blake3::hash(identity.to_string().as_bytes());
     let bytes = hash.as_bytes();
     let octets: [u8; 16] = [
-        0x02, bytes[0], bytes[1], bytes[2],
-        bytes[3], bytes[4], bytes[5], bytes[6],
-        bytes[7], bytes[8], bytes[9], bytes[10],
-        bytes[11], bytes[12], bytes[13], bytes[14],
+        0x02, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
     ];
     Ipv6Addr::from(octets)
 }
@@ -312,7 +310,12 @@ impl IrohIdentityProvider {
     pub fn new(endpoint_id: EndpointId, collision_index: u32) -> Self {
         let ip = derive_ip_with_index(&endpoint_id, collision_index);
         let ipv6 = derive_ipv6(&endpoint_id);
-        Self { endpoint_id, ip, ipv6, collision_index }
+        Self {
+            endpoint_id,
+            ip,
+            ipv6,
+            collision_index,
+        }
     }
 
     pub fn collision_index(&self) -> u32 {
@@ -383,7 +386,12 @@ pub fn canonical_group_bytes(
     rmp_serde::to_vec_named(&data).expect("msgpack serialize")
 }
 
-pub fn group_blob_hash(members: &MemberList, approved: &ApprovedList, acl: &AclData, name: Option<&str>) -> blake3::Hash {
+pub fn group_blob_hash(
+    members: &MemberList,
+    approved: &ApprovedList,
+    acl: &AclData,
+    name: Option<&str>,
+) -> blake3::Hash {
     let bytes = canonical_group_bytes(members, approved, acl, name);
     blake3::hash(&bytes)
 }
@@ -441,7 +449,8 @@ fn ensure_in_cgnat_range(ip: Ipv4Addr) -> Result<()> {
 }
 
 pub fn decode_group_blob(bytes: &[u8]) -> Result<GroupBlob> {
-    let blob: GroupBlob = rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid group blob: {e}"))?;
+    let blob: GroupBlob =
+        rmp_serde::from_slice(bytes).map_err(|e| anyhow::anyhow!("invalid group blob: {e}"))?;
     // Enforce the identity<->IP binding at the decode boundary. Any blob that
     // survives this check has self-consistent members/approved entries, so a
     // malicious or buggy publisher cannot inject a spoofed or reserved IP.
@@ -576,10 +585,7 @@ mod tests {
         list.add(member.clone()).unwrap();
         assert!(list.is_member(&id));
         assert!(!list.is_member(&test_id(2)));
-        assert_eq!(
-            list.get(&id).unwrap().ip,
-            Ipv4Addr::new(100, 64, 10, 5)
-        );
+        assert_eq!(list.get(&id).unwrap().ip, Ipv4Addr::new(100, 64, 10, 5));
     }
 
     #[test]
@@ -730,7 +736,7 @@ mod tests {
                 identity: test_id(1),
                 ip: Ipv4Addr::new(100, 64, 5, 10),
                 is_coordinator: false,
-            hostname: None,
+                hostname: None,
             })
             .unwrap();
         let entry = ApprovedEntry {
@@ -750,7 +756,7 @@ mod tests {
                 ApprovedEntry {
                     identity: test_id(1),
                     ip: Ipv4Addr::new(100, 64, 5, 10),
-            hostname: None,
+                    hostname: None,
                 },
                 &members,
             )
@@ -759,7 +765,7 @@ mod tests {
             ApprovedEntry {
                 identity: test_id(2),
                 ip: Ipv4Addr::new(100, 64, 5, 10),
-            hostname: None,
+                hostname: None,
             },
             &members,
         );
@@ -776,7 +782,7 @@ mod tests {
                 ApprovedEntry {
                     identity: id,
                     ip: Ipv4Addr::new(100, 64, 5, 10),
-            hostname: None,
+                    hostname: None,
                 },
                 &members,
             )
@@ -786,7 +792,7 @@ mod tests {
                 ApprovedEntry {
                     identity: id,
                     ip: Ipv4Addr::new(100, 64, 5, 10),
-            hostname: None,
+                    hostname: None,
                 },
                 &members,
             )
@@ -804,7 +810,7 @@ mod tests {
                 ApprovedEntry {
                     identity: id,
                     ip: Ipv4Addr::new(100, 64, 5, 10),
-            hostname: None,
+                    hostname: None,
                 },
                 &members,
             )
@@ -820,12 +826,12 @@ mod tests {
             ApprovedEntry {
                 identity: test_id(1),
                 ip: Ipv4Addr::new(100, 64, 0, 2),
-            hostname: None,
+                hostname: None,
             },
             ApprovedEntry {
                 identity: test_id(2),
                 ip: Ipv4Addr::new(100, 64, 0, 3),
-            hostname: None,
+                hostname: None,
             },
         ];
         let list = ApprovedList::from_entries(entries);
@@ -844,7 +850,7 @@ mod tests {
                 identity: id,
                 ip: derive_ip(&id),
                 is_coordinator: false,
-            hostname: None,
+                hostname: None,
             });
         }
         list
@@ -888,7 +894,16 @@ mod tests {
         let members = make_member_list(&[1, 2]);
         let mut approved = ApprovedList::new();
         let id3 = test_id(3);
-        approved.approve(ApprovedEntry { identity: id3, ip: derive_ip(&id3), hostname: None }, &members).unwrap();
+        approved
+            .approve(
+                ApprovedEntry {
+                    identity: id3,
+                    ip: derive_ip(&id3),
+                    hostname: None,
+                },
+                &members,
+            )
+            .unwrap();
         let acl = crate::acl::AclData::empty();
 
         let bytes = canonical_group_bytes(&members, &approved, &acl, None);
@@ -1020,7 +1035,11 @@ mod tests {
                 is_coordinator: false,
                 hostname: None,
             };
-            assert!(validate_member(&member).is_ok(), "seed {seed} -> {}", member.ip);
+            assert!(
+                validate_member(&member).is_ok(),
+                "seed {seed} -> {}",
+                member.ip
+            );
         }
     }
 

@@ -355,13 +355,24 @@ fn parse_ipv4(packet: &[u8]) -> Option<PacketInfo> {
     }
 
     let protocol = packet[9];
-    let src_ip = IpAddr::V4(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]));
-    let dst_ip = IpAddr::V4(Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]));
+    let src_ip = IpAddr::V4(Ipv4Addr::new(
+        packet[12], packet[13], packet[14], packet[15],
+    ));
+    let dst_ip = IpAddr::V4(Ipv4Addr::new(
+        packet[16], packet[17], packet[18], packet[19],
+    ));
 
     let (src_port, dst_port) = extract_ports(protocol, packet, header_len);
     let tcp_flags = extract_tcp_flags(protocol, packet, header_len);
 
-    Some(PacketInfo { src_ip, dst_ip, protocol, src_port, dst_port, tcp_flags })
+    Some(PacketInfo {
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        tcp_flags,
+    })
 }
 
 fn parse_ipv6(packet: &[u8]) -> Option<PacketInfo> {
@@ -380,7 +391,14 @@ fn parse_ipv6(packet: &[u8]) -> Option<PacketInfo> {
     let (src_port, dst_port) = extract_ports(protocol, packet, header_len);
     let tcp_flags = extract_tcp_flags(protocol, packet, header_len);
 
-    Some(PacketInfo { src_ip, dst_ip, protocol, src_port, dst_port, tcp_flags })
+    Some(PacketInfo {
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        tcp_flags,
+    })
 }
 
 fn extract_ports(protocol: u8, packet: &[u8], header_len: usize) -> (u16, u16) {
@@ -415,10 +433,9 @@ pub fn load_firewall() -> Result<FirewallConfig> {
     if !path.exists() {
         return Ok(FirewallConfig::default());
     }
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    toml::from_str(&content)
-        .with_context(|| format!("parse {}", path.display()))
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    toml::from_str(&content).with_context(|| format!("parse {}", path.display()))
 }
 
 pub fn save_firewall(config: &FirewallConfig) -> Result<()> {
@@ -449,7 +466,10 @@ pub fn parse_protocol(s: &str) -> Result<Protocol> {
         "udp" => Ok(Protocol::Udp),
         "icmp" => Ok(Protocol::Icmp),
         "any" => Ok(Protocol::Any),
-        _ => bail!("invalid protocol '{}' (expected 'tcp', 'udp', 'icmp', or 'any')", s),
+        _ => bail!(
+            "invalid protocol '{}' (expected 'tcp', 'udp', 'icmp', or 'any')",
+            s
+        ),
     }
 }
 
@@ -463,7 +483,10 @@ pub fn parse_port_range(s: &str) -> Result<PortRange> {
         Ok(PortRange { start, end })
     } else {
         let port: u16 = s.parse().context("invalid port number")?;
-        Ok(PortRange { start: port, end: port })
+        Ok(PortRange {
+            start: port,
+            end: port,
+        })
     }
 }
 
@@ -490,7 +513,10 @@ fn format_action(a: Action) -> &'static str {
     }
 }
 
-pub fn format_firewall_show(config: &FirewallConfig, short_id: &dyn Fn(&EndpointId) -> String) -> String {
+pub fn format_firewall_show(
+    config: &FirewallConfig,
+    short_id: &dyn Fn(&EndpointId) -> String,
+) -> String {
     let mut out = format!("Default: {}\n", format_action(config.default_action));
 
     if config.rules.is_empty() {
@@ -605,7 +631,10 @@ mod tests {
     #[test]
     fn evaluate_default_allow() {
         let fw = SharedFirewall::new(FirewallConfig::default());
-        assert_eq!(fw.evaluate(Direction::In, 6, 22, &test_id(1)), Action::Allow);
+        assert_eq!(
+            fw.evaluate(Direction::In, 6, 22, &test_id(1)),
+            Action::Allow
+        );
     }
 
     #[test]
@@ -630,8 +659,14 @@ mod tests {
             }],
         });
         assert_eq!(fw.evaluate(Direction::In, 6, 22, &test_id(1)), Action::Deny);
-        assert_eq!(fw.evaluate(Direction::In, 6, 80, &test_id(1)), Action::Allow);
-        assert_eq!(fw.evaluate(Direction::Out, 6, 22, &test_id(1)), Action::Allow);
+        assert_eq!(
+            fw.evaluate(Direction::In, 6, 80, &test_id(1)),
+            Action::Allow
+        );
+        assert_eq!(
+            fw.evaluate(Direction::Out, 6, 22, &test_id(1)),
+            Action::Allow
+        );
     }
 
     #[test]
@@ -642,12 +677,21 @@ mod tests {
                 direction: Direction::In,
                 action: Action::Allow,
                 protocol: Protocol::Any,
-                port: Some(PortRange { start: 80, end: 443 }),
+                port: Some(PortRange {
+                    start: 80,
+                    end: 443,
+                }),
                 peer: PeerFilter::Any,
             }],
         });
-        assert_eq!(fw.evaluate(Direction::In, 6, 80, &test_id(1)), Action::Allow);
-        assert_eq!(fw.evaluate(Direction::In, 17, 443, &test_id(1)), Action::Allow);
+        assert_eq!(
+            fw.evaluate(Direction::In, 6, 80, &test_id(1)),
+            Action::Allow
+        );
+        assert_eq!(
+            fw.evaluate(Direction::In, 17, 443, &test_id(1)),
+            Action::Allow
+        );
         assert_eq!(fw.evaluate(Direction::In, 6, 22, &test_id(1)), Action::Deny);
     }
 
@@ -663,7 +707,10 @@ mod tests {
                 peer: PeerFilter::Identity(test_id(1)),
             }],
         });
-        assert_eq!(fw.evaluate(Direction::In, 6, 22, &test_id(1)), Action::Allow);
+        assert_eq!(
+            fw.evaluate(Direction::In, 6, 22, &test_id(1)),
+            Action::Allow
+        );
         assert_eq!(fw.evaluate(Direction::In, 6, 22, &test_id(2)), Action::Deny);
     }
 
@@ -691,7 +738,10 @@ mod tests {
         // SSH denied by first rule even though second allows all
         assert_eq!(fw.evaluate(Direction::In, 6, 22, &test_id(1)), Action::Deny);
         // Other ports allowed by second rule
-        assert_eq!(fw.evaluate(Direction::In, 6, 80, &test_id(1)), Action::Allow);
+        assert_eq!(
+            fw.evaluate(Direction::In, 6, 80, &test_id(1)),
+            Action::Allow
+        );
     }
 
     #[test]
@@ -700,7 +750,13 @@ mod tests {
         assert_eq!(r, PortRange { start: 80, end: 80 });
 
         let r = parse_port_range("80-443").unwrap();
-        assert_eq!(r, PortRange { start: 80, end: 443 });
+        assert_eq!(
+            r,
+            PortRange {
+                start: 80,
+                end: 443
+            }
+        );
 
         assert!(parse_port_range("443-80").is_err());
         assert!(parse_port_range("abc").is_err());
@@ -714,7 +770,10 @@ mod tests {
                 direction: Direction::In,
                 action: Action::Allow,
                 protocol: Protocol::Tcp,
-                port: Some(PortRange { start: 443, end: 443 }),
+                port: Some(PortRange {
+                    start: 443,
+                    end: 443,
+                }),
                 peer: PeerFilter::Any,
             }],
         };
@@ -733,7 +792,13 @@ mod tests {
     const RST: u8 = 0x04;
 
     /// Builds a 40-byte IPv4/TCP packet with the given 5-tuple and flags.
-    fn tcp_pkt(src: Ipv4Addr, src_port: u16, dst: Ipv4Addr, dst_port: u16, flags: u8) -> PacketInfo {
+    fn tcp_pkt(
+        src: Ipv4Addr,
+        src_port: u16,
+        dst: Ipv4Addr,
+        dst_port: u16,
+        flags: u8,
+    ) -> PacketInfo {
         let mut p = vec![0u8; 40];
         p[0] = 0x45; // IPv4, IHL=5
         p[9] = 6; // TCP
@@ -780,16 +845,25 @@ mod tests {
 
         // Unsolicited inbound to port 22 -> blocked.
         let inbound_ssh = tcp_pkt(peer, 51000, me, 22, SYN);
-        assert_eq!(fw.evaluate_packet(Direction::In, &inbound_ssh, &peer_id), Action::Deny);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &inbound_ssh, &peer_id),
+            Action::Deny
+        );
 
         // Outbound SSH to a peer's port 22 -> allowed (default allow).
         let outbound_ssh = tcp_pkt(me, 54321, peer, 22, SYN);
-        assert_eq!(fw.evaluate_packet(Direction::Out, &outbound_ssh, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &outbound_ssh, &peer_id),
+            Action::Allow
+        );
 
         // Return traffic peer:22 -> me:54321 -> allowed (not matched by deny-in-22,
         // and would be allowed by default anyway).
         let ret = tcp_pkt(peer, 22, me, 54321, ACK);
-        assert_eq!(fw.evaluate_packet(Direction::In, &ret, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &ret, &peer_id),
+            Action::Allow
+        );
     }
 
     #[test]
@@ -801,7 +875,10 @@ mod tests {
                 direction: Direction::Out,
                 action: Action::Allow,
                 protocol: Protocol::Tcp,
-                port: Some(PortRange { start: 443, end: 443 }),
+                port: Some(PortRange {
+                    start: 443,
+                    end: 443,
+                }),
                 peer: PeerFilter::Any,
             }],
         });
@@ -811,23 +888,38 @@ mod tests {
 
         // We initiate HTTPS: outbound SYN me:50000 -> peer:443, allowed by rule.
         let syn = tcp_pkt(me, 50000, peer, 443, SYN);
-        assert_eq!(fw.evaluate_packet(Direction::Out, &syn, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &syn, &peer_id),
+            Action::Allow
+        );
 
         // Return traffic peer:443 -> me:50000: no explicit rule matches, but the
         // flow is established from our outbound SYN -> allowed.
         let ret = tcp_pkt(peer, 443, me, 50000, SYN | ACK);
-        assert_eq!(fw.evaluate_packet(Direction::In, &ret, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &ret, &peer_id),
+            Action::Allow
+        );
 
         // Unsolicited inbound to some other port -> denied by default.
         let unsolicited = tcp_pkt(peer, 1234, me, 8080, SYN);
-        assert_eq!(fw.evaluate_packet(Direction::In, &unsolicited, &peer_id), Action::Deny);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id),
+            Action::Deny
+        );
 
         // Outbound to a non-allowed port -> denied by default, and NOT tracked
         // (so its would-be return traffic is also denied).
         let blocked_out = tcp_pkt(me, 40000, peer, 6667, SYN);
-        assert_eq!(fw.evaluate_packet(Direction::Out, &blocked_out, &peer_id), Action::Deny);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &blocked_out, &peer_id),
+            Action::Deny
+        );
         let blocked_ret = tcp_pkt(peer, 6667, me, 40000, ACK);
-        assert_eq!(fw.evaluate_packet(Direction::In, &blocked_ret, &peer_id), Action::Deny);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &blocked_ret, &peer_id),
+            Action::Deny
+        );
     }
 
     #[test]
@@ -838,7 +930,10 @@ mod tests {
                 direction: Direction::Out,
                 action: Action::Allow,
                 protocol: Protocol::Tcp,
-                port: Some(PortRange { start: 443, end: 443 }),
+                port: Some(PortRange {
+                    start: 443,
+                    end: 443,
+                }),
                 peer: PeerFilter::Any,
             }],
         });
@@ -848,17 +943,29 @@ mod tests {
 
         // Establish the flow.
         let syn = tcp_pkt(me, 50000, peer, 443, SYN);
-        assert_eq!(fw.evaluate_packet(Direction::Out, &syn, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &syn, &peer_id),
+            Action::Allow
+        );
         let ret = tcp_pkt(peer, 443, me, 50000, ACK);
-        assert_eq!(fw.evaluate_packet(Direction::In, &ret, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &ret, &peer_id),
+            Action::Allow
+        );
 
         // We close with FIN. Flow should be evicted.
         let fin = tcp_pkt(me, 50000, peer, 443, FIN | ACK);
-        assert_eq!(fw.evaluate_packet(Direction::Out, &fin, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &fin, &peer_id),
+            Action::Allow
+        );
 
         // Now return traffic from the closed flow is denied again.
         let after = tcp_pkt(peer, 443, me, 50000, ACK);
-        assert_eq!(fw.evaluate_packet(Direction::In, &after, &peer_id), Action::Deny);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &after, &peer_id),
+            Action::Deny
+        );
     }
 
     #[test]
@@ -879,15 +986,24 @@ mod tests {
 
         // Outbound DNS query me:53000 -> peer:53.
         let q = udp_pkt(me, 53000, peer, 53);
-        assert_eq!(fw.evaluate_packet(Direction::Out, &q, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &q, &peer_id),
+            Action::Allow
+        );
 
         // Return response peer:53 -> me:53000 allowed via established flow.
         let resp = udp_pkt(peer, 53, me, 53000);
-        assert_eq!(fw.evaluate_packet(Direction::In, &resp, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &resp, &peer_id),
+            Action::Allow
+        );
 
         // Unsolicited inbound UDP -> denied.
         let unsolicited = udp_pkt(peer, 9999, me, 53);
-        assert_eq!(fw.evaluate_packet(Direction::In, &unsolicited, &peer_id), Action::Deny);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &unsolicited, &peer_id),
+            Action::Deny
+        );
     }
 
     #[test]
@@ -913,7 +1029,10 @@ mod tests {
         let syn = tcp_pkt(me, 50000, peer, 443, SYN);
         fw.evaluate_packet(Direction::Out, &syn, &bad_peer); // track
         let ret = tcp_pkt(peer, 443, me, 50000, ACK);
-        assert_eq!(fw.evaluate_packet(Direction::In, &ret, &bad_peer), Action::Deny);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &ret, &bad_peer),
+            Action::Deny
+        );
     }
 
     #[test]
@@ -935,7 +1054,10 @@ mod tests {
                 direction: Direction::Out,
                 action: Action::Allow,
                 protocol: Protocol::Tcp,
-                port: Some(PortRange { start: 443, end: 443 }),
+                port: Some(PortRange {
+                    start: 443,
+                    end: 443,
+                }),
                 peer: PeerFilter::Any,
             }],
         });
@@ -944,16 +1066,28 @@ mod tests {
         let peer_id = test_id(4);
 
         let syn = tcp_pkt(me, 50000, peer, 443, SYN);
-        assert_eq!(fw.evaluate_packet(Direction::Out, &syn, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &syn, &peer_id),
+            Action::Allow
+        );
         let ret = tcp_pkt(peer, 443, me, 50000, ACK);
-        assert_eq!(fw.evaluate_packet(Direction::In, &ret, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &ret, &peer_id),
+            Action::Allow
+        );
 
         // Peer sends RST (inbound). We don't track inbound-eviction, but our own
         // outbound RST should evict. Send an outbound RST.
         let rst = tcp_pkt(me, 50000, peer, 443, RST | ACK);
-        assert_eq!(fw.evaluate_packet(Direction::Out, &rst, &peer_id), Action::Allow);
+        assert_eq!(
+            fw.evaluate_packet(Direction::Out, &rst, &peer_id),
+            Action::Allow
+        );
 
         let after = tcp_pkt(peer, 443, me, 50000, ACK);
-        assert_eq!(fw.evaluate_packet(Direction::In, &after, &peer_id), Action::Deny);
+        assert_eq!(
+            fw.evaluate_packet(Direction::In, &after, &peer_id),
+            Action::Deny
+        );
     }
 }

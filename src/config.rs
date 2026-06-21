@@ -284,7 +284,10 @@ mod tests {
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
         assert_eq!(config.networks[0].group_mode, GroupMode::Open);
-        assert_eq!(config.networks[0].my_ip, Some(Ipv4Addr::new(100, 64, 10, 5)));
+        assert_eq!(
+            config.networks[0].my_ip,
+            Some(Ipv4Addr::new(100, 64, 10, 5))
+        );
     }
 
     #[test]
@@ -339,7 +342,7 @@ mod tests {
                     identity: id1,
                     ip: Ipv4Addr::new(100, 64, 5, 3),
                     is_coordinator: true,
-                            hostname: None,
+                    hostname: None,
                 }],
                 approved: vec![ApprovedConfigEntry {
                     identity: id2,

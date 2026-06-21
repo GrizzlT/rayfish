@@ -39,7 +39,9 @@ pub async fn create_endpoint_with_alpns(
             .await
             .context("failed to create Tor transport — is Tor running with ControlPort 9051?")?;
         builder = builder
-            .add_custom_transport(tor_transport.clone() as Arc<dyn iroh::endpoint::transports::CustomTransport>)
+            .add_custom_transport(
+                tor_transport.clone() as Arc<dyn iroh::endpoint::transports::CustomTransport>
+            )
             .address_lookup(tor_transport.discovery());
         tracing::info!("Tor transport enabled");
     }

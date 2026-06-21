@@ -45,10 +45,8 @@ fn collision_index_path() -> Result<PathBuf> {
 pub fn load_collision_index() -> Result<u32> {
     let path = collision_index_path()?;
     if path.exists() {
-        let s = std::fs::read_to_string(&path)
-            .context("read collision_index")?;
-        s.trim().parse::<u32>()
-            .context("parse collision_index")
+        let s = std::fs::read_to_string(&path).context("read collision_index")?;
+        s.trim().parse::<u32>().context("parse collision_index")
     } else {
         Ok(0)
     }
@@ -56,6 +54,5 @@ pub fn load_collision_index() -> Result<u32> {
 
 pub fn save_collision_index(index: u32) -> Result<()> {
     let path = collision_index_path()?;
-    std::fs::write(&path, index.to_string())
-        .context("write collision_index")
+    std::fs::write(&path, index.to_string()).context("write collision_index")
 }

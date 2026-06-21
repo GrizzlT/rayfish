@@ -11,7 +11,10 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use simple_dns::{Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, Name, CLASS, rdata::RData, rdata::A, rdata::AAAA};
+use simple_dns::{
+    CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, rdata::A, rdata::AAAA,
+    rdata::RData,
+};
 
 use crate::DNS_DOMAIN;
 
@@ -101,9 +104,10 @@ async fn resolve_name(name: &str, suffix: &str, table: &HostnameTable) -> Option
 
     // Try <hostname>.<network>.pi
     if let Some((hostname, network)) = stripped.rsplit_once('.')
-        && let Some(network_hosts) = table_guard.get(network) {
-            return network_hosts.get(hostname).copied();
-        }
+        && let Some(network_hosts) = table_guard.get(network)
+    {
+        return network_hosts.get(hostname).copied();
+    }
 
     // Try <hostname>.pi (search all networks, return first match)
     for network_hosts in table_guard.values() {
@@ -123,7 +127,9 @@ fn make_a_response(query: &Packet, qname: &Name, ip: Ipv4Addr) -> Vec<u8> {
         qname.clone(),
         CLASS::IN,
         60,
-        RData::A(A { address: u32::from(ip) }),
+        RData::A(A {
+            address: u32::from(ip),
+        }),
     ));
     response.build_bytes_vec().unwrap_or_default()
 }
@@ -136,7 +142,9 @@ fn make_aaaa_response(query: &Packet, qname: &Name, ip: Ipv6Addr) -> Vec<u8> {
         qname.clone(),
         CLASS::IN,
         60,
-        RData::AAAA(AAAA { address: u128::from(ip) }),
+        RData::AAAA(AAAA {
+            address: u128::from(ip),
+        }),
     ));
     response.build_bytes_vec().unwrap_or_default()
 }
@@ -178,7 +186,10 @@ mod tests {
             t.insert("gaming".to_string(), hosts);
         }
         let result = resolve_name("alice.gaming.pi", SUFFIX, &table).await;
-        assert_eq!(result.map(|(v4, _)| v4), Some(Ipv4Addr::new(100, 64, 10, 5)));
+        assert_eq!(
+            result.map(|(v4, _)| v4),
+            Some(Ipv4Addr::new(100, 64, 10, 5))
+        );
     }
 
     #[tokio::test]
@@ -191,7 +202,10 @@ mod tests {
             t.insert("work".to_string(), hosts);
         }
         let result = resolve_name("bob.pi", SUFFIX, &table).await;
-        assert_eq!(result.map(|(v4, _)| v4), Some(Ipv4Addr::new(100, 64, 20, 3)));
+        assert_eq!(
+            result.map(|(v4, _)| v4),
+            Some(Ipv4Addr::new(100, 64, 20, 3))
+        );
     }
 
     #[tokio::test]

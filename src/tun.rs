@@ -28,8 +28,7 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
 }
 
 pub fn check_cgnat_conflict() -> Result<()> {
-    let output = std::process::Command::new("ifconfig")
-        .output();
+    let output = std::process::Command::new("ifconfig").output();
 
     let output = match output {
         Ok(o) => o,
@@ -40,7 +39,8 @@ pub fn check_cgnat_conflict() -> Result<()> {
     let mut current_iface = String::new();
 
     for line in stdout.lines() {
-        if !line.starts_with('\t') && !line.starts_with(' ')
+        if !line.starts_with('\t')
+            && !line.starts_with(' ')
             && let Some(name) = line.split(':').next()
         {
             current_iface = name.to_string();
@@ -56,7 +56,8 @@ pub fn check_cgnat_conflict() -> Result<()> {
                     "interface {} already has CGNAT address {} — another VPN \
                      (e.g. Tailscale) is using the 100.64.0.0/10 range. \
                      Disable it before starting pitopi.",
-                    current_iface, ip
+                    current_iface,
+                    ip
                 );
             }
         }
@@ -84,7 +85,9 @@ pub fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter, Strin
     });
 
     let device = tun::create_as_async(&config)?;
-    let tun_name = device.as_ref().tun_name()
+    let tun_name = device
+        .as_ref()
+        .tun_name()
         .unwrap_or_else(|_| "unknown".to_string());
     tracing::info!(addr = %v4, ipv6 = %v6, tun = %tun_name, "TUN device created");
 

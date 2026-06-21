@@ -74,8 +74,7 @@ fn backup_path(original: &Path) -> PathBuf {
 fn backup_file(path: &Path) -> Result<()> {
     let backup = backup_path(path);
     if path.exists() {
-        std::fs::copy(path, &backup)
-            .with_context(|| format!("backing up {}", path.display()))?;
+        std::fs::copy(path, &backup).with_context(|| format!("backing up {}", path.display()))?;
     }
     Ok(())
 }
@@ -83,8 +82,7 @@ fn backup_file(path: &Path) -> Result<()> {
 fn restore_file(path: &Path) -> Result<()> {
     let backup = backup_path(path);
     if backup.exists() {
-        std::fs::copy(&backup, path)
-            .with_context(|| format!("restoring {}", path.display()))?;
+        std::fs::copy(&backup, path).with_context(|| format!("restoring {}", path.display()))?;
         std::fs::remove_file(&backup)?;
     } else if path.exists() {
         std::fs::remove_file(path)?;
@@ -163,7 +161,10 @@ impl DnsConfigurator for SystemdResolved {
             .context("resolvectl domain")?;
         anyhow::ensure!(status.success(), "resolvectl domain failed");
 
-        tracing::info!("configured systemd-resolved for .{DNS_DOMAIN} via {}", self.tun_iface);
+        tracing::info!(
+            "configured systemd-resolved for .{DNS_DOMAIN} via {}",
+            self.tun_iface
+        );
         Ok(())
     }
 
