@@ -794,7 +794,7 @@ impl DaemonState {
         dns_config::update_search_domains(&network_names, &self.tun_name);
     }
 
-    async fn handle_request(&self, req: IpcRequest) -> IpcResponse {
+    async fn handle_request(&self, req: IpcRequest, peer_cred: Option<(u32, u32)>) -> IpcResponse {
         match req {
             IpcRequest::Create {
                 mode,
@@ -857,7 +857,7 @@ impl DaemonState {
             }
             IpcRequest::SendFile { path, peer } => self.send_file(&path, &peer).await,
             IpcRequest::ListFiles => self.list_files(),
-            IpcRequest::AcceptFile { id, output } => self.accept_file(id, output).await,
+            IpcRequest::AcceptFile { id, output } => self.accept_file(id, output, peer_cred).await,
         }
     }
 
@@ -2641,7 +2641,7 @@ impl DaemonState {
         IpcResponse::FileList { files }
     }
 
-    async fn accept_file(&self, id: u64, output: Option<String>) -> IpcResponse {
+    async fn accept_file(&self, id: u64, output: Option<String>, peer_cred: Option<(u32, u32)>) -> IpcResponse {
         let pending_file = {
             let mut pending = self.protocol_router.pending_files.lock().unwrap();
             let idx = pending.iter().position(|f| f.id == id);
@@ -2712,6 +2712,16 @@ impl DaemonState {
             return IpcResponse::Error {
                 message: format!("write failed: {e}"),
             };
+        }
+
+        if let Some((uid, gid)) = peer_cred {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(c) = std::ffi::CString::new(dest.as_os_str().as_bytes()) {
+                unsafe { libc::chown(c.as_ptr(), uid, gid) };
+            }
+            if let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) {
+                unsafe { libc::chown(c.as_ptr(), uid, gid) };
+            }
         }
 
         IpcResponse::Ok {
@@ -3032,8 +3042,9 @@ fn set_socket_group_permissions(path: &std::path::Path) {
 }
 
 async fn handle_ipc_client(mut stream: UnixStream, daemon: &DaemonState) -> Result<()> {
+    let peer_cred = stream.peer_cred().ok().map(|c| (c.uid(), c.gid()));
     let req: IpcRequest = ipc::recv_msg(&mut stream).await?;
-    let resp = daemon.handle_request(req).await;
+    let resp = daemon.handle_request(req, peer_cred).await;
     ipc::send_msg(&mut stream, &resp).await?;
     Ok(())
 }

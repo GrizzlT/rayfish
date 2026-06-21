@@ -104,13 +104,13 @@ pub enum IpcResponse {
         name: String,
         network_key: EndpointId,
         my_ip: Ipv4Addr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         my_ipv6: Option<Ipv6Addr>,
     },
     Joined {
         name: String,
         my_ip: Ipv4Addr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         my_ipv6: Option<Ipv6Addr>,
     },
     Status {
@@ -218,10 +218,10 @@ pub async fn connect() -> Result<UnixStream> {
 }
 
 pub async fn send_msg<T: Serialize>(stream: &mut UnixStream, msg: &T) -> Result<()> {
-    let json = serde_json::to_vec(msg).context("serialize IPC message")?;
-    let len = (json.len() as u32).to_be_bytes();
+    let body = rmp_serde::to_vec(msg).context("serialize IPC message")?;
+    let len = (body.len() as u32).to_be_bytes();
     stream.write_all(&len).await.context("write IPC length")?;
-    stream.write_all(&json).await.context("write IPC body")?;
+    stream.write_all(&body).await.context("write IPC body")?;
     stream.flush().await.context("flush IPC")?;
     Ok(())
 }
@@ -239,7 +239,7 @@ pub async fn recv_msg<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T>
         .read_exact(&mut body)
         .await
         .context("read IPC body")?;
-    serde_json::from_slice(&body).context("decode IPC message")
+    rmp_serde::from_slice(&body).context("decode IPC message")
 }
 
 #[cfg(test)]
@@ -254,8 +254,8 @@ mod tests {
             hostname: None,
             transport: None,
         };
-        let json = serde_json::to_vec(&req).unwrap();
-        let decoded: IpcRequest = serde_json::from_slice(&json).unwrap();
+        let json = rmp_serde::to_vec(&req).unwrap();
+        let decoded: IpcRequest = rmp_serde::from_slice(&json).unwrap();
         match decoded {
             IpcRequest::Create { mode, .. } => {
                 assert_eq!(mode, GroupMode::Open);
@@ -273,8 +273,8 @@ mod tests {
             my_ip: Ipv4Addr::new(100, 64, 10, 5),
             my_ipv6: None,
         };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let decoded: IpcResponse = serde_json::from_slice(&json).unwrap();
+        let json = rmp_serde::to_vec(&resp).unwrap();
+        let decoded: IpcResponse = rmp_serde::from_slice(&json).unwrap();
         match decoded {
             IpcResponse::Created {
                 name,
@@ -297,8 +297,8 @@ mod tests {
             tag: "servers".to_string(),
             peer_ids: vec!["ab3f".to_string(), "d92c".to_string()],
         };
-        let json = serde_json::to_vec(&req).unwrap();
-        let decoded: IpcRequest = serde_json::from_slice(&json).unwrap();
+        let json = rmp_serde::to_vec(&req).unwrap();
+        let decoded: IpcRequest = rmp_serde::from_slice(&json).unwrap();
         match decoded {
             IpcRequest::AclTag {
                 network,
@@ -318,8 +318,8 @@ mod tests {
         let resp = IpcResponse::AclState {
             display: "Tags:\n  servers: ab3f\n".to_string(),
         };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let decoded: IpcResponse = serde_json::from_slice(&json).unwrap();
+        let json = rmp_serde::to_vec(&resp).unwrap();
+        let decoded: IpcResponse = rmp_serde::from_slice(&json).unwrap();
         match decoded {
             IpcResponse::AclState { display } => {
                 assert!(display.contains("servers"));
@@ -356,8 +356,8 @@ mod tests {
             bytes_rx: 0,
             bytes_tx: 0,
         };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let decoded: IpcResponse = serde_json::from_slice(&json).unwrap();
+        let json = rmp_serde::to_vec(&resp).unwrap();
+        let decoded: IpcResponse = rmp_serde::from_slice(&json).unwrap();
         match decoded {
             IpcResponse::Status {
                 endpoint_id,
