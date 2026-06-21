@@ -1,6 +1,6 @@
 # Pitopi Roadmap
 
-**Thesis:** a basic P2P layer that apps build on with zero SDK — resolve a `.pitopi`
+**Thesis:** a basic P2P layer that apps build on with zero SDK — resolve a `.pi`
 name, open a socket, done. Unmodified apps work over the mesh. Priority = how directly
 an item serves that socket/DNS surface.
 
@@ -15,6 +15,8 @@ an item serves that socket/DNS surface.
 - [x] Distributed ACLs with tag-based allow rules
 - [x] Systemd/launchd service integration
 - [x] Daemon architecture with Unix socket IPC
+- [x] Magic DNS with .pi domain resolution
+- [x] Local device firewall with port/protocol/peer filtering
 
 ---
 
@@ -38,12 +40,13 @@ an item serves that socket/DNS surface.
   - **Forwarding:** detect IPv4 vs IPv6 via version nibble (byte 0 upper 4 bits),
     extract dest from bytes 16-19 (v4) or 24-39 (v6), look up PeerTable
   - **MagicDNS makes IPs opaque:** users never see raw addresses.
-    `alice.mynet.pitopi` resolves to AAAA (stable IPv6) + A (possibly-rotated IPv4).
+    `alice.mynet.pi` resolves to AAAA (stable IPv6) + A (possibly-rotated IPv4).
     IPv4 rotation is transparent because apps resolve via DNS, not hardcoded IPs
-- [ ] **Magic DNS**
-  - Local resolver intercepts `.pitopi` queries → IPv6 (AAAA) + IPv4 (A)
-  - Per-network names: `alice.gaming.pitopi`, registered on join
-  - This is the contract apps depend on: resolve a name, open a socket, pitopi is invisible
+- [x] **Magic DNS**
+  - Local resolver intercepts `.pi` queries → A records (IPv4); AAAA when IPv6 lands
+  - Per-network names: `alice.gaming.pi`, registered on join via `--hostname`
+  - Multi-platform DNS config (macOS scoped resolver, Linux systemd-resolved/resolvconf/direct)
+  - Backup/restore of DNS files with crash recovery
 
 ---
 

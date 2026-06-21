@@ -19,14 +19,15 @@ A complete guide to pitopi's architecture, protocols, and internals.
 11. [Three-Word Names](#11-three-word-names)
 12. [Access Control](#12-access-control)
 13. [Local Device Firewall](#13-local-device-firewall)
-14. [Audit Logging](#14-audit-logging)
-15. [Statistics](#15-statistics)
-16. [Shutdown](#16-shutdown)
-17. [DHT Membership](#17-dht-membership)
-18. [Network Lifecycle](#18-network-lifecycle)
-19. [Daemon Architecture](#19-daemon-architecture)
-20. [Code Flow Diagrams](#20-code-flow-diagrams)
-21. [Security Model](#21-security-model)
+14. [Magic DNS](#14-magic-dns)
+15. [Audit Logging](#15-audit-logging)
+16. [Statistics](#16-statistics)
+17. [Shutdown](#17-shutdown)
+18. [DHT Network Records](#18-dht-network-records)
+19. [Network Lifecycle](#19-network-lifecycle)
+20. [Daemon Architecture](#20-daemon-architecture)
+21. [Code Flow Diagrams](#21-code-flow-diagrams)
+22. [Security Model](#22-security-model)
 
 ---
 
@@ -1301,7 +1302,81 @@ pitopi firewall add out allow
 
 ---
 
-## 14. Audit Logging
+## 14. Magic DNS
+
+**Modules:** `src/dns.rs`, `src/dns_config.rs`, `src/hostname.rs`
+
+Magic DNS lets you reach peers by name instead of IP. Every peer gets a hostname — either chosen via `--hostname` at create/join time, or randomly assigned from a word list.
+
+### Resolution scheme
+
+Names resolve under the `.pi` TLD:
+
+- **`alice.gaming.pi`** — fully qualified: hostname + network name
+- **`alice.pi`** — flat lookup: searches all active networks, returns first match
+
+### How it works
+
+```
+App DNS query (e.g., "alice.gaming.pi")
+    |
+    v
+System resolver (macOS /etc/resolver/pi, Linux systemd-resolved, etc.)
+    |  routes only .pi queries to pitopi
+    v
+pitopi DNS server (UDP, 100.64.0.1:53)
+    |  looks up HostnameTable (network → hostname → IP)
+    v
+A record response (100.64.x.x)
+```
+
+The daemon runs a minimal UDP DNS responder bound to the TUN gateway address (100.64.0.1:53). It only handles A queries for `.pi` names — everything else gets REFUSED, so normal DNS is never affected.
+
+### Hostname assignment
+
+Hostnames are stored in the `Member` struct and propagated via the GroupBlob (the same mechanism used for membership and ACLs). This means hostnames are available even when the named peer is offline — any peer that has fetched the blob can resolve the name.
+
+```bash
+pitopi create --hostname alice       # choose your hostname
+pitopi create                        # random hostname assigned (e.g., "walrus")
+pitopi join <key> --hostname bob     # join with a chosen hostname
+```
+
+### System DNS configuration
+
+Pitopi configures the OS to split-route `.pi` queries to its local resolver. The detection chain (modeled on Tailscale's approach):
+
+| Platform | Method | How |
+|----------|--------|-----|
+| macOS | Scoped resolver | Writes `/etc/resolver/pi` — macOS natively routes queries for that TLD |
+| Linux | systemd-resolved | `resolvectl dns <tun> 100.64.0.1` + `resolvectl domain <tun> ~pi` |
+| Linux | resolvconf | Pipes config to `resolvconf -a tun-pitopi.inet` |
+| Linux | Direct | Prepends `nameserver 100.64.0.1` to `/etc/resolv.conf` (fallback) |
+
+### Backup and crash recovery
+
+Before modifying any DNS configuration file, pitopi saves a backup at `<path>.before-pitopi`. On daemon shutdown (clean or SIGTERM), the backup is restored. If the daemon crashes, the next startup detects stale `.before-pitopi` files and restores them before proceeding.
+
+### Status display
+
+`pitopi status` shows your hostname and peer hostnames:
+
+```
+Endpoint: ab3f...
+  gentle-amber-fox [coordinator]
+    Hostname: alice.gentle-amber-fox.pi
+    IP: 100.64.23.142
+    Peers:
+      100.64.7.201 (d92c...) [bob]
+```
+
+### Constants
+
+The DNS domain is controlled by `DNS_DOMAIN` in `src/main.rs`. Changing it from `"pi"` to something else updates all resolver paths, split-DNS routing, and query matching.
+
+---
+
+## 15. Audit Logging
 
 **Module:** `src/audit.rs`
 
@@ -1345,7 +1420,7 @@ audit.log_disconnect(peer_ip, &endpoint_id);
 
 ---
 
-## 15. Statistics
+## 16. Statistics
 
 **Module:** `src/stats.rs`
 
@@ -1377,7 +1452,7 @@ Byte counts are logged as raw values (no formatting) for easy parsing and script
 
 ---
 
-## 16. Shutdown
+## 17. Shutdown
 
 **Module:** `src/shutdown.rs`
 
@@ -1413,7 +1488,7 @@ The shutdown is cooperative, not forceful. Each task exits at its next `tokio::s
 
 ---
 
-## 17. DHT Network Records
+## 18. DHT Network Records
 
 **Module:** `src/dht.rs`
 
@@ -1495,7 +1570,7 @@ The single-record model eliminates the MITM vulnerability of name-based director
 
 ---
 
-## 18. Network Lifecycle
+## 19. Network Lifecycle
 
 This chapter ties the modules together by walking through the complete lifecycle of a network.
 
@@ -1646,7 +1721,7 @@ All networks share the same TUN device and routing table, since the address spac
 
 ---
 
-## 19. Daemon Architecture
+## 20. Daemon Architecture
 
 Pitopi uses a daemon/client split similar to Tailscale. The daemon (`pitopi daemon`) is a long-lived root process that owns all shared resources, while CLI commands are thin IPC clients.
 
@@ -1706,7 +1781,7 @@ When a network is left:
 
 ---
 
-## 20. Code Flow Diagrams
+## 21. Code Flow Diagrams
 
 Visual reference for how data and control flow through the codebase.
 
@@ -1878,7 +1953,7 @@ spawn_peer_reader detects conn.read_datagram() error
 
 ---
 
-## 21. Security Model
+## 22. Security Model
 
 ### Transport security
 

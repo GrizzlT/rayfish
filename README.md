@@ -136,6 +136,24 @@ Rules are evaluated first-match-wins. Supports TCP, UDP, ICMP, port ranges (e.g.
 
 The `self` keyword can be used to reference your own device in ACL and firewall commands (e.g. `pitopi acl gaming tag servers self`).
 
+### Magic DNS
+
+Every peer gets a hostname resolvable under the `.pi` domain. No more memorizing IPs:
+
+```bash
+# Create with a chosen hostname
+pitopi create --hostname alice
+
+# Join with a hostname
+pitopi join 3f8a...c7d2 --hostname bob
+
+# Now reach peers by name
+ping alice.gentle-amber-fox.pi    # fully qualified
+ping alice.pi                     # flat lookup (searches all networks)
+```
+
+Hostnames propagate via the membership blob — they're resolvable even when the named peer is offline. The daemon configures your system DNS to route only `.pi` queries to its local resolver; all other DNS is untouched.
+
 ## Commands
 
 | Command | Description | Needs daemon |
@@ -216,6 +234,7 @@ See [TODO.md](TODO.md) for the full roadmap. Current status:
 - [x] DHT network records for offline coordinator resilience
 - [x] Distributed ACLs with tag-based allow rules (coordinator-managed, enforced on all peers)
 - [x] Local device firewall with port/protocol/peer filtering
+- [x] Magic DNS with .pi domain resolution
 - [x] Systemd/launchd service integration
 - [x] Daemon architecture with Unix socket IPC
 - [ ] Social discovery (Discord, Slack, Steam)
