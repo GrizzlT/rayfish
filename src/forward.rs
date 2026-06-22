@@ -106,6 +106,7 @@ pub struct DisconnectEvent {
 /// Main TUN read loop. Reads packets from the TUN device, extracts the destination IP,
 /// looks up the peer in [`PeerTable`], and sends the packet as a QUIC datagram.
 /// Packets with no matching peer are silently dropped.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_mesh(
     mut tun: TunReader,
     peers: PeerTable,
