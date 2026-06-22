@@ -2204,6 +2204,14 @@ impl DaemonState {
             warnings.push(format!("failed to bring TUN interface up: {e}"));
         }
 
+        // Route the 200::/7 peer range into the TUN. Must happen after link-up:
+        // on Linux the kernel won't install an IPv6 connected route while the
+        // link is down, so without this peer traffic leaks out the default route.
+        if let Err(e) = tun::route_peer_range(&self.tun_name).await {
+            tracing::warn!(error = %e, "failed to route 200::/7 into TUN");
+            warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
+        }
+
         // Configure system DNS to route .ray queries to our local resolver.
         dns_config::restore_stale_backups();
         match dns_config::detect_and_configure(&self.tun_name) {

@@ -100,9 +100,11 @@ pub async fn create(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<(TunReader, TunWriter,
     Ok((TunReader { reader }, TunWriter { writer }, tun_name))
 }
 
-/// Assigns the IPv6 address to the TUN and ensures the `200::/7` peer range
-/// routes into it. The address is added with a `/7` prefix so the kernel
-/// installs the connected route automatically — no separate route entry needed.
+/// Assigns the TUN's own IPv6 address. The `200::/7` peer range is routed into
+/// the TUN separately by [`route_peer_range`], which must run *after* the link
+/// is up — assigning the address here at creation time (link still down) is not
+/// enough on Linux, where the kernel does not reliably install the connected
+/// route until the interface comes up.
 #[cfg(target_os = "linux")]
 async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
     use futures::TryStreamExt;
@@ -126,12 +128,12 @@ async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
             .header
             .index;
 
-        // `/7` prefix → kernel adds the 200::/7 connected route into the TUN,
-        // exactly as the IPv4 /10 netmask does. `replace()` keeps it idempotent
+        // /128: just our own address. The peer-range route is added explicitly
+        // after link-up in `route_peer_range`. `replace()` keeps it idempotent
         // across daemon restarts.
         handle
             .address()
-            .add(index, IpAddr::V6(addr), 7)
+            .add(index, IpAddr::V6(addr), 128)
             .replace()
             .execute()
             .await
@@ -147,17 +149,68 @@ async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 async fn configure_ipv6(tun_name: &str, addr: Ipv6Addr) -> Result<()> {
-    // macOS has no netlink; assign the address and add the range route via the
-    // BSD tools. utun is point-to-point, so the /7 prefix alone does not create
-    // the connected route — we add it explicitly.
+    // macOS has no netlink; assign the address via the BSD tools. The peer-range
+    // route is added separately by `route_peer_range` after link-up.
     let status = std::process::Command::new("ifconfig")
         .args([tun_name, "inet6", &addr.to_string(), "prefixlen", "128"])
         .status()
         .context("run ifconfig")?;
     anyhow::ensure!(status.success(), "ifconfig inet6 failed with {status}");
+    Ok(())
+}
 
-    // `route add` fails if the route already exists (e.g. daemon restart), so
-    // delete any stale entry first and ignore its result.
+/// Routes the whole `200::/7` peer range into the TUN. Must be called *after*
+/// the interface is up (see [`set_link_up`]): on Linux the kernel does not
+/// reliably install an IPv6 connected route while the link is down, so peer
+/// traffic would otherwise leak out the host's default IPv6 route. Idempotent —
+/// safe to call on every `up` cycle.
+#[cfg(target_os = "linux")]
+pub async fn route_peer_range(tun_name: &str) -> Result<()> {
+    use futures::TryStreamExt;
+    use rtnetlink::RouteMessageBuilder;
+
+    let (connection, handle, _) = rtnetlink::new_connection().context("open netlink socket")?;
+    let conn = tokio::spawn(connection);
+
+    let result = async {
+        let index = handle
+            .link()
+            .get()
+            .match_name(tun_name.to_owned())
+            .execute()
+            .try_next()
+            .await
+            .context("query TUN link")?
+            .with_context(|| format!("TUN link {tun_name} not found"))?
+            .header
+            .index;
+
+        let route = RouteMessageBuilder::<Ipv6Addr>::new()
+            .destination_prefix(Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 0), 7)
+            .output_interface(index)
+            .build();
+        handle
+            .route()
+            .add(route)
+            .replace()
+            .execute()
+            .await
+            .context("add 200::/7 route via netlink")?;
+
+        Ok(())
+    }
+    .await;
+
+    conn.abort();
+    result
+}
+
+#[cfg(target_os = "macos")]
+pub async fn route_peer_range(tun_name: &str) -> Result<()> {
+    // utun is point-to-point, so the address prefix alone does not create the
+    // range route — we add it explicitly. `route add` fails if the route
+    // already exists (e.g. an earlier `up`), so delete any stale entry first
+    // and ignore its result.
     let _ = std::process::Command::new("route")
         .args([
             "-n",
