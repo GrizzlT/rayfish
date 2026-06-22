@@ -46,7 +46,7 @@ impl AuditLog {
 fn log_path() -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .context("could not determine config directory")?
-        .join("pitopi");
+        .join("rayfish");
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join("audit.log"))
 }
@@ -58,7 +58,7 @@ mod tests {
     #[test]
     fn test_log_path() {
         let path = log_path().unwrap();
-        assert!(path.to_string_lossy().contains("pitopi"));
+        assert!(path.to_string_lossy().contains("rayfish"));
         assert!(path.to_string_lossy().ends_with("audit.log"));
     }
 }

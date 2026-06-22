@@ -1,6 +1,6 @@
 //! OS-level DNS resolver configuration for Magic DNS.
 //!
-//! Configures the system to route `.pi` queries to our local resolver at 127.0.0.1:53.
+//! Configures the system to route `.ray` queries to our local resolver at 127.0.0.1:53.
 //! macOS: SCDynamicStore with session keys (auto-cleanup on process exit).
 //! Linux: systemd-resolved / resolvconf / direct /etc/resolv.conf.
 
@@ -63,7 +63,7 @@ pub fn restore_stale_backups() {
     {
         use std::path::PathBuf;
         let resolver_file = PathBuf::from(format!("/etc/resolver/{DNS_DOMAIN}"));
-        let backup = PathBuf::from(format!("/etc/resolver/{DNS_DOMAIN}.before-pitopi"));
+        let backup = PathBuf::from(format!("/etc/resolver/{DNS_DOMAIN}.before-rayfish"));
         if backup.exists() {
             tracing::info!("removing stale /etc/resolver backup from old DNS approach");
             let _ = std::fs::copy(&backup, &resolver_file);
@@ -71,7 +71,7 @@ pub fn restore_stale_backups() {
         }
         if resolver_file.exists()
             && let Ok(content) = std::fs::read_to_string(&resolver_file)
-            && content.contains("pitopi")
+            && content.contains("rayfish")
         {
             tracing::info!("removing old /etc/resolver/{DNS_DOMAIN} (migrated to SCDynamicStore)");
             let _ = std::fs::remove_file(&resolver_file);
@@ -95,8 +95,8 @@ pub fn restore_stale_backups() {
 }
 
 /// Update system DNS routing so bare hostnames and `<host>.<network>` resolve.
-/// Configures search domains (`<network>.pi`, `pi`) and supplemental match
-/// domains (each network name + `pi`) so the OS routes queries to pitopi.
+/// Configures search domains (`<network>.ray`, `pi`) and supplemental match
+/// domains (each network name + `pi`) so the OS routes queries to rayfish.
 /// Call whenever networks are joined or left.
 pub fn update_search_domains(network_names: &[String], tun_name: &str) {
     let mut search: Vec<String> = network_names
@@ -112,7 +112,7 @@ pub fn update_search_domains(network_names: &[String], tun_name: &str) {
     }
 }
 
-/// Remove all pitopi search domains (called on daemon shutdown).
+/// Remove all rayfish search domains (called on daemon shutdown).
 pub fn clear_search_domains(tun_name: &str) {
     if let Err(e) = set_search_domains(&[], &[], tun_name) {
         tracing::warn!(error = %e, "failed to clear search domains");
@@ -120,22 +120,22 @@ pub fn clear_search_domains(tun_name: &str) {
 }
 
 fn set_search_domains(
-    pitopi_domains: &[String],
+    rayfish_domains: &[String],
     network_names: &[String],
     tun_name: &str,
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let _ = tun_name;
-        write_dns_config_macos(pitopi_domains, network_names)
+        write_dns_config_macos(rayfish_domains, network_names)
     }
     #[cfg(target_os = "linux")]
     {
-        set_search_domains_linux(pitopi_domains, network_names, tun_name)
+        set_search_domains_linux(rayfish_domains, network_names, tun_name)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (pitopi_domains, network_names, tun_name);
+        let _ = (rayfish_domains, network_names, tun_name);
         Ok(())
     }
 }
@@ -164,7 +164,7 @@ mod macos {
 
     use super::{DnsConfigurator, DNS_DOMAIN, RESOLVER_IP};
 
-    const SC_DNS_KEY: &str = "State:/Network/Service/pitopi/DNS";
+    const SC_DNS_KEY: &str = "State:/Network/Service/rayfish/DNS";
 
     struct SendSyncStore(SCDynamicStore);
 
@@ -185,7 +185,7 @@ mod macos {
         if let Some(existing) = STORE.get() {
             return Ok(existing);
         }
-        let store = SCDynamicStoreBuilder::new("pitopi")
+        let store = SCDynamicStoreBuilder::new("rayfish")
             .session_keys(true)
             .build()
             .context("failed to create SCDynamicStore session")?;
@@ -205,7 +205,7 @@ mod macos {
         let server_val =
             CFArray::from_CFTypes(&[CFString::from_static_string(RESOLVER_IP)]);
 
-        // Route .pi + each bare network name to our resolver
+        // Route .ray + each bare network name to our resolver
         let match_key =
             unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSSupplementalMatchDomains) };
         let mut match_domains: Vec<CFString> = vec![CFString::new(DNS_DOMAIN)];
@@ -277,7 +277,7 @@ fn write_dns_config_macos(search_domains: &[String], network_names: &[String]) -
 
 #[cfg(target_os = "linux")]
 fn set_search_domains_linux(
-    pitopi_domains: &[String],
+    rayfish_domains: &[String],
     network_names: &[String],
     tun_name: &str,
 ) -> Result<()> {
@@ -291,7 +291,7 @@ fn set_search_domains_linux(
             for name in network_names {
                 domains.push((name.clone(), true));
             }
-            for d in pitopi_domains {
+            for d in rayfish_domains {
                 domains.push((d.clone(), false));
             }
             let reply = conn.call_method(
@@ -315,7 +315,7 @@ fn set_search_domains_linux(
         for name in network_names {
             args.push(format!("~{name}"));
         }
-        args.extend(pitopi_domains.iter().cloned());
+        args.extend(rayfish_domains.iter().cloned());
         let status = Command::new("resolvectl")
             .args(&args)
             .status()
@@ -641,8 +641,8 @@ fn try_resolvconf() -> Option<Resolvconf> {
 impl Resolvconf {
     fn iface_name(&self) -> &str {
         match self.variant {
-            ResolvconfVariant::Debian => "tun-pitopi.inet",
-            ResolvconfVariant::Openresolv => "tun-pitopi",
+            ResolvconfVariant::Debian => "tun-rayfish.inet",
+            ResolvconfVariant::Openresolv => "tun-rayfish",
         }
     }
 }
@@ -690,9 +690,9 @@ impl DnsConfigurator for Resolvconf {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-const BACKUP_SUFFIX: &str = ".before-pitopi";
+const BACKUP_SUFFIX: &str = ".before-rayfish";
 #[cfg(target_os = "linux")]
-const HEADER_COMMENT: &str = "# Added by pitopi - do not edit\n";
+const HEADER_COMMENT: &str = "# Added by rayfish - do not edit\n";
 
 #[cfg(target_os = "linux")]
 fn backup_path(original: &std::path::Path) -> std::path::PathBuf {

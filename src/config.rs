@@ -120,7 +120,7 @@ pub struct NetworkConfig {
 
 fn default_true() -> bool { true }
 
-/// Top-level config stored at `~/.config/pitopi/networks.toml`.
+/// Top-level config stored at `~/.config/rayfish/networks.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_true")]
@@ -141,7 +141,7 @@ impl Default for AppConfig {
 fn config_path() -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .context("could not determine config directory")?
-        .join("pitopi");
+        .join("rayfish");
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join("networks.toml"))
 }

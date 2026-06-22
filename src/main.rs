@@ -19,8 +19,8 @@ mod stats;
 mod transport;
 mod tun;
 
-pub const APP_NAME: &str = "pitopi";
-pub const DNS_DOMAIN: &str = "pi";
+pub const APP_NAME: &str = "ray";
+pub const DNS_DOMAIN: &str = "ray";
 
 use std::sync::Arc;
 
@@ -68,7 +68,7 @@ pub(crate) fn spawn_path_logger(conn: IrohConnection, label: String) {
 }
 
 #[derive(Parser)]
-#[command(name = "pitopi", about = "P2P mesh VPN powered by iroh")]
+#[command(name = "ray", about = "P2P mesh VPN powered by iroh")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -81,10 +81,10 @@ enum Command {
         /// Membership mode: open or restricted
         #[arg(long, default_value = "restricted")]
         mode: GroupMode,
-        /// Network name used in DNS (e.g. "gaming" → alice.gaming.pi). Random if not set
+        /// Network name used in DNS (e.g. "gaming" → alice.gaming.ray). Random if not set
         #[arg(long)]
         name: Option<String>,
-        /// Your hostname within the network (e.g. "alice" → alice.gaming.pi). Random if not set
+        /// Your hostname within the network (e.g. "alice" → alice.gaming.ray). Random if not set
         #[arg(long)]
         hostname: Option<String>,
         /// Route traffic through Tor (requires running Tor daemon with ControlPort 9051)
@@ -98,7 +98,7 @@ enum Command {
         /// Optional local alias for the network
         #[arg(long)]
         name: Option<String>,
-        /// Your hostname within the network (e.g. "bob" → bob.gaming.pi). Random if not set
+        /// Your hostname within the network (e.g. "bob" → bob.gaming.ray). Random if not set
         #[arg(long)]
         hostname: Option<String>,
         /// Route traffic through Tor (requires running Tor daemon with ControlPort 9051)
@@ -151,7 +151,7 @@ enum Command {
     Hostname {
         /// Network name
         network: String,
-        /// New hostname (e.g. "alice" → alice.network.pi)
+        /// New hostname (e.g. "alice" → alice.network.ray)
         name: String,
     },
     /// Enable or disable mDNS local peer discovery
@@ -175,7 +175,7 @@ enum Command {
     Pair {
         #[command(subcommand)]
         action: Option<PairAction>,
-        /// Pairing ticket from the primary device (shorthand for `pitopi pair accept <ticket>`)
+        /// Pairing ticket from the primary device (shorthand for `rayfish pair accept <ticket>`)
         ticket: Option<String>,
     },
 }
@@ -266,7 +266,7 @@ enum FirewallAction {
 enum FilesAction {
     /// Accept a pending file transfer
     Accept {
-        /// Transfer ID (from 'pitopi files')
+        /// Transfer ID (from 'rayfish files')
         id: u64,
         /// Output directory (default: ~/Downloads)
         #[arg(long, short)]
@@ -276,7 +276,7 @@ enum FilesAction {
 
 fn check_root() {
     if unsafe { libc::geteuid() } != 0 {
-        eprintln!("pitopi requires root privileges to create TUN devices. Run with sudo.");
+        eprintln!("rayfish requires root privileges to create TUN devices. Run with sudo.");
         std::process::exit(1);
     }
 }
@@ -318,7 +318,7 @@ async fn main() -> Result<()> {
         Command::InstallService => cmd_install_service(),
         Command::UninstallService => cmd_uninstall_service(),
         Command::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "pitopi", &mut std::io::stdout());
+            clap_complete::generate(shell, &mut Cli::command(), "ray", &mut std::io::stdout());
             Ok(())
         }
         Command::Acl { network, action } => ipc_acl(&network, action).await,
@@ -340,7 +340,7 @@ fn cmd_mdns(state: &str) -> Result<()> {
         "on" => true,
         "off" => false,
         _ => {
-            eprintln!("Usage: pitopi mdns <on|off>");
+            eprintln!("Usage: rayfish mdns <on|off>");
             std::process::exit(1);
         }
     };
@@ -759,7 +759,7 @@ async fn ipc_files(action: Option<FilesAction>) -> Result<()> {
                             );
                         }
                         println!();
-                        println!("Accept with: pitopi files accept <id>");
+                        println!("Accept with: rayfish files accept <id>");
                     }
                 }
                 ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
@@ -798,15 +798,15 @@ fn format_size(bytes: u64) -> String {
 
 async fn cmd_pair(action: Option<PairAction>, ticket: Option<String>) -> Result<()> {
     match (action, ticket) {
-        // `pitopi pair <ticket>` shorthand
+        // `rayfish pair <ticket>` shorthand
         (None, Some(ticket)) | (Some(PairAction::Accept { ticket }), _) => {
             ipc_pair_accept(&ticket).await
         }
-        // `pitopi pair` — start pairing on primary device
+        // `rayfish pair` — start pairing on primary device
         (None, None) => ipc_pair_start().await,
-        // `pitopi pair backup`
+        // `rayfish pair backup`
         (Some(PairAction::Backup), _) => cmd_pair_backup(),
-        // `pitopi pair restore <backup>`
+        // `rayfish pair restore <backup>`
         (Some(PairAction::Restore { backup }), _) => cmd_pair_restore(&backup),
     }
 }
@@ -822,7 +822,7 @@ async fn ipc_pair_start() -> Result<()> {
             qr2term::print_qr(&ticket).ok();
             println!();
             println!("On the other device, run:");
-            println!("  pitopi pair {}", ticket);
+            println!("  rayfish pair {}", ticket);
             println!();
             println!("Waiting for device to connect...");
             // The daemon handles the pairing asynchronously via the accept loop.
@@ -911,7 +911,7 @@ fn cmd_pair_backup() -> Result<()> {
     println!("Backup code: {}", backup);
     println!();
     println!("Store this safely. To restore on a new device:");
-    println!("  pitopi pair restore {}", backup);
+    println!("  rayfish pair restore {}", backup);
     Ok(())
 }
 
@@ -959,7 +959,7 @@ fn cmd_pair_restore(backup: &str) -> Result<()> {
     // Write the restored key
     let config_dir = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?
-        .join("pitopi");
+        .join("rayfish");
     std::fs::create_dir_all(&config_dir)?;
     std::fs::write(config_dir.join("secret_key"), key.to_bytes())?;
 
@@ -975,18 +975,18 @@ fn cmd_pair_restore(backup: &str) -> Result<()> {
 fn cmd_install_service() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let service = include_str!("../contrib/pitopi.service");
-        let path = std::path::Path::new("/etc/systemd/system/pitopi.service");
+        let service = include_str!("../contrib/rayfish.service");
+        let path = std::path::Path::new("/etc/systemd/system/rayfish.service");
         std::fs::write(path, service)?;
         println!("Installed systemd service to {}", path.display());
-        println!("Run: sudo systemctl enable --now pitopi");
+        println!("Run: sudo systemctl enable --now rayfish");
         return Ok(());
     }
 
     #[cfg(target_os = "macos")]
     {
-        let plist = include_str!("../contrib/com.pitopi.vpn.plist");
-        let path = std::path::Path::new("/Library/LaunchDaemons/com.pitopi.vpn.plist");
+        let plist = include_str!("../contrib/com.rayfish.vpn.plist");
+        let path = std::path::Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
         std::fs::write(path, plist)?;
         println!("Installed launchd daemon to {}", path.display());
         println!("Run: sudo launchctl load {}", path.display());
@@ -1002,7 +1002,7 @@ fn cmd_install_service() -> Result<()> {
 fn cmd_uninstall_service() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let path = std::path::Path::new("/etc/systemd/system/pitopi.service");
+        let path = std::path::Path::new("/etc/systemd/system/rayfish.service");
         if path.exists() {
             std::fs::remove_file(path)?;
             println!("Removed systemd service.");
@@ -1015,7 +1015,7 @@ fn cmd_uninstall_service() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let path = std::path::Path::new("/Library/LaunchDaemons/com.pitopi.vpn.plist");
+        let path = std::path::Path::new("/Library/LaunchDaemons/com.rayfish.vpn.plist");
         if path.exists() {
             println!("Run: sudo launchctl unload {}", path.display());
             std::fs::remove_file(path)?;

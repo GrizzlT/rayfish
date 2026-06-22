@@ -37,7 +37,7 @@ pub struct DropLabels {
 }
 
 #[derive(Debug, MetricsGroup)]
-#[metrics(name = "pitopi", default)]
+#[metrics(name = "rayfish", default)]
 pub struct ForwardMetrics {
     /// Total packets received from peers
     pub packets_rx: Counter,
@@ -139,7 +139,7 @@ pub struct PeerLabels {
 }
 
 #[derive(Debug, MetricsGroup)]
-#[metrics(name = "pitopi_peer", default)]
+#[metrics(name = "rayfish_peer", default)]
 pub struct PeerMetrics {
     /// RTT to peer in microseconds
     pub rtt_us: Family<PeerLabels, Gauge>,

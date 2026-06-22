@@ -11,7 +11,7 @@ use iroh::{
 use iroh_dns::pkarr::SignedPacket;
 use url::Url;
 
-const RECORD_NAME: &str = "_pitopi";
+const RECORD_NAME: &str = "_rayfish";
 const RECORD_VERSION: &str = "v1";
 const RECORD_TTL: u32 = 300;
 const PKARR_RELAY_URL: &str = "https://dns.iroh.link/pkarr";
@@ -147,7 +147,7 @@ mod tests {
         let key = SecretKey::generate();
         let hash = blake3::hash(b"test");
         let packet = encode_network_record(&key, &hash, &[]).unwrap();
-        let records = packet.txt_records("_pitopi");
+        let records = packet.txt_records("_rayfish");
         assert_eq!(records[0], "v1");
     }
 
@@ -155,7 +155,7 @@ mod tests {
     fn decode_rejects_unknown_version() {
         let key = SecretKey::generate();
         let values = vec!["v99".to_string()];
-        let packet = SignedPacket::from_txt_strings(&key, "_pitopi", values, 300).unwrap();
+        let packet = SignedPacket::from_txt_strings(&key, "_rayfish", values, 300).unwrap();
         let result = decode_network_record(&packet);
         assert!(result.is_err());
         assert!(
@@ -180,7 +180,7 @@ mod tests {
         let key = SecretKey::generate();
         let peer = SecretKey::generate().public();
         let values = vec!["v1".to_string(), format!("p,{peer}")];
-        let packet = SignedPacket::from_txt_strings(&key, "_pitopi", values, 300).unwrap();
+        let packet = SignedPacket::from_txt_strings(&key, "_rayfish", values, 300).unwrap();
         let result = decode_network_record(&packet);
         assert!(result.is_err());
         assert!(

@@ -1,4 +1,4 @@
-# Pitopi Roadmap
+# Rayfish Roadmap
 
 **Thesis:** a basic P2P layer that apps build on with zero SDK — resolve a `.pi`
 name, open a socket, done. Unmodified apps work over the mesh. Priority = how directly
@@ -52,19 +52,19 @@ an item serves that socket/DNS surface.
 These are where bulk throughput matters and where the optional WG fast path applies.
 
 - [ ] **Subnet routing**
-  - `pitopi subnet advertise 192.168.1.0/24` — expose a LAN (NAS, printer, home server)
+  - `ray subnet advertise 192.168.1.0/24` — expose a LAN (NAS, printer, home server)
   - Advertising peer is a gateway; routing updates propagated via control messages
   - ACL integration: which peers reach which subnets
 - [ ] **Exit nodes**
-  - `pitopi exit-node enable` / `pitopi exit-node use alice`
+  - `ray exit-node enable` / `ray exit-node use alice`
   - NAT/masquerade outbound on the exit's real interface
   - Route DNS through the exit (leak prevention) + kill switch; IPv6 from day one
   - ACL integration: who can offer / who can use
-- [ ] **File sharing via iroh-blobs**
-  - `pitopi send file.zip alice` — content-addressed, so dedup + resume are free
-  - Lean into directory *sync*, not just one-shot send (the feature people actually want)
+- [x] **File sharing via iroh-blobs**
+  - `ray send file.zip alice` — content-addressed, so dedup + resume are free
+  - TODO: lean into directory *sync*, not just one-shot send (the feature people actually want)
 - [ ] **Split tunneling**
-  - Route only matching traffic: `pitopi route add 10.0.0.0/8`
+  - Route only matching traffic: `ray route add 10.0.0.0/8`
   - Mesh-only vs full-tunnel modes; important for gaming (game on mesh, streaming direct)
 - [ ] **Kernel-WG fast path (NEW — optimization, only when throughput is measured)**
   - Scoped to easy-NAT, own-socket peers: public IP / port-mapped / full-cone / LAN
@@ -85,11 +85,11 @@ These are where bulk throughput matters and where the optional WG fast path appl
 ## Tier 2 — UX / friction reduction
 
 - [ ] **Invite links**
-  - `pitopi://join/<base58>` URI scheme handler, click-to-join anywhere
+  - `rayfish://join/<base58>` URI scheme handler, click-to-join anywhere
   - **Sign them** — unsigned handlers are a forgery/phishing surface
   - Optional expiry + single-use
 - [ ] **Web dashboard**
-  - `pitopi dashboard`, localhost only: topology, connection type, latency, per-peer stats
+  - `ray dashboard`, localhost only: topology, connection type, latency, per-peer stats
   - NAT-type detection, network health; add a Prometheus/OpenMetrics endpoint alongside
 - [ ] **Smart relay routing (fastest-path selection)**
   - Multi-hop when faster than direct; Dijkstra/Bellman-Ford over a latency graph
@@ -121,7 +121,7 @@ Foundational but not blocking the MVP demo. Land before you have users who'd be 
 
 ---
 
-## Tier 5 — Social product (SEPARATE PRODUCT — build ON pitopi, not IN it)
+## Tier 5 — Social product (SEPARATE PRODUCT — build ON rayfish, not IN it)
 
 A different company with a different moat. Build at most one as a demo; defer the rest.
 Discovery is centralized (Slack/Discord identity as trust anchor); once connected it's all P2P.

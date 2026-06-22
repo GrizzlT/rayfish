@@ -6,11 +6,11 @@
 //! read from the TUN device on the outbound side, and QUIC datagrams from peers
 //! on the inbound side — see `forward::run_mesh` / `forward::evaluate_inbound`).
 //!
-//! The pitopi/iroh **control plane** (`Welcome`, `MemberSync`, `BlobUpdated`,
+//! The rayfish/iroh **control plane** (`Welcome`, `MemberSync`, `BlobUpdated`,
 //! `MeshHello`, `ReconnectRequest`, …) travels over QUIC *bidirectional streams*,
 //! not datagrams, and the iroh transport itself runs on the host's real network
 //! interfaces — neither ever enters the TUN device. **The firewall therefore
-//! cannot block pitopi/iroh connections**, regardless of rules. Blocking the VPN
+//! cannot block rayfish/iroh connections**, regardless of rules. Blocking the VPN
 //! transport itself is deliberately impossible from the firewall policy.
 //!
 //! ## Stateful behaviour
@@ -423,7 +423,7 @@ fn extract_tcp_flags(protocol: u8, packet: &[u8], header_len: usize) -> u8 {
 pub fn firewall_path() -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .context("could not determine config directory")?
-        .join("pitopi");
+        .join("rayfish");
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join("firewall.toml"))
 }

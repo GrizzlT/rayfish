@@ -1,7 +1,7 @@
-//! Minimal DNS responder for Magic DNS (.pi TLD).
+//! Minimal DNS responder for Magic DNS (.ray TLD).
 //!
 //! Binds to 127.0.0.1:53 (UDP + TCP) and answers A, AAAA, PTR, and SOA
-//! queries for `*.pi` names. All other queries receive REFUSED.
+//! queries for `*.ray` names. All other queries receive REFUSED.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -237,7 +237,7 @@ async fn handle_query(
         return Some(make_soa_response(&packet, &question.qname));
     }
 
-    // Try resolving: first as .pi name, then as bare <host>.<network>
+    // Try resolving: first as .ray name, then as bare <host>.<network>
     let entry = if is_a || is_aaaa {
         if name_lower.ends_with(&suffix) {
             resolve_name(&name_lower, &suffix, table).await
@@ -258,7 +258,7 @@ async fn handle_query(
         }
     }
 
-    // For .pi names, return NXDOMAIN (A/AAAA) or NODATA (other types)
+    // For .ray names, return NXDOMAIN (A/AAAA) or NODATA (other types)
     if name_lower.ends_with(&suffix) || name_lower == DNS_DOMAIN {
         if is_a || is_aaaa {
             tracing::info!(name = %name_lower, "DNS query NXDOMAIN");
@@ -349,7 +349,7 @@ fn parse_ptr_name(name: &str) -> Option<IpAddr> {
     None
 }
 
-/// Resolve `<hostname>.<network>` (without .pi suffix).
+/// Resolve `<hostname>.<network>` (without .ray suffix).
 /// Used when the OS routes a bare network domain to us via supplemental match.
 async fn resolve_bare_network_name(name: &str, table: &HostnameTable) -> Option<HostnameEntry> {
     let (hostname, network) = name.rsplit_once('.')?;
@@ -361,14 +361,14 @@ pub async fn resolve_name(name: &str, suffix: &str, table: &HostnameTable) -> Op
     let stripped = name.strip_suffix(suffix)?;
     let table_guard = table.read().await;
 
-    // Try <hostname>.<network>.pi
+    // Try <hostname>.<network>.ray
     if let Some((hostname, network)) = stripped.rsplit_once('.')
         && let Some(network_hosts) = table_guard.get(network)
     {
         return network_hosts.get(hostname).copied();
     }
 
-    // Try <hostname>.pi (search all networks, return first match)
+    // Try <hostname>.ray (search all networks, return first match)
     for network_hosts in table_guard.values() {
         if let Some(entry) = network_hosts.get(stripped) {
             return Some(*entry);
@@ -380,8 +380,8 @@ pub async fn resolve_name(name: &str, suffix: &str, table: &HostnameTable) -> Op
 
 fn pi_soa<'a>() -> SOA<'a> {
     SOA {
-        mname: Name::new_unchecked("ns.pi"),
-        rname: Name::new_unchecked("admin.pi"),
+        mname: Name::new_unchecked("ns.ray"),
+        rname: Name::new_unchecked("admin.ray"),
         serial: 1,
         refresh: 3600,
         retry: 600,
@@ -502,7 +502,7 @@ fn make_refused(query: &Packet) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    const SUFFIX: &str = ".pi";
+    const SUFFIX: &str = ".ray";
 
     fn entry(v4: Ipv4Addr) -> HostnameEntry {
         let v6 = Ipv6Addr::new(0x0200, 0, 0, 0, 0, 0, 0, 1);
@@ -518,7 +518,7 @@ mod tests {
             hosts.insert("alice".to_string(), entry(Ipv4Addr::new(100, 64, 10, 5)));
             t.insert("gaming".to_string(), hosts);
         }
-        let result = resolve_name("alice.gaming.pi", SUFFIX, &table).await;
+        let result = resolve_name("alice.gaming.ray", SUFFIX, &table).await;
         assert_eq!(
             result.map(|(v4, _)| v4),
             Some(Ipv4Addr::new(100, 64, 10, 5))
@@ -534,7 +534,7 @@ mod tests {
             hosts.insert("bob".to_string(), entry(Ipv4Addr::new(100, 64, 20, 3)));
             t.insert("work".to_string(), hosts);
         }
-        let result = resolve_name("bob.pi", SUFFIX, &table).await;
+        let result = resolve_name("bob.ray", SUFFIX, &table).await;
         assert_eq!(
             result.map(|(v4, _)| v4),
             Some(Ipv4Addr::new(100, 64, 20, 3))
@@ -544,7 +544,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_unknown() {
         let table = new_hostname_table();
-        let result = resolve_name("nobody.pi", SUFFIX, &table).await;
+        let result = resolve_name("nobody.ray", SUFFIX, &table).await;
         assert_eq!(result, None);
     }
 
@@ -581,7 +581,7 @@ mod tests {
         update_hostname(&table, &reverse, "gaming", "alice", v4, v6).await;
 
         // Forward lookup works
-        let result = resolve_name("alice.gaming.pi", SUFFIX, &table).await;
+        let result = resolve_name("alice.gaming.ray", SUFFIX, &table).await;
         assert_eq!(result, Some((v4, v6)));
 
         // Reverse lookup works
@@ -601,7 +601,7 @@ mod tests {
         update_hostname(&table, &reverse, "gaming", "alice", v4, v6).await;
         remove_hostname(&table, &reverse, "gaming", "alice").await;
 
-        assert_eq!(resolve_name("alice.gaming.pi", SUFFIX, &table).await, None);
+        assert_eq!(resolve_name("alice.gaming.ray", SUFFIX, &table).await, None);
         assert!(reverse.get(&IpAddr::V4(v4)).is_none());
         assert!(reverse.get(&IpAddr::V6(v6)).is_none());
     }

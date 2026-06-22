@@ -1,4 +1,4 @@
-//! Persistent Ed25519 identity stored at `~/.config/pitopi/secret_key`.
+//! Persistent Ed25519 identity stored at `~/.config/rayfish/secret_key`.
 //!
 //! The same keypair is used across restarts, giving each node a stable
 //! [`EndpointId`](iroh::EndpointId) and deterministic virtual IP.
@@ -13,7 +13,7 @@ use crate::control::DeviceCert;
 fn config_dir() -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .context("could not determine config directory")?
-        .join("pitopi");
+        .join("rayfish");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

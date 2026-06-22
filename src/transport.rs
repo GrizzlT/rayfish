@@ -1,6 +1,6 @@
 //! iroh endpoint setup and peer connection management.
 //!
-//! Each network gets its own ALPN (`pitopi/net/<name>`) for isolation.
+//! Each network gets its own ALPN (`rayfish/net/<name>`) for isolation.
 //! A single shared iroh [`Endpoint`] handles all networks, filtering by ALPN on accept.
 
 use anyhow::{Context, Result};
@@ -10,12 +10,12 @@ use iroh::{
 #[cfg(feature = "tor")]
 use std::sync::Arc;
 
-pub const FILES_ALPN: &[u8] = b"pitopi/files/1";
+pub const FILES_ALPN: &[u8] = b"rayfish/files/1";
 
 pub fn network_alpn(network_pubkey: &EndpointId) -> Vec<u8> {
     let full = network_pubkey.to_string();
     let prefix = &full[..full.len().min(16)];
-    format!("pitopi/net/{prefix}").into_bytes()
+    format!("rayfish/net/{prefix}").into_bytes()
 }
 
 /// Creates an iroh endpoint with the N0 preset (NAT traversal + relay fallback).
@@ -106,7 +106,7 @@ mod tests {
         let key = SecretKey::generate().public();
         let alpn = network_alpn(&key);
         let key_str = key.to_string();
-        let expected = format!("pitopi/net/{}", &key_str[..16]);
+        let expected = format!("rayfish/net/{}", &key_str[..16]);
         assert_eq!(alpn, expected.as_bytes());
     }
 }

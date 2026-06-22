@@ -55,7 +55,7 @@ pub fn check_cgnat_conflict() -> Result<()> {
                 bail!(
                     "interface {} already has CGNAT address {} — another VPN \
                      (e.g. Tailscale) is using the 100.64.0.0/10 range. \
-                     Disable it before starting pitopi.",
+                     Disable it before starting rayfish.",
                     current_iface,
                     ip
                 );

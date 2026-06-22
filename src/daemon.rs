@@ -41,7 +41,7 @@ use crate::tun::{self, check_cgnat_conflict};
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
-const PAIR_ALPN: &[u8] = b"pitopi/pair/1";
+const PAIR_ALPN: &[u8] = b"rayfish/pair/1";
 
 struct CoordinatorAcceptState {
     endpoint: Endpoint,
@@ -2245,7 +2245,7 @@ impl DaemonState {
     fn acl_file_path(&self, network: &str) -> std::path::PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("pitopi")
+            .join("rayfish")
             .join("acl")
             .join(format!("{network}.acl"))
     }
@@ -3030,7 +3030,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
     let blobs_dir = dirs::config_dir()
         .context("no config directory")?
-        .join("pitopi")
+        .join("rayfish")
         .join("blobs");
     std::fs::create_dir_all(&blobs_dir)?;
     let blob_store = FsStore::load(&blobs_dir)
@@ -3077,11 +3077,11 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
         }
     });
 
-    // Configure system DNS to route .pi queries to 127.0.0.1
+    // Configure system DNS to route .ray queries to 127.0.0.1
     dns_config::restore_stale_backups();
     let dns_configurator = match dns_config::detect_and_configure(&tun_name) {
         Ok(c) => {
-            tracing::info!(backend = c.name(), "system DNS configured for .pitopi");
+            tracing::info!(backend = c.name(), "system DNS configured for .rayfish");
             Some(c)
         }
         Err(e) => {
@@ -3094,14 +3094,14 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     let mdns_enabled = app_config.mdns_enabled;
     if mdns_enabled {
         match iroh_mdns_address_lookup::MdnsAddressLookup::builder()
-            .service_name("pitopi")
+            .service_name("rayfish")
             .advertise(true)
             .build(ep.id())
         {
             Ok(mdns) => {
                 if let Ok(lookups) = ep.address_lookup() {
                     lookups.add(mdns.clone());
-                    tracing::info!("mDNS discovery enabled (advertising _pitopi._udp.local)");
+                    tracing::info!("mDNS discovery enabled (advertising _rayfish._udp.local)");
                     let mdns_token = token.clone();
                     tokio::spawn(async move {
                         use futures::StreamExt;
@@ -3171,7 +3171,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
     // Accept loop — dispatches connections via ProtocolHandler by ALPN
     protocol_router.spawn_accept_loop(daemon.endpoint.clone(), token.clone());
 
-    // Metrics registry: pitopi counters + per-peer gauges + iroh endpoint metrics
+    // Metrics registry: rayfish counters + per-peer gauges + iroh endpoint metrics
     let mut registry = iroh_metrics::Registry::default();
     registry.register(stats.clone());
     let peer_metrics = Arc::new(crate::stats::PeerMetrics::default());
@@ -3306,16 +3306,16 @@ fn set_socket_group_permissions(path: &std::path::Path) {
         return;
     }
 
-    let group_name = CString::new("pitopi").unwrap();
+    let group_name = CString::new("rayfish").unwrap();
     let grp = unsafe { libc::getgrnam(group_name.as_ptr()) };
     if grp.is_null() {
-        tracing::warn!("group 'pitopi' not found — socket only accessible by root");
+        tracing::warn!("group 'rayfish' not found — socket only accessible by root");
         return;
     }
     let gid = unsafe { (*grp).gr_gid };
     unsafe { libc::chown(c_path.as_ptr(), 0, gid) };
     unsafe { libc::chmod(c_path.as_ptr(), 0o660) };
-    tracing::info!("socket owned by root:pitopi (0660)");
+    tracing::info!("socket owned by root:rayfish (0660)");
 }
 
 async fn handle_ipc_client(stream: UnixStream, daemon: &DaemonState) -> Result<()> {

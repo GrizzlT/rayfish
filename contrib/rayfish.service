@@ -1,11 +1,11 @@
 [Unit]
-Description=pitopi P2P mesh VPN
+Description=rayfish P2P mesh VPN
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pitopi daemon
+ExecStart=/usr/local/bin/ray daemon
 Restart=on-failure
 RestartSec=5
 

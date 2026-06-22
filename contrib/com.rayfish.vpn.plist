@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.pitopi.vpn</string>
+    <string>com.rayfish.vpn</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/pitopi</string>
+        <string>/usr/local/bin/ray</string>
         <string>daemon</string>
     </array>
     <key>RunAtLoad</key>
@@ -14,8 +14,8 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/var/log/pitopi.log</string>
+    <string>/var/log/rayfish.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/pitopi.log</string>
+    <string>/var/log/rayfish.log</string>
 </dict>
 </plist>

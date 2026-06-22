@@ -3272,53 +3272,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pitopi"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "argon2",
- "blake3",
- "bs58",
- "bytes",
- "chacha20poly1305",
- "clap",
- "clap_complete",
- "core-foundation 0.9.4",
- "dashmap",
- "derive_more 2.1.1",
- "dirs",
- "futures",
- "hex",
- "humansize",
- "iroh",
- "iroh-blobs",
- "iroh-dns",
- "iroh-mdns-address-lookup",
- "iroh-metrics",
- "iroh-tor-transport",
- "libc",
- "mime_guess",
- "qr2term",
- "rand 0.10.1",
- "rmp-serde",
- "rpassword",
- "serde",
- "serde_json",
- "simple-dns 0.9.3",
- "smol_str 0.3.6",
- "system-configuration",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "tun",
- "url",
- "zbus",
-]
-
-[[package]]
 name = "pkcs8"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3684,6 +3637,53 @@ dependencies = [
  "ref-cast",
  "serde",
  "smallvec",
+]
+
+[[package]]
+name = "rayfish"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "argon2",
+ "blake3",
+ "bs58",
+ "bytes",
+ "chacha20poly1305",
+ "clap",
+ "clap_complete",
+ "core-foundation 0.9.4",
+ "dashmap",
+ "derive_more 2.1.1",
+ "dirs",
+ "futures",
+ "hex",
+ "humansize",
+ "iroh",
+ "iroh-blobs",
+ "iroh-dns",
+ "iroh-mdns-address-lookup",
+ "iroh-metrics",
+ "iroh-tor-transport",
+ "libc",
+ "mime_guess",
+ "qr2term",
+ "rand 0.10.1",
+ "rmp-serde",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "simple-dns 0.9.3",
+ "smol_str 0.3.6",
+ "system-configuration",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "tun",
+ "url",
+ "zbus",
 ]
 
 [[package]]

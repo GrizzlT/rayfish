@@ -40,7 +40,7 @@ impl DeviceCert {
     }
 }
 
-/// Messages for the device pairing protocol (ALPN `pitopi/pair/1`).
+/// Messages for the device pairing protocol (ALPN `rayfish/pair/1`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PairMsg {
     Request {

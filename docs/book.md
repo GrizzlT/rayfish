@@ -1,6 +1,6 @@
-# The Pitopi Book
+# The Rayfish Book
 
-A complete guide to pitopi's architecture, protocols, and internals.
+A complete guide to rayfish's architecture, protocols, and internals.
 
 ---
 
@@ -35,9 +35,9 @@ A complete guide to pitopi's architecture, protocols, and internals.
 
 ## 1. Introduction
 
-Pitopi is a peer-to-peer mesh VPN that creates private virtual networks without any centralized infrastructure. It is built on top of [iroh](https://iroh.computer), a library that provides encrypted QUIC-based peer-to-peer connectivity with automatic NAT traversal, hole-punching, and relay fallback.
+Rayfish is a peer-to-peer mesh VPN that creates private virtual networks without any centralized infrastructure. It is built on top of [iroh](https://iroh.computer), a library that provides encrypted QUIC-based peer-to-peer connectivity with automatic NAT traversal, hole-punching, and relay fallback.
 
-The core idea is simple: every peer gets a virtual IP address derived from their cryptographic identity. When an application on your machine sends a packet to that virtual IP, pitopi captures it through a TUN device, looks up which peer owns that IP, and tunnels the packet over an encrypted QUIC connection to the right machine. To the application, it looks like all peers are on the same local network.
+The core idea is simple: every peer gets a virtual IP address derived from their cryptographic identity. When an application on your machine sends a packet to that virtual IP, rayfish captures it through a TUN device, looks up which peer owns that IP, and tunnels the packet over an encrypted QUIC connection to the right machine. To the application, it looks like all peers are on the same local network.
 
 ### The data path
 
@@ -48,7 +48,7 @@ Application (e.g., Minecraft)
 TUN device (100.64.x.x / 200::x)
     |
     v
-pitopi forwarding loop
+rayfish forwarding loop
     |  reads IPv4/IPv6 packets from TUN
     |  checks version nibble (4 or 6)
     |  extracts destination IP from header
@@ -57,18 +57,18 @@ pitopi forwarding loop
 iroh QUIC datagram
     |  encrypted, NAT-traversed
     v
-Remote peer's pitopi
+Remote peer's rayfish
     |  receives datagram
     |  writes packet to local TUN device
     v
 Remote application
 ```
 
-Pitopi uses QUIC datagrams (not streams) for data packets. Datagrams are unreliable and unordered -- just like UDP -- which means low latency and no head-of-line blocking. This makes pitopi well-suited for real-time applications like games.
+Rayfish uses QUIC datagrams (not streams) for data packets. Datagrams are unreliable and unordered -- just like UDP -- which means low latency and no head-of-line blocking. This makes rayfish well-suited for real-time applications like games.
 
 ### Address space
 
-Pitopi is dual-stack: every peer gets both an IPv4 and an IPv6 address, each derived deterministically from their cryptographic identity.
+Rayfish is dual-stack: every peer gets both an IPv4 and an IPv6 address, each derived deterministically from their cryptographic identity.
 
 **IPv4 — `100.64.0.0/10`:** The IANA-assigned Carrier-Grade NAT (CGNAT) block. This range is reserved for internal use by ISPs and is extremely unlikely to collide with any real network your machine participates in. The /10 prefix gives 22 bits of host address space (roughly 4 million unique addresses), derived via FNV-1a hash of the peer's identity.
 
@@ -76,7 +76,7 @@ Pitopi is dual-stack: every peer gets both an IPv4 and an IPv6 address, each der
 
 ### Why not WireGuard?
 
-WireGuard is excellent for static, pre-configured tunnels between known endpoints. Pitopi solves a different problem: you don't know your peers' IP addresses, you don't want to configure port forwarding, and you want peers to find each other by cryptographic identity alone. iroh handles the hard part -- discovering peers through relay servers, punching through NATs, and falling back to relayed connections when direct paths aren't possible.
+WireGuard is excellent for static, pre-configured tunnels between known endpoints. Rayfish solves a different problem: you don't know your peers' IP addresses, you don't want to configure port forwarding, and you want peers to find each other by cryptographic identity alone. iroh handles the hard part -- discovering peers through relay servers, punching through NATs, and falling back to relayed connections when direct paths aren't possible.
 
 ### Network topology
 
@@ -103,7 +103,7 @@ Your device sits at the center of all your networks. Each network is a full-mesh
   '--------------------------------------' '-------------------------------------'
 ```
 
-One pitopi process, one TUN device, one routing table -- shared across all your networks.
+One rayfish process, one TUN device, one routing table -- shared across all your networks.
 
 ### Enterprise use case
 
@@ -146,13 +146,13 @@ The coordinator creates a network and gets a join code (the network's public key
                                          |                         |
                                          '-------------------------'
 
-  1.  User creates network:    pitopi create
+  1.  User creates network:    ray create
       --> prints network name: gentle-amber-fox
       --> prints join code: <public-key-string>
 
   2.  User shares join code with Friend 1 (chat, email, etc.)
 
-  3.  Friend 1 joins:          pitopi join <public-key> --name gaming
+  3.  Friend 1 joins:          ray join <public-key> --name gaming
       --> daemon resolves pkarr record via public key
       --> fetches GroupBlob from online seed peers via iroh-blobs
       --> coordinator approves (or peer welcomes if already approved)
@@ -227,25 +227,25 @@ Requires Rust 2024 edition.
 Before using any network commands, start the daemon:
 
 ```bash
-sudo pitopi daemon
+sudo ray daemon
 ```
 
-The daemon is a long-lived process that owns the iroh endpoint, TUN device, and all peer connections. It listens for commands on a Unix socket at `/var/run/pitopi/pitopi.sock`. On startup, it restores all previously saved networks from config.
+The daemon is a long-lived process that owns the iroh endpoint, TUN device, and all peer connections. It listens for commands on a Unix socket at `/var/run/rayfish/rayfish.sock`. On startup, it restores all previously saved networks from config.
 
-`pitopi up` is an alias for `pitopi daemon`.
+`ray up` is an alias for `ray daemon`.
 
 ### Creating a network
 
 In another terminal, create a network:
 
 ```bash
-pitopi create
+ray create
 ```
 
 Or create with a custom name:
 
 ```bash
-pitopi create --name gaming
+ray create --name gaming
 ```
 
 This produces output like:
@@ -262,7 +262,7 @@ The daemon automatically generates a three-word name (adjective-noun-noun) and p
 Other peers join by providing the three-word name:
 
 ```bash
-pitopi join gentle-amber-fox
+ray join gentle-amber-fox
 ```
 
 The daemon resolves the name via the directory DHT, fetches the current member list from online peers, connects to the coordinator (or any peer), receives approval and a member list, and establishes direct connections to every other peer in the mesh.
@@ -272,7 +272,7 @@ The daemon resolves the name via the directory DHT, fetches the current member l
 To permanently remove a network and announce its removal to all peers:
 
 ```bash
-pitopi nuke gentle-amber-fox
+ray nuke gentle-amber-fox
 ```
 
 This publishes empty membership and seed list records to the DHT (so new joiners know the network no longer exists), then leaves the network. Use `--force` to skip the confirmation prompt.
@@ -282,19 +282,19 @@ This publishes empty membership and seed list records to the DHT (so new joiners
 Once you have networks running, query the daemon for live state:
 
 ```bash
-pitopi status
+ray status
 # > Endpoint: <your-endpoint-id>
-# >   gaming [coordinator] — alice.gaming.pi
+# >   gaming [coordinator] — alice.gaming.ray
 # >     Peers:
-# >       bob.gaming.pi (b3f2)
+# >       bob.gaming.ray (b3f2)
 ```
 
-Peers are shown by DNS name when available (hostname.network.pi), falling back to IP for peers without a hostname.
+Peers are shown by DNS name when available (hostname.network.ray), falling back to IP for peers without a hostname.
 
 ### Leaving a network
 
 ```bash
-pitopi leave gaming
+ray leave gaming
 ```
 
 This tears down all connections for that network, removes peers from the routing table, and deletes it from the saved config.
@@ -302,55 +302,55 @@ This tears down all connections for that network, removes peers from the routing
 ### Shutting down
 
 ```bash
-pitopi down    # signals the daemon to shut down gracefully
+ray down    # signals the daemon to shut down gracefully
 ```
 
 ### Socket permissions
 
-The daemon runs as root and creates the IPC socket at `/var/run/pitopi/pitopi.sock`. By default, only root can connect. To allow unprivileged users to run commands, create a `pitopi` group and add users to it:
+The daemon runs as root and creates the IPC socket at `/var/run/rayfish/rayfish.sock`. By default, only root can connect. To allow unprivileged users to run commands, create a `rayfish` group and add users to it:
 
 ```bash
-sudo groupadd pitopi
-sudo usermod -aG pitopi $USER
-# log out and back in, or: newgrp pitopi
+sudo groupadd rayfish
+sudo usermod -aG rayfish $USER
+# log out and back in, or: newgrp rayfish
 ```
 
-The daemon automatically sets the socket to `root:pitopi` with mode `0660` if the group exists.
+The daemon automatically sets the socket to `root:rayfish` with mode `0660` if the group exists.
 
 ### Why sudo?
 
-TUN devices are virtual network interfaces. Creating them requires root privileges on both Linux and macOS. Only `pitopi daemon` (and its alias `pitopi up`) requires root. All other commands are thin IPC clients that talk to the daemon and run unprivileged.
+TUN devices are virtual network interfaces. Creating them requires root privileges on both Linux and macOS. Only `ray daemon` (and its alias `ray up`) requires root. All other commands are thin IPC clients that talk to the daemon and run unprivileged.
 
 ### All commands
 
 | Command | Description | Needs daemon |
 |---------|-------------|:---:|
-| `sudo pitopi daemon` | Start the daemon (owns TUN + endpoint) | — |
-| `sudo pitopi up` | Alias for `daemon` | — |
-| `pitopi create [--name NAME]` | Create a network (custom or random name + join code) | Yes |
-| `pitopi join KEY [--name ALIAS]` | Join a network by public key | Yes |
-| `pitopi leave NAME` | Leave a network and remove config | Yes |
-| `pitopi nuke NAME [--force]` | Publish empty record to DHT then leave | Yes |
-| `pitopi status` | Show all networks (active + inactive), peers, traffic | No* |
-| `pitopi down` | Shut down the daemon | Yes |
-| `pitopi acl NAME tag TAG PEERS…` | Assign a tag to one or more peers | Yes |
-| `pitopi acl NAME untag TAG PEERS…` | Remove a tag from peers | Yes |
-| `pitopi acl NAME allow SRC DST` | Add an allow rule | Yes |
-| `pitopi acl NAME remove INDEX` | Remove a rule by index | Yes |
-| `pitopi acl NAME show` | Display current ACL state | Yes |
-| `pitopi acl NAME apply` | Re-publish current ACL to all peers | Yes |
-| `pitopi mdns on\|off` | Enable/disable mDNS local peer discovery | No |
-| `pitopi install-service` | Install systemd/launchd service | No |
-| `pitopi uninstall-service` | Remove system service | No |
-| `pitopi completions SHELL` | Generate shell completions | No |
+| `sudo ray daemon` | Start the daemon (owns TUN + endpoint) | — |
+| `sudo ray up` | Alias for `daemon` | — |
+| `ray create [--name NAME]` | Create a network (custom or random name + join code) | Yes |
+| `ray join KEY [--name ALIAS]` | Join a network by public key | Yes |
+| `ray leave NAME` | Leave a network and remove config | Yes |
+| `ray nuke NAME [--force]` | Publish empty record to DHT then leave | Yes |
+| `ray status` | Show all networks (active + inactive), peers, traffic | No* |
+| `ray down` | Shut down the daemon | Yes |
+| `ray acl NAME tag TAG PEERS…` | Assign a tag to one or more peers | Yes |
+| `ray acl NAME untag TAG PEERS…` | Remove a tag from peers | Yes |
+| `ray acl NAME allow SRC DST` | Add an allow rule | Yes |
+| `ray acl NAME remove INDEX` | Remove a rule by index | Yes |
+| `ray acl NAME show` | Display current ACL state | Yes |
+| `ray acl NAME apply` | Re-publish current ACL to all peers | Yes |
+| `ray mdns on\|off` | Enable/disable mDNS local peer discovery | No |
+| `ray install-service` | Install systemd/launchd service | No |
+| `ray uninstall-service` | Remove system service | No |
+| `ray completions SHELL` | Generate shell completions | No |
 
 ### Deploying to servers
 
 ```bash
-just deploy <ip>    # cross-build + install + create pitopi group + start daemon service
+just deploy <ip>    # cross-build + install + create rayfish group + start daemon service
 ```
 
-This handles everything: builds for x86_64 Linux, installs the binary, creates the `pitopi` group, installs a systemd service, and starts the daemon. On subsequent deploys it restarts the service to pick up the new binary.
+This handles everything: builds for x86_64 Linux, installs the binary, creates the `rayfish` group, installs a systemd service, and starts the daemon. On subsequent deploys it restarts the service to pick up the new binary.
 
 ---
 
@@ -358,14 +358,14 @@ This handles everything: builds for x86_64 Linux, installs the binary, creates t
 
 **Module:** `src/identity.rs`
 
-Every pitopi node has a persistent Ed25519 keypair stored at `~/.config/pitopi/secret_key`. This keypair is the node's cryptographic identity -- it determines the node's EndpointId and, by extension, its virtual IP address.
+Every rayfish node has a persistent Ed25519 keypair stored at `~/.config/rayfish/secret_key`. This keypair is the node's cryptographic identity -- it determines the node's EndpointId and, by extension, its virtual IP address.
 
 ### Key generation and persistence
 
-The first time pitopi runs, it generates a random Ed25519 secret key and writes the raw 32 bytes to disk:
+The first time rayfish runs, it generates a random Ed25519 secret key and writes the raw 32 bytes to disk:
 
 ```
-~/.config/pitopi/secret_key  (32 bytes, binary)
+~/.config/rayfish/secret_key  (32 bytes, binary)
 ```
 
 On subsequent runs, it loads the existing key. This means a node always has the same EndpointId and the same virtual IP across restarts, reboots, and even machine migrations (as long as you copy the key file).
@@ -389,11 +389,11 @@ The secret key never leaves the machine. All authentication happens at the QUIC 
 
 **Module:** `src/membership.rs`
 
-The membership module is the heart of pitopi's identity and authorization system. It defines how peers are identified, how their IP addresses are assigned, and who is allowed to join a network.
+The membership module is the heart of rayfish's identity and authorization system. It defines how peers are identified, how their IP addresses are assigned, and who is allowed to join a network.
 
 ### Identity-derived IP addresses
 
-Rather than assigning IPs sequentially (first joiner gets .2, second gets .3), pitopi derives each peer's addresses deterministically from their cryptographic identity.
+Rather than assigning IPs sequentially (first joiner gets .2, second gets .3), rayfish derives each peer's addresses deterministically from their cryptographic identity.
 
 #### IPv4 derivation (FNV-1a)
 
@@ -423,7 +423,7 @@ The key property: **a peer always gets the same IPv4 and IPv6 addresses, in ever
 
 #### Collision handling
 
-With 22 bits of address space and a hash function, collisions are possible. The birthday problem gives roughly a 50% collision probability around 2,000 peers. For pitopi's target use case (small groups of friends or coworkers), this is extremely unlikely, but the system handles it gracefully at two levels:
+With 22 bits of address space and a hash function, collisions are possible. The birthday problem gives roughly a 50% collision probability around 2,000 peers. For rayfish's target use case (small groups of friends or coworkers), this is extremely unlikely, but the system handles it gracefully at two levels:
 
 1. **Coordinator-side check:** Before broadcasting a `MemberApproved` message, the coordinator checks the derived IP against both the member list and the approved list. If a collision is found with a different identity, the peer receives a `JoinDenied` with the reason "IP collision" and the approval is never broadcast.
 
@@ -540,7 +540,7 @@ Networks can operate in one of two membership modes:
 The mode is selected at network creation:
 
 ```bash
-sudo pitopi create --name gaming --mode open
+sudo ray create --name gaming --mode open
 ```
 
 ### The MembershipPolicy trait
@@ -587,19 +587,19 @@ The endpoint is created with:
 
 ### ALPN-based network isolation
 
-Each pitopi network gets its own ALPN (Application-Layer Protocol Negotiation) string:
+Each rayfish network gets its own ALPN (Application-Layer Protocol Negotiation) string:
 
 ```
-pitopi/net/<pubkey-prefix>
+rayfish/net/<pubkey-prefix>
 ```
 
-The ALPN uses the first 16 hex characters of the network's public key. For example, `pitopi/net/aa8bc368fec8c227`. When a connection arrives, pitopi checks the ALPN to determine which network it belongs to and routes it accordingly. Since the ALPN is derived from the public key (which all peers share via the join code), it matches regardless of local aliases.
+The ALPN uses the first 16 hex characters of the network's public key. For example, `rayfish/net/aa8bc368fec8c227`. When a connection arrives, rayfish checks the ALPN to determine which network it belongs to and routes it accordingly. Since the ALPN is derived from the public key (which all peers share via the join code), it matches regardless of local aliases.
 
 This allows a single iroh endpoint to participate in multiple networks without interference. Connection attempts for one network are invisible to another.
 
 ### Connection model
 
-Pitopi uses two types of QUIC channels:
+Rayfish uses two types of QUIC channels:
 
 1. **Bidirectional streams** -- for control messages (join requests, member syncs, mesh hellos). These are reliable and ordered, suitable for the structured JSON messages that coordinate membership.
 
@@ -614,11 +614,11 @@ iroh handles NAT traversal automatically. The typical flow:
 3. iroh attempts direct UDP hole-punching between the two peers.
 4. If direct connection fails (about 10% of cases), traffic flows through the relay server, still fully encrypted end-to-end.
 
-This means pitopi works without any port forwarding, dynamic DNS, or firewall configuration.
+This means rayfish works without any port forwarding, dynamic DNS, or firewall configuration.
 
 ### Tor transport
 
-Pitopi supports routing traffic through the Tor network for IP-level anonymity. This is an optional feature enabled at build time with `--features tor` and at runtime with the `--tor` flag on `create` or `join`.
+Rayfish supports routing traffic through the Tor network for IP-level anonymity. This is an optional feature enabled at build time with `--features tor` and at runtime with the `--tor` flag on `create` or `join`.
 
 When Tor is enabled, the daemon:
 1. Connects to a local Tor daemon via the control port (9051)
@@ -633,8 +633,8 @@ The Tor onion address is derived deterministically from the iroh identity — no
 
 **Usage:**
 ```bash
-pitopi create --tor --hostname alice
-pitopi join <key> --tor --hostname bob
+ray create --tor --hostname alice
+ray join <key> --tor --hostname bob
 ```
 
 The `--tor` preference is saved per-network in `networks.toml`. On daemon restart, if any saved network uses Tor, the Tor transport is automatically enabled.
@@ -817,7 +817,7 @@ A TUN (network TUNnel) device is a virtual network interface that operates at th
 
 ### Creation
 
-The `create(v4, v6)` function takes both the peer's IPv4 and IPv6 addresses and returns `(TunReader, TunWriter, tun_name)`. Pitopi creates a TUN device with:
+The `create(v4, v6)` function takes both the peer's IPv4 and IPv6 addresses and returns `(TunReader, TunWriter, tun_name)`. Rayfish creates a TUN device with:
 
 - **IPv4 address:** the peer's identity-derived IP (e.g., `100.64.23.142`)
 - **Gateway/destination:** `100.64.0.1` (fixed for point-to-point interface on macOS)
@@ -864,7 +864,7 @@ This split/sink pattern is critical for performance — sharing an I/O device be
 
 ### Single TUN architecture
 
-Pitopi uses a single TUN device per node, shared across all networks. Since all networks use the flat `100.64.0.0/10` address space and each peer has a globally unique identity-derived IP, there is no address conflict between networks. Packets are demultiplexed by looking up the destination IP in a shared routing table.
+Rayfish uses a single TUN device per node, shared across all networks. Since all networks use the flat `100.64.0.0/10` address space and each peer has a globally unique identity-derived IP, there is no address conflict between networks. Packets are demultiplexed by looking up the destination IP in a shared routing table.
 
 ---
 
@@ -872,7 +872,7 @@ Pitopi uses a single TUN device per node, shared across all networks. Since all 
 
 **Module:** `src/forward.rs`
 
-The forwarding module is the data plane of pitopi. It moves packets between the TUN device and peer QUIC connections.
+The forwarding module is the data plane of rayfish. It moves packets between the TUN device and peer QUIC connections.
 
 ### Architecture
 
@@ -1008,7 +1008,7 @@ In the `cmd_up` path (connecting to all saved networks), a single `PeerTable` is
 
 **Module:** `src/config.rs`
 
-Pitopi persists network memberships to `~/.config/pitopi/networks.toml` so that networks survive restarts. The `pitopi up` command reads this file to reconnect to all saved networks.
+Rayfish persists network memberships to `~/.config/rayfish/networks.toml` so that networks survive restarts. The `ray up` command reads this file to reconnect to all saved networks.
 
 ### File format
 
@@ -1104,7 +1104,7 @@ Config is written at several points:
 1. **Create:** when the coordinator creates a network (saves self as the only member, empty approved list).
 2. **Join:** when a peer receives `Welcome` or `MemberSync` (saves both the member list and approved list).
 3. **Accept loop:** when the coordinator approves a new peer or promotes an approved peer to member.
-4. **Leave:** when the user runs `pitopi leave` (removes the network entry).
+4. **Leave:** when the user runs `ray leave` (removes the network entry).
 
 ---
 
@@ -1112,7 +1112,7 @@ Config is written at several points:
 
 **Module:** `src/network_name.rs`
 
-EndpointIds are 32-byte binary values, far too unwieldy to share with friends. Pitopi solves this with randomly generated three-word names in the format `adjective-noun-noun` (e.g., `gentle-amber-fox`). These names are memorable, speakable, and easy to share over chat or voice.
+EndpointIds are 32-byte binary values, far too unwieldy to share with friends. Rayfish solves this with randomly generated three-word names in the format `adjective-noun-noun` (e.g., `gentle-amber-fox`). These names are memorable, speakable, and easy to share over chat or voice.
 
 ### Generation
 
@@ -1129,15 +1129,15 @@ The word lists are embedded at compile time. The combination space is large enou
 
 ### Validation
 
-`is_valid_name(s: &str) -> bool` checks that a string matches the three-word format (all lowercase, hyphen-separated, each word from the known lists). This is used to validate user input on `pitopi join`.
+`is_valid_name(s: &str) -> bool` checks that a string matches the three-word format (all lowercase, hyphen-separated, each word from the known lists). This is used to validate user input on `ray join`.
 
 ### Names as local aliases
 
 Three-word names are now optional local aliases. The primary identifier for a network is its per-network public key (the join code). Names are generated at create time for human convenience and can be assigned on join with `--name`:
 
 ```bash
-pitopi create                          # generates name + prints public key as join code
-pitopi join <public-key> --name gaming # assigns "gaming" as a local alias
+ray create                          # generates name + prints public key as join code
+ray join <public-key> --name gaming # assigns "gaming" as a local alias
 ```
 
 The join code is the network's public key string — only the coordinator (holder of the corresponding secret key) can publish records for this network, preventing MITM attacks.
@@ -1148,7 +1148,7 @@ The join code is the network's public key string — only the coordinator (holde
 
 **Module:** `src/acl.rs`
 
-Pitopi supports distributed, identity/tag-based ACLs. The coordinator manages allow rules that are published to all peers and enforced at the packet forwarding layer.
+Rayfish supports distributed, identity/tag-based ACLs. The coordinator manages allow rules that are published to all peers and enforced at the packet forwarding layer.
 
 ### Policy model
 
@@ -1170,10 +1170,10 @@ Control traffic (QUIC streams for membership, mesh hello, etc.) is always exempt
 Tags are named labels that group peers. They enable group-based rules without listing individual endpoint IDs:
 
 ```
-pitopi acl gentle-amber-fox tag servers ab3f... d92c...
+ray acl gentle-amber-fox tag servers ab3f... d92c...
 # assigns the "servers" tag to two peers
 
-pitopi acl gentle-amber-fox allow servers servers
+ray acl gentle-amber-fox allow servers servers
 # allow all tagged servers to reach each other
 ```
 
@@ -1188,28 +1188,28 @@ All ACL commands are scoped to a network. Only the coordinator should modify ACL
 
 ```bash
 # Assign tags to peers (by endpoint ID prefix)
-pitopi acl gentle-amber-fox tag servers ab3f... d92c...
+ray acl gentle-amber-fox tag servers ab3f... d92c...
 
 # Remove a tag from peers
-pitopi acl gentle-amber-fox untag servers ab3f...
+ray acl gentle-amber-fox untag servers ab3f...
 
 # Add an allow rule: src dst
-pitopi acl gentle-amber-fox allow servers servers
-pitopi acl gentle-amber-fox allow all servers
+ray acl gentle-amber-fox allow servers servers
+ray acl gentle-amber-fox allow all servers
 
 # Remove a rule by index (shown in 'show' output)
-pitopi acl gentle-amber-fox remove 0
+ray acl gentle-amber-fox remove 0
 
 # Show current ACL state
-pitopi acl gentle-amber-fox show
+ray acl gentle-amber-fox show
 
 # Re-publish the current ACL to all peers (force push)
-pitopi acl gentle-amber-fox apply
+ray acl gentle-amber-fox apply
 ```
 
 ### File format
 
-ACLs are persisted to `~/.config/pitopi/acl/<network>.acl` as a plain-text file:
+ACLs are persisted to `~/.config/rayfish/acl/<network>.acl` as a plain-text file:
 
 ```
 tag servers ab3f1234... d92c5678...
@@ -1261,13 +1261,13 @@ pub enum AclTarget {
 
 ```bash
 # Tag all game servers
-pitopi acl gaming tag servers server1... server2... server3...
+ray acl gaming tag servers server1... server2... server3...
 
 # Allow all members to reach servers
-pitopi acl gaming allow all servers
+ray acl gaming allow all servers
 
 # Allow servers to reach each other (for replication)
-pitopi acl gaming allow servers servers
+ray acl gaming allow servers servers
 
 # Result: regular members cannot reach each other directly —
 # all traffic must go through a server
@@ -1278,7 +1278,7 @@ pitopi acl gaming allow servers servers
 When referencing peers in ACL or firewall commands, you can use the literal `self` to refer to the local device's EndpointId. This is convenient when tagging your own device:
 
 ```bash
-pitopi acl gaming tag servers self
+ray acl gaming tag servers self
 ```
 
 ---
@@ -1330,24 +1330,24 @@ The `SharedFirewall` wraps an `Arc<ArcSwap<FirewallConfig>>` for lock-free reads
 
 ```bash
 # Show current rules and default policy
-pitopi firewall show
+ray firewall show
 
 # Set default policy
-pitopi firewall default deny
+ray firewall default deny
 
 # Add rules (direction action [options])
-pitopi firewall add in allow --proto tcp --port 443
-pitopi firewall add in allow --peer ab3f
-pitopi firewall add out deny --proto any --peer e71a
-pitopi firewall add in deny
+ray firewall add in allow --proto tcp --port 443
+ray firewall add in allow --peer ab3f
+ray firewall add out deny --proto any --peer e71a
+ray firewall add in deny
 
 # Remove a rule by index
-pitopi firewall remove 2
+ray firewall remove 2
 ```
 
 ### Persistence
 
-Firewall rules are stored in `~/.config/pitopi/firewall.toml`:
+Firewall rules are stored in `~/.config/rayfish/firewall.toml`:
 
 ```toml
 default_action = "allow"
@@ -1366,16 +1366,16 @@ The file is loaded at daemon startup and saved on every rule change.
 
 ```bash
 # Deny all inbound by default
-pitopi firewall default deny
+ray firewall default deny
 
 # Allow SSH from a trusted admin peer
-pitopi firewall add in allow --proto tcp --port 22 --peer ab3f
+ray firewall add in allow --proto tcp --port 22 --peer ab3f
 
 # Allow HTTPS from anyone
-pitopi firewall add in allow --proto tcp --port 443
+ray firewall add in allow --proto tcp --port 443
 
 # Allow all outbound
-pitopi firewall add out allow
+ray firewall add out allow
 ```
 
 ---
@@ -1384,24 +1384,24 @@ pitopi firewall add out allow
 
 **Modules:** `src/daemon.rs` (IPC handlers, PendingFile queue), `src/control.rs` (FileOffer message), `src/transport.rs` (FILES_ALPN)
 
-Pitopi includes peer-to-peer file sharing over the mesh. Files are content-addressed via blake3 and transferred using iroh-blobs — no cloud storage, no size limits.
+Rayfish includes peer-to-peer file sharing over the mesh. Files are content-addressed via blake3 and transferred using iroh-blobs — no cloud storage, no size limits.
 
 ### Sending a file
 
 ```bash
-pitopi send photo.jpg alice
+ray send photo.jpg alice
 ```
 
-The sender reads the file, adds it to the local iroh-blobs store, resolves the peer (by hostname or short ID across all networks), connects via the dedicated `pitopi/files/1` ALPN, and sends a `FileOffer` control message containing the filename, size, MIME type (detected via `mime_guess`), and blake3 hash.
+The sender reads the file, adds it to the local iroh-blobs store, resolves the peer (by hostname or short ID across all networks), connects via the dedicated `rayfish/files/1` ALPN, and sends a `FileOffer` control message containing the filename, size, MIME type (detected via `mime_guess`), and blake3 hash.
 
 ### Receiving files
 
 The daemon's ProtocolRouter accept loop matches the FILES_ALPN and queues incoming offers as `PendingFile` entries with auto-incrementing IDs:
 
 ```bash
-pitopi files                         # list pending offers
-pitopi files accept 0                # accept, saves to ~/Downloads
-pitopi files accept 0 --output .     # accept to specific directory
+ray files                         # list pending offers
+ray files accept 0                # accept, saves to ~/Downloads
+ray files accept 0 --output .     # accept to specific directory
 ```
 
 ### Accept flow
@@ -1410,7 +1410,7 @@ On accept, the daemon connects to the sender via iroh-blobs ALPN (`/iroh-bytes/4
 
 ### Wire protocol
 
-File offers use a dedicated ALPN (`pitopi/files/1`) separate from mesh traffic. The sender opens a bidirectional QUIC stream and sends a single `FileOffer` control message (length-prefixed msgpack). The receiver validates that the `from` field matches the connection's remote identity.
+File offers use a dedicated ALPN (`rayfish/files/1`) separate from mesh traffic. The sender opens a bidirectional QUIC stream and sends a single `FileOffer` control message (length-prefixed msgpack). The receiver validates that the `from` field matches the connection's remote identity.
 
 ---
 
@@ -1422,27 +1422,27 @@ Magic DNS lets you reach peers by name instead of IP. Every peer gets a hostname
 
 ### Resolution scheme
 
-Names resolve under the `.pi` TLD:
+Names resolve under the `.ray` TLD:
 
-- **`alice.gaming.pi`** — fully qualified: hostname + network name
-- **`alice.pi`** — flat lookup: searches all active networks, returns first match
+- **`alice.gaming.ray`** — fully qualified: hostname + network name
+- **`alice.ray`** — flat lookup: searches all active networks, returns first match
 
 ### How it works
 
 ```
-App DNS query (e.g., "alice.gaming.pi")
+App DNS query (e.g., "alice.gaming.ray")
     |
     v
 System resolver (macOS SCDynamicStore, Linux systemd-resolved D-Bus, etc.)
-    |  routes only .pi queries to pitopi
+    |  routes only .ray queries to rayfish
     v
-pitopi DNS server (UDP+TCP, 127.0.0.1:53)
+rayfish DNS server (UDP+TCP, 127.0.0.1:53)
     |  looks up HostnameTable + ReverseLookupTable
     v
-A record (100.64.x.x) / AAAA record (200::x) / PTR record (hostname.network.pi)
+A record (100.64.x.x) / AAAA record (200::x) / PTR record (hostname.network.ray)
 ```
 
-The daemon runs a UDP+TCP DNS responder bound to `127.0.0.1:53`. It handles A (IPv4), AAAA (IPv6), PTR (reverse DNS), and SOA queries for `.pi` names. EDNS/OPT is supported (advertises 1232-byte UDP payload size). Unsupported query types on `.pi` names return NODATA (NOERROR with empty answer); queries for non-`.pi` domains return REFUSED. Queries are handled concurrently via `tokio::spawn`. A reverse lookup table (`DashMap<IpAddr, (hostname, network)>`) enables PTR resolution — `dig -x 100.64.x.x` returns `hostname.network.pi`.
+The daemon runs a UDP+TCP DNS responder bound to `127.0.0.1:53`. It handles A (IPv4), AAAA (IPv6), PTR (reverse DNS), and SOA queries for `.ray` names. EDNS/OPT is supported (advertises 1232-byte UDP payload size). Unsupported query types on `.ray` names return NODATA (NOERROR with empty answer); queries for non-`.ray` domains return REFUSED. Queries are handled concurrently via `tokio::spawn`. A reverse lookup table (`DashMap<IpAddr, (hostname, network)>`) enables PTR resolution — `dig -x 100.64.x.x` returns `hostname.network.ray`.
 
 ### Hostname assignment
 
@@ -1450,23 +1450,23 @@ Hostnames are stored in the `Member` struct and propagated via the GroupBlob (th
 
 The `HostnameTable` stores a `HostnameEntry` tuple `(Ipv4Addr, Ipv6Addr)` per hostname, keyed as `network -> hostname -> (v4, v6)`. A companion `ReverseLookupTable` (`DashMap<IpAddr, (hostname, network)>`) is maintained in parallel for PTR queries. Both tables are updated atomically via `dns::update_hostname()`.
 
-Hostnames are persisted in `~/.config/pitopi/networks.toml` (the `my_hostname` field) so they survive daemon restarts. If no hostname is chosen and none was previously assigned, a random one is generated from a word list.
+Hostnames are persisted in `~/.config/rayfish/networks.toml` (the `my_hostname` field) so they survive daemon restarts. If no hostname is chosen and none was previously assigned, a random one is generated from a word list.
 
 If two peers choose the same hostname, collision resolution appends a numeric suffix (e.g., `alice` → `alice2` → `alice3`).
 
 ```bash
-pitopi create --hostname alice       # choose your hostname
-pitopi create                        # random hostname assigned (e.g., "walrus")
-pitopi join <key> --hostname bob     # join with a chosen hostname
+ray create --hostname alice       # choose your hostname
+ray create                        # random hostname assigned (e.g., "walrus")
+ray join <key> --hostname bob     # join with a chosen hostname
 ```
 
 ### System DNS configuration
 
-Pitopi configures the OS to split-route `.pi` queries to its local resolver. The detection chain (modeled on Tailscale's approach):
+Rayfish configures the OS to split-route `.ray` queries to its local resolver. The detection chain (modeled on Tailscale's approach):
 
 | Platform | Method | How |
 |----------|--------|-----|
-| macOS | SCDynamicStore | Writes `State:/Network/Service/pitopi/DNS` via SystemConfiguration framework with `SupplementalMatchDomains` and `SearchDomains` — session keys auto-clean on process exit |
+| macOS | SCDynamicStore | Writes `State:/Network/Service/rayfish/DNS` via SystemConfiguration framework with `SupplementalMatchDomains` and `SearchDomains` — session keys auto-clean on process exit |
 | Linux | systemd-resolved (D-Bus) | `SetLinkDNS` + `SetLinkDomains` via `org.freedesktop.resolve1` (zbus, pure Rust) |
 | Linux | NetworkManager (D-Bus) | Detects NM DNS mode, configures when NM manages DNS directly (dnsmasq/default mode) |
 | Linux | systemd-resolved (CLI) | `resolvectl dns/domain` — fallback when D-Bus is unavailable |
@@ -1475,16 +1475,16 @@ Pitopi configures the OS to split-route `.pi` queries to its local resolver. The
 
 ### Backup and crash recovery
 
-On macOS, SCDynamicStore session keys are automatically removed when the process exits (clean or crash) — no backup files needed. On Linux, before modifying any DNS configuration file, pitopi saves a backup at `<path>.before-pitopi`. On daemon shutdown (clean or SIGTERM), the backup is restored. If the daemon crashes, the next startup detects stale `.before-pitopi` files and restores them before proceeding.
+On macOS, SCDynamicStore session keys are automatically removed when the process exits (clean or crash) — no backup files needed. On Linux, before modifying any DNS configuration file, rayfish saves a backup at `<path>.before-rayfish`. On daemon shutdown (clean or SIGTERM), the backup is restored. If the daemon crashes, the next startup detects stale `.before-rayfish` files and restores them before proceeding.
 
 ### Status display
 
-`pitopi status` shows your hostname and peer hostnames:
+`ray status` shows your hostname and peer hostnames:
 
 ```
 Endpoint: ab3f...
   gentle-amber-fox [coordinator]
-    Hostname: alice.gentle-amber-fox.pi
+    Hostname: alice.gentle-amber-fox.ray
     IP: 100.64.23.142
     Peers:
       100.64.7.201 (d92c...) [bob]
@@ -1496,9 +1496,9 @@ The DNS domain is controlled by `DNS_DOMAIN` in `src/main.rs`. Changing it from 
 
 ### mDNS local peer discovery
 
-Pitopi uses `iroh-mdns-address-lookup` to advertise the daemon's endpoint on the local network via mDNS (service name `_pitopi._udp.local`). When two peers are on the same LAN, iroh automatically uses the mDNS-discovered addresses for direct connections — bypassing relay servers entirely.
+Rayfish uses `iroh-mdns-address-lookup` to advertise the daemon's endpoint on the local network via mDNS (service name `_rayfish._udp.local`). When two peers are on the same LAN, iroh automatically uses the mDNS-discovered addresses for direct connections — bypassing relay servers entirely.
 
-mDNS is enabled by default. The setting is stored as `mdns_enabled` in `~/.config/pitopi/networks.toml` and can be toggled with `pitopi mdns on|off` (requires daemon restart).
+mDNS is enabled by default. The setting is stored as `mdns_enabled` in `~/.config/rayfish/networks.toml` and can be toggled with `ray mdns on|off` (requires daemon restart).
 
 On startup, the daemon builds an `MdnsAddressLookup` instance and registers it with the iroh endpoint's address lookup system. A background task logs `Discovered` and `Expired` events at INFO level. The mDNS subsystem uses its own UDP multicast sockets (via the `swarm-discovery` crate) — it is independent of iroh's transport layer and works alongside relay and Tor transports.
 
@@ -1510,7 +1510,7 @@ No changes are needed in the connect or join flow. iroh queries all registered a
 
 **Module:** `src/audit.rs`
 
-The audit module provides an append-only log of peer connection events at `~/.config/pitopi/audit.log`.
+The audit module provides an append-only log of peer connection events at `~/.config/rayfish/audit.log`.
 
 ### Format
 
@@ -1554,17 +1554,17 @@ audit.log_disconnect(peer_ip, &endpoint_id);
 
 **Module:** `src/stats.rs`
 
-Pitopi uses `iroh-metrics` for Prometheus-compatible metrics collection and export. The `ForwardMetrics` struct is defined with the `#[derive(MetricsGroup)]` macro and registered alongside iroh's own endpoint metrics in a shared `Registry`.
+Rayfish uses `iroh-metrics` for Prometheus-compatible metrics collection and export. The `ForwardMetrics` struct is defined with the `#[derive(MetricsGroup)]` macro and registered alongside iroh's own endpoint metrics in a shared `Registry`.
 
 ### Counters
 
 | Counter | Meaning |
 |---------|---------|
-| `pitopi_packets_rx_total` | Packets received from peers |
-| `pitopi_packets_tx_total` | Packets sent to peers |
-| `pitopi_bytes_rx_total` | Total bytes received |
-| `pitopi_bytes_tx_total` | Total bytes sent |
-| `pitopi_drops_total{reason="..."}` | Dropped packets, labeled by reason |
+| `rayfish_packets_rx_total` | Packets received from peers |
+| `rayfish_packets_tx_total` | Packets sent to peers |
+| `rayfish_bytes_rx_total` | Total bytes received |
+| `rayfish_bytes_tx_total` | Total bytes sent |
+| `rayfish_drops_total{reason="..."}` | Dropped packets, labeled by reason |
 
 Drop reasons: `acl` (network ACL denied), `firewall` (local firewall denied), `send_failure` (QUIC send error), `no_peer` (no route to destination), `malformed` (oversized or non-IPv4/IPv6 packet).
 
@@ -1574,10 +1574,10 @@ A background collector polls iroh connection stats every 60 seconds and exports 
 
 | Metric | Meaning |
 |--------|---------|
-| `pitopi_peer_rtt_us{peer="100.64.x.x"}` | Round-trip time in microseconds |
-| `pitopi_peer_bytes_tx{peer="100.64.x.x"}` | Total bytes sent to peer (from iroh) |
-| `pitopi_peer_bytes_rx{peer="100.64.x.x"}` | Total bytes received from peer (from iroh) |
-| `pitopi_peer_lost_packets{peer="100.64.x.x"}` | Packets lost to peer |
+| `rayfish_peer_rtt_us{peer="100.64.x.x"}` | Round-trip time in microseconds |
+| `rayfish_peer_bytes_tx{peer="100.64.x.x"}` | Total bytes sent to peer (from iroh) |
+| `rayfish_peer_bytes_rx{peer="100.64.x.x"}` | Total bytes received from peer (from iroh) |
+| `rayfish_peer_lost_packets{peer="100.64.x.x"}` | Packets lost to peer |
 
 These values come directly from iroh's QUIC connection stats — no manual counting needed.
 
@@ -1589,7 +1589,7 @@ The daemon starts an HTTP metrics server on port 9090. Scrape it with Prometheus
 curl http://localhost:9090/metrics
 ```
 
-The output includes both pitopi-level metrics (`pitopi_*`) and iroh endpoint metrics (`socket_*`, `net_report_*`) in OpenMetrics text format.
+The output includes both rayfish-level metrics (`rayfish_*`) and iroh endpoint metrics (`socket_*`, `net_report_*`) in OpenMetrics text format.
 
 ### Periodic logging
 
@@ -1601,7 +1601,7 @@ INFO (30s) rx=42 tx=38 bytes_rx=49356 bytes_tx=44100 drops=0
 
 ### CLI status
 
-`pitopi status` shows aggregate traffic stats alongside per-peer connection info:
+`ray status` shows aggregate traffic stats alongside per-peer connection info:
 
 ```
   Traffic: rx:142 tx:138 (98.2 KB)
@@ -1613,7 +1613,7 @@ INFO (30s) rx=42 tx=38 bytes_rx=49356 bytes_tx=44100 drops=0
 
 **Module:** `src/shutdown.rs`
 
-Pitopi uses a `CancellationToken` from `tokio-util` for coordinated shutdown. Every long-running task (forwarding loops, accept loops, peer readers, stats logger) checks this token and exits cleanly when it's cancelled.
+Rayfish uses a `CancellationToken` from `tokio-util` for coordinated shutdown. Every long-running task (forwarding loops, accept loops, peer readers, stats logger) checks this token and exits cleanly when it's cancelled.
 
 ### Signal handling
 
@@ -1649,7 +1649,7 @@ The shutdown is cooperative, not forceful. Each task exits at its next `tokio::s
 
 **Module:** `src/dht.rs`
 
-Pitopi publishes network state to iroh's pkarr relay so that peers can discover each other and fetch membership/ACL data even when the coordinator is offline. A single pkarr record per network contains everything needed to join.
+Rayfish publishes network state to iroh's pkarr relay so that peers can discover each other and fetch membership/ACL data even when the coordinator is offline. A single pkarr record per network contains everything needed to join.
 
 ### Single-record model
 
@@ -1710,7 +1710,7 @@ Publishing errors are logged as warnings and never crash the coordinator or bloc
 
 ### Join resolution
 
-When `pitopi join <public-key>` is run:
+When `ray join <public-key>` is run:
 
 1. **Resolve pkarr:** look up the public key → `(blob_hash, seed_peers)`.
 2. **Blob fetch:** connect to seed peers one by one until one responds. Verify hash, deserialize.
@@ -1733,7 +1733,7 @@ This chapter ties the modules together by walking through the complete lifecycle
 
 ### Creating a network
 
-When a user runs `pitopi create` (optionally with `--mode open`), the CLI sends an `IpcMessage::Create` to the daemon. The daemon:
+When a user runs `ray create` (optionally with `--mode open`), the CLI sends an `IpcMessage::Create` to the daemon. The daemon:
 
 1. **Generate three-word name.** Call `network_name::generate_name()` to produce a random adjective-noun-noun name like `gentle-amber-fox`.
 
@@ -1743,7 +1743,7 @@ When a user runs `pitopi create` (optionally with `--mode open`), the CLI sends 
 
 4. **Generate per-network keypair.** Create a random `SecretKey` — this is the network's signing key. Its public key becomes the join code.
 
-5. **Update ALPNs.** Call `endpoint.set_alpns()` to add `pitopi/net/<pubkey-prefix>` to the shared endpoint.
+5. **Update ALPNs.** Call `endpoint.set_alpns()` to add `rayfish/net/<pubkey-prefix>` to the shared endpoint.
 
 6. **Initialize membership.** Create a `MemberList` with self as the only member (marked `is_coordinator: true`). Create the membership policy based on the mode.
 
@@ -1753,13 +1753,13 @@ When a user runs `pitopi create` (optionally with `--mode open`), the CLI sends 
 
 9. **Create NetworkHandle.** Insert into the daemon's `networks` map with a child `CancellationToken`.
 
-10. **Save config.** Write the network to `~/.config/pitopi/networks.toml` with `network_secret_key` (hex) and `network_public_key`.
+10. **Save config.** Write the network to `~/.config/rayfish/networks.toml` with `network_secret_key` (hex) and `network_public_key`.
 
 11. **Return response.** Send `IpcMessage::Created` with the generated name, join code (public key), and IP back to the CLI.
 
 ### Joining a network
 
-When a user runs `pitopi join <public-key> --name gaming`, the CLI sends an `IpcMessage::Join { network_key, name }` to the daemon. The daemon:
+When a user runs `ray join <public-key> --name gaming`, the CLI sends an `IpcMessage::Join { network_key, name }` to the daemon. The daemon:
 
 1. **Parse join code.** Parse the public key string → `EndpointId`.
 
@@ -1787,7 +1787,7 @@ When a user runs `pitopi join <public-key> --name gaming`, the CLI sends an `Ipc
 
 ### Nuking a network
 
-When a user runs `pitopi nuke gentle-amber-fox`, the CLI sends an `IpcMessage::Nuke { name, force }` to the daemon. The daemon:
+When a user runs `ray nuke gentle-amber-fox`, the CLI sends an `IpcMessage::Nuke { name, force }` to the daemon. The daemon:
 
 1. **Publish empty record.** Publish a pkarr record with an empty GroupBlob hash and no seed peers. This signals to any future joiner that the network is gone.
 
@@ -1860,9 +1860,9 @@ When the entire mesh session fails (e.g., `enter_mesh` returns an error):
 
 ### Daemon startup
 
-When a user runs `sudo pitopi daemon` (or `sudo pitopi up`):
+When a user runs `sudo ray daemon` (or `sudo ray up`):
 
-1. **Load identity** from `~/.config/pitopi/secret_key`.
+1. **Load identity** from `~/.config/rayfish/secret_key`.
 
 2. **Create shared resources.** A single iroh Endpoint, TUN device, PeerTable, and Stats are created and shared across all networks.
 
@@ -1870,9 +1870,9 @@ When a user runs `sudo pitopi daemon` (or `sudo pitopi up`):
 
 4. **Start accept loop.** A shared accept loop dispatches incoming connections by ALPN to the correct network's handler.
 
-5. **Start IPC listener.** Bind the Unix socket at `/var/run/pitopi/pitopi.sock` and accept client commands.
+5. **Start IPC listener.** Bind the Unix socket at `/var/run/rayfish/rayfish.sock` and accept client commands.
 
-6. **Block on shutdown.** Wait for `CancellationToken` (SIGINT/SIGTERM or `pitopi down`).
+6. **Block on shutdown.** Wait for `CancellationToken` (SIGINT/SIGTERM or `ray down`).
 
 All networks share the same TUN device and routing table, since the address space is flat and each peer has a globally unique IP.
 
@@ -1880,11 +1880,11 @@ All networks share the same TUN device and routing table, since the address spac
 
 ## 21. Daemon Architecture
 
-Pitopi uses a daemon/client split similar to Tailscale. The daemon (`pitopi daemon`) is a long-lived root process that owns all shared resources, while CLI commands are thin IPC clients.
+Rayfish uses a daemon/client split similar to Tailscale. The daemon (`ray daemon`) is a long-lived root process that owns all shared resources, while CLI commands are thin IPC clients.
 
 ### Why a daemon?
 
-Without a daemon, each `pitopi create` or `pitopi join` was a blocking process that owned its own iroh endpoint and TUN device. There was no way to:
+Without a daemon, each `ray create` or `ray join` was a blocking process that owned its own iroh endpoint and TUN device. There was no way to:
 
 - Manage multiple networks from a single process
 - Query live peer status
@@ -1914,7 +1914,7 @@ Each active network has:
 
 ### IPC protocol
 
-The Unix socket at `/var/run/pitopi/pitopi.sock` uses the same wire format as the peer-to-peer control protocol: 4-byte big-endian length prefix + msgpack body, framed via `tokio_util::codec::Framed` with a `MsgpackCodec`. A single `IpcMessage` enum carries both request and response variants:
+The Unix socket at `/var/run/rayfish/rayfish.sock` uses the same wire format as the peer-to-peer control protocol: 4-byte big-endian length prefix + msgpack body, framed via `tokio_util::codec::Framed` with a `MsgpackCodec`. A single `IpcMessage` enum carries both request and response variants:
 
 - **Request variants** — `Create`, `Join`, `Leave`, `Nuke`, `Status`, `Shutdown`, `AclTag`, `AclUntag`, `AclAllow`, `AclRemove`, `AclShow`, `AclApply`, `FirewallAdd`, `FirewallRemove`, `FirewallShow`, `FirewallDefault`, `SetHostname`, `SendFile`, `ListFiles`, `AcceptFile`
 - **Response variants** — `Ok`, `Error`, `Created` (with generated name + join code + IP), `Joined`, `StatusResponse`, `AclState`, `FirewallState`, `FileList`
@@ -1923,7 +1923,7 @@ The daemon accepts one connection at a time, reads a request, processes it, and 
 
 ### Dynamic ALPN management
 
-The key enabler for runtime network management is `Endpoint::set_alpns()`. When a network is created or joined, its ALPN (`pitopi/net/<pubkey-prefix>`) is added to the endpoint. When a network is left, the ALPN is removed. The shared accept loop dispatches incoming connections to the correct network handler based on the ALPN.
+The key enabler for runtime network management is `Endpoint::set_alpns()`. When a network is created or joined, its ALPN (`rayfish/net/<pubkey-prefix>`) is added to the endpoint. When a network is left, the ALPN is removed. The shared accept loop dispatches incoming connections to the correct network handler based on the ALPN.
 
 ### Network teardown (`leave`)
 
@@ -1942,7 +1942,7 @@ When a network is left:
 
 Visual reference for how data and control flow through the codebase.
 
-### Coordinator startup (`pitopi create`)
+### Coordinator startup (`ray create`)
 
 ```
 create_network_inner()
@@ -1990,7 +1990,7 @@ create_network_inner()
     }
 ```
 
-### Joiner startup (`pitopi join`)
+### Joiner startup (`ray join`)
 
 ```
 join_network_inner("<public-key>", Some("gaming"))
@@ -2124,11 +2124,11 @@ Peers authenticate at two levels:
 
 1. **Transport level:** The QUIC handshake verifies each peer's Ed25519 public key. A peer's `EndpointId` is cryptographically bound to their connection. You cannot connect to a peer without them proving they hold the corresponding private key.
 
-2. **Application level:** When peers send `MeshHello` or `ReconnectRequest` messages, pitopi verifies that the claimed identity matches the transport-level identity (`conn.remote_id()`). This prevents a connected peer from claiming to be someone else.
+2. **Application level:** When peers send `MeshHello` or `ReconnectRequest` messages, rayfish verifies that the claimed identity matches the transport-level identity (`conn.remote_id()`). This prevents a connected peer from claiming to be someone else.
 
 ### Membership authorization
 
-Pitopi separates *authorization* (who can approve a new identity) from *welcome* (who can let an approved peer into the mesh):
+Rayfish separates *authorization* (who can approve a new identity) from *welcome* (who can let an approved peer into the mesh):
 
 - **Restricted mode:** Only the coordinator can authorize new members. However, once a peer is approved and the `MemberApproved` message is broadcast, *any* peer can welcome that approved identity when it connects. This means the coordinator doesn't need to be online when the approved peer actually joins -- it just needs to have been online long enough to broadcast the approval.
 
@@ -2178,11 +2178,11 @@ Peers verify the blake3 hash of the GroupBlob before trusting its contents. The 
 
 **Modules:** `src/identity.rs` (device certs), `src/control.rs` (PairMsg), `src/daemon.rs` (pairing handler), `src/peers.rs` (DeviceUserMap)
 
-Pitopi's identity model normally binds one cryptographic key to one device. Device pairing extends this so that a single user can operate multiple devices under a shared identity, using certificate-based pairing.
+Rayfish's identity model normally binds one cryptographic key to one device. Device pairing extends this so that a single user can operate multiple devices under a shared identity, using certificate-based pairing.
 
 ### The problem
 
-Without pairing, each device has its own Ed25519 keypair and its own EndpointId. If you use pitopi on a laptop and a phone, they appear as two separate peers -- different IPs, different ACL identities, different tags. You'd need to tag and authorize each device independently.
+Without pairing, each device has its own Ed25519 keypair and its own EndpointId. If you use rayfish on a laptop and a phone, they appear as two separate peers -- different IPs, different ACL identities, different tags. You'd need to tag and authorize each device independently.
 
 ### How pairing works
 
@@ -2205,20 +2205,20 @@ After pairing, all devices share the same user identity for ACL purposes, while 
 **On the primary device:**
 
 ```bash
-pitopi pair
+ray pair
 ```
 
-This generates a pairing secret, creates a pairing ticket (`bs58(endpoint_id || pairing_secret)`), and displays it as both a text string and a QR code (rendered in the terminal via `qr2term`). The daemon registers a temporary handler on the `pitopi/pair/1` ALPN to accept the incoming pairing connection.
+This generates a pairing secret, creates a pairing ticket (`bs58(endpoint_id || pairing_secret)`), and displays it as both a text string and a QR code (rendered in the terminal via `qr2term`). The daemon registers a temporary handler on the `rayfish/pair/1` ALPN to accept the incoming pairing connection.
 
 **On the secondary device:**
 
 ```bash
-pitopi pair <ticket>
+ray pair <ticket>
 ```
 
 The secondary daemon decodes the ticket, extracts the primary's EndpointId and the pairing secret, and connects to the primary via the PAIR_ALPN. The pairing secret authenticates the request -- only someone with the ticket can pair.
 
-The primary verifies the secret, then signs a `DeviceCert` that binds the secondary's transport key to the primary's user identity. The signed certificate is sent back to the secondary, which stores it at `~/.config/pitopi/device_cert`.
+The primary verifies the secret, then signs a `DeviceCert` that binds the secondary's transport key to the primary's user identity. The signed certificate is sent back to the secondary, which stores it at `~/.config/rayfish/device_cert`.
 
 ### After pairing
 
@@ -2234,12 +2234,12 @@ The `DeviceUserMap` is consulted during ACL evaluation in the forwarding path (`
 
 ### Key backup and restore
 
-If you lose your primary device, you lose the identity key that signed all device certificates. To guard against this, pitopi supports encrypted key backup:
+If you lose your primary device, you lose the identity key that signed all device certificates. To guard against this, rayfish supports encrypted key backup:
 
 **Backup:**
 
 ```bash
-pitopi pair backup
+ray pair backup
 ```
 
 You are prompted for a passphrase (via `rpassword`, no terminal echo). The identity key is encrypted using chacha20poly1305 with a key derived from the passphrase via argon2. The resulting backup code is displayed for you to store securely (e.g., print it, write it down, save it in a password manager).
@@ -2247,10 +2247,10 @@ You are prompted for a passphrase (via `rpassword`, no terminal echo). The ident
 **Restore:**
 
 ```bash
-pitopi pair restore <backup-code>
+ray pair restore <backup-code>
 ```
 
-You are prompted for the passphrase. The backup code is decrypted and the identity key is restored to `~/.config/pitopi/secret_key`. After restore, the device has the same EndpointId and user identity as the original primary device.
+You are prompted for the passphrase. The backup code is decrypted and the identity key is restored to `~/.config/rayfish/secret_key`. After restore, the device has the same EndpointId and user identity as the original primary device.
 
 ### ACLs with paired devices
 
@@ -2258,17 +2258,17 @@ With pairing, ACL tags reference user identities rather than individual device t
 
 ```bash
 # Tag a user (covers all their devices)
-pitopi acl gaming tag admins ab3f
+ray acl gaming tag admins ab3f
 
 # This rule applies to traffic from any of the user's paired devices
-pitopi acl gaming allow admins all
+ray acl gaming allow admins all
 ```
 
 The coordinator sees all devices of a paired user as the same identity for tagging and rule purposes. Each device still appears as a separate peer in the mesh (separate IP, separate connection), but ACL evaluation treats them as one user.
 
 ### Wire protocol
 
-The pairing protocol uses a dedicated ALPN (`pitopi/pair/1`) and the `PairMsg` enum in `src/control.rs`:
+The pairing protocol uses a dedicated ALPN (`rayfish/pair/1`) and the `PairMsg` enum in `src/control.rs`:
 
 - **PairRequest** -- sent by secondary with the pairing secret
 - **PairResponse** -- sent by primary with the signed `DeviceCert` (or rejection)

@@ -237,9 +237,9 @@ pub type IpcFramed = Framed<UnixStream, MsgpackCodec<IpcMessage>>;
 
 pub fn socket_path() -> PathBuf {
     if cfg!(target_os = "macos") {
-        PathBuf::from("/var/run/pitopi.sock")
+        PathBuf::from("/var/run/rayfish.sock")
     } else {
-        PathBuf::from("/var/run/pitopi/pitopi.sock")
+        PathBuf::from("/var/run/rayfish/rayfish.sock")
     }
 }
 
@@ -247,7 +247,7 @@ pub async fn connect() -> Result<IpcFramed> {
     let path = socket_path();
     let stream = UnixStream::connect(&path)
         .await
-        .context("daemon not running — start it with: sudo pitopi daemon")?;
+        .context("daemon not running — start it with: sudo rayfish daemon")?;
     Ok(Framed::new(stream, MsgpackCodec::new()))
 }
 
