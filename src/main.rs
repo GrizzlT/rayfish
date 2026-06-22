@@ -16,6 +16,7 @@ mod peers;
 
 mod shutdown;
 mod stats;
+mod style;
 mod transport;
 mod tun;
 
@@ -388,13 +389,26 @@ async fn ipc_create(
             my_ip,
             my_ipv6,
         } => {
-            println!("Network created: {}", name);
-            println!("  IPv4: {}", my_ip);
+            let key_str = network_key.to_string();
+            let short = if key_str.len() > 12 {
+                format!("{}…{}", &key_str[..4], &key_str[key_str.len() - 4..])
+            } else {
+                key_str.clone()
+            };
+            println!();
+            println!("{} {}", style::green("✓ network created"), style::bold(&name));
+            println!("  {}  {}", style::label("IPv4"), style::value(&my_ip.to_string()));
             if let Some(v6) = my_ipv6 {
-                println!("  IPv6: {}", v6);
+                println!("  {}  {}", style::label("IPv6"), style::value(&v6.to_string()));
             }
-            println!("  Join code: {}", network_key);
-            println!("  Share this join code to invite others");
+            println!(
+                "  {}  {}  {}",
+                style::label("join"),
+                style::rose(&short),
+                style::faint("# share this code to invite")
+            );
+            println!("  {}", style::faint(&format!("full: {network_key}")));
+            println!();
         }
         ipc::IpcMessage::Error { message } => {
             eprintln!("Error: {}", message);
@@ -433,11 +447,13 @@ async fn ipc_join(
             my_ip,
             my_ipv6,
         } => {
-            println!("Joined network '{}'.", name);
-            println!("  IPv4: {}", my_ip);
+            println!();
+            println!("{} {}", style::green("✓ joined"), style::bold(&name));
+            println!("  {}  {}", style::label("IPv4"), style::value(&my_ip.to_string()));
             if let Some(v6) = my_ipv6 {
-                println!("  IPv6: {}", v6);
+                println!("  {}  {}", style::label("IPv6"), style::value(&v6.to_string()));
             }
+            println!();
         }
         ipc::IpcMessage::Error { message } => {
             eprintln!("Error: {}", message);
@@ -488,18 +504,27 @@ async fn ipc_status() -> Result<()> {
     let Ok(mut stream) = ipc::connect().await else {
         // Daemon not running — show saved config
         let app_config = config::load()?;
+        println!();
+        println!("  {}", style::red("✗ daemon not running"));
         if app_config.networks.is_empty() {
-            println!("Daemon not running. No saved networks.");
+            println!("  {}", style::faint("no saved networks"));
+            println!();
             return Ok(());
         }
-        println!("Daemon not running. Saved networks:");
+        println!("  {}", style::faint("saved networks:"));
         for net in &app_config.networks {
             let ip_str = net
                 .my_ip
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "?".to_string());
-            println!("  {} (ip: {}, members: {})", net.name, ip_str, net.members.len());
+            println!(
+                "    {} {}  {}",
+                style::value(&net.name),
+                style::faint(&format!("({ip_str})")),
+                style::faint(&format!("{} members", net.members.len()))
+            );
         }
+        println!();
         return Ok(());
     };
 
@@ -515,10 +540,24 @@ async fn ipc_status() -> Result<()> {
             bytes_rx,
             bytes_tx,
         } => {
-            println!("Endpoint: {}", endpoint_id);
-            println!("  mDNS: {}", if mdns_enabled { "enabled" } else { "disabled" });
+            println!();
+            println!(
+                "  {} {}",
+                style::label("endpoint"),
+                style::value(&endpoint_id.to_string())
+            );
+            println!(
+                "  {} {}",
+                style::label("mDNS    "),
+                if mdns_enabled {
+                    style::green("on")
+                } else {
+                    style::faint("off")
+                }
+            );
             if networks.is_empty() {
-                println!("No active networks.");
+                println!();
+                println!("  {}", style::faint("no active networks"));
             } else {
                 for net in &networks {
                     let role = match &net.role {
@@ -529,54 +568,64 @@ async fn ipc_status() -> Result<()> {
                         .my_hostname
                         .as_ref()
                         .map(|h| format!("{}.{}.{}", h, net.name, DNS_DOMAIN));
-                    print!("  {} [{}]", net.name, role);
+                    println!();
+                    print!(
+                        "  {} {}",
+                        style::bold(&net.name),
+                        style::faint(&format!("[{role}]"))
+                    );
                     if let Some(ref dns) = dns_name {
-                        print!(" — {}", dns);
+                        print!("  {}", style::value(dns));
                     }
-                    println!("  ({})", net.my_ip);
+                    println!("  {}", style::faint(&format!("({})", net.my_ip)));
                     if let Some(ref key) = net.network_key {
-                        println!(
-                            "    Key: {}…{}",
+                        let short = format!(
+                            "{}…{}",
                             &key[..8.min(key.len())],
                             &key[key.len().saturating_sub(4)..]
                         );
+                        println!("    {}  {}", style::label("join   "), style::rose(&short));
                     }
                     println!(
-                        "    Members: {}/{} online",
-                        net.peers.len() + 1,
-                        net.member_count
+                        "    {}  {}",
+                        style::label("members"),
+                        style::value(&format!(
+                            "{}/{} online",
+                            net.peers.len() + 1,
+                            net.member_count
+                        ))
                     );
-                    if !net.peers.is_empty() {
-                        println!("    Peers:");
-                        for peer in &net.peers {
-                            let name = if let Some(ref h) = peer.hostname {
-                                format!("{}.{}.{}", h, net.name, DNS_DOMAIN)
-                            } else {
-                                peer.ip.to_string()
-                            };
-                            print!("      {} ({})", name, peer.endpoint_id.fmt_short());
-                            if let Some(ref uid) = peer.user_identity {
-                                print!(" user:{}", uid.fmt_short());
-                            }
-                            if let Some(ref ci) = peer.connection {
-                                let conn_type = match ci.conn_type {
-                                    ipc::ConnType::Direct => "direct",
-                                    ipc::ConnType::Relay => "relay",
-                                    ipc::ConnType::Tor => "tor",
-                                    ipc::ConnType::Unknown => "?",
-                                };
-                                print!(" [{conn_type}");
-                                if let Some(rtt) = ci.rtt_ms {
-                                    print!(", {:.1}ms", rtt);
-                                }
-                                print!("]");
-                                print!("  tx:{} rx:{}", ci.bytes_tx, ci.bytes_rx);
-                                if ci.lost_packets > 0 {
-                                    print!(" lost:{}", ci.lost_packets);
-                                }
-                            }
-                            println!();
+                    for peer in &net.peers {
+                        let name = if let Some(ref h) = peer.hostname {
+                            format!("{}.{}.{}", h, net.name, DNS_DOMAIN)
+                        } else {
+                            peer.ip.to_string()
+                        };
+                        print!(
+                            "    {} {}  {}",
+                            style::dot_online(),
+                            style::value(&name),
+                            style::faint(&format!("{}", peer.endpoint_id.fmt_short()))
+                        );
+                        if let Some(ref uid) = peer.user_identity {
+                            print!(" {}", style::faint(&format!("user:{}", uid.fmt_short())));
                         }
+                        if let Some(ref ci) = peer.connection {
+                            let conn_type = match ci.conn_type {
+                                ipc::ConnType::Direct => "direct",
+                                ipc::ConnType::Relay => "relay",
+                                ipc::ConnType::Tor => "tor",
+                                ipc::ConnType::Unknown => "?",
+                            };
+                            print!("  {}", style::faint(conn_type));
+                            if let Some(rtt) = ci.rtt_ms {
+                                print!("  {}", style::latency(rtt));
+                            }
+                            if ci.lost_packets > 0 {
+                                print!("  {}", style::red(&format!("lost:{}", ci.lost_packets)));
+                            }
+                        }
+                        println!();
                     }
                 }
             }
@@ -591,7 +640,12 @@ async fn ipc_status() -> Result<()> {
                     .filter(|n| !active_names.contains(n.name.as_str()))
                     .collect();
                 for net in &inactive {
-                    println!("  {} [inactive]", net.name);
+                    println!();
+                    println!(
+                        "  {} {}",
+                        style::faint(&net.name),
+                        style::faint("[inactive]")
+                    );
                 }
             }
 
@@ -606,12 +660,18 @@ async fn ipc_status() -> Result<()> {
                     format!("{} B", b)
                 }
             }
+            println!();
             println!(
-                "  Traffic: rx:{} tx:{} ({})",
-                packets_rx,
-                packets_tx,
-                format_bytes(bytes_rx + bytes_tx)
+                "  {} {}",
+                style::label("traffic"),
+                style::value(&format!(
+                    "{} rx · {} tx · {}",
+                    packets_rx,
+                    packets_tx,
+                    format_bytes(bytes_rx + bytes_tx)
+                ))
             );
+            println!();
         }
         ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
