@@ -1,22 +1,72 @@
 # Rayfish
 
-A peer-to-peer mesh VPN that lets you create private virtual networks without any infrastructure. Built on [iroh](https://iroh.computer), it connects peers by cryptographic identity — not IP addresses — so you never need to deal with port forwarding, dynamic DNS, or firewall rules.
+**A peer-to-peer mesh VPN with zero infrastructure.** Create a private virtual network, share a code, and your devices act like they're on the same LAN — no servers, no port forwarding, no static IPs.
 
-## Why?
+Built on [iroh](https://iroh.computer), Rayfish connects peers by *cryptographic identity* rather than IP address. NAT traversal, hole-punching, and end-to-end encryption are handled for you. When a direct connection isn't possible (~10% of cases), traffic falls back to encrypted relays.
 
-You want to play Minecraft with friends, but nobody wants to set up port forwarding or pay for a hosted server. With Rayfish, one person creates a network, shares a short code, and everyone joins. Each player gets virtual IPv4 and IPv6 addresses and the game thinks you're all on the same LAN.
+```bash
+ray create                 # you're the coordinator; get a join code
+ray join <join-code>       # friends join with the code
+ping alice.gaming.ray      # reach peers by name
+```
 
-But it's not just for games. Rayfish gives you a private, encrypted network between any set of devices — work machines, home servers, cloud instances — without trusting a third party.
+---
+
+## Contents
+
+- [Why Rayfish](#why-rayfish)
+- [How it works](#how-it-works)
+- [Quick start](#quick-start)
+- [Features](#features)
+  - [Multiple networks](#multiple-networks)
+  - [Access control (ACL)](#access-control-acl)
+  - [Local device firewall](#local-device-firewall)
+  - [File sharing](#file-sharing)
+  - [Magic DNS](#magic-dns)
+  - [Device pairing](#device-pairing)
+  - [Local peer discovery (mDNS)](#local-peer-discovery-mdns)
+  - [Tor transport](#tor-transport)
+- [Command reference](#command-reference)
+- [Running as a service](#running-as-a-service)
+- [Metrics](#metrics)
+- [Configuration](#configuration)
+- [Building](#building)
+- [Architecture](#architecture)
+- [Roadmap](#roadmap)
+
+---
+
+## Why Rayfish
+
+You want to play Minecraft with friends, but nobody wants to set up port forwarding or pay for a hosted server. One person runs `ray create`, shares a short code, and everyone joins. Each player gets virtual IPv4 and IPv6 addresses, and the game thinks you're all on the same LAN.
+
+It's not just for games. Rayfish gives you a private, encrypted network between any set of devices — laptops, home servers, cloud instances — without trusting a third party to route or store your traffic.
+
+**What you get:**
+
+- **No infrastructure** — no central server to run, pay for, or trust
+- **Identity-based** — peers are addressed by public key, not IP
+- **Dual-stack** — stable IPv4 (`100.64.0.0/10`) and IPv6 (`200::/7`) per peer
+- **Magic DNS** — reach peers by `name.network.ray` instead of memorizing IPs
+- **Full mesh** — every peer connects directly to every other peer
+- **Multi-network** — run many isolated networks through one daemon
+- **Access control** — coordinator ACLs plus a per-device firewall
+- **Multi-device** — share one identity across your devices via pairing
+- **Optional Tor** — route traffic through Tor for IP-level anonymity
+
+---
 
 ## How it works
 
-1. **Create a network** — one peer starts a network and becomes the coordinator
-2. **Share the join code** — the creator gets a public key string to share with friends
-3. **Join** — peers connect using the join code. iroh handles NAT traversal, hole-punching, and encrypted transport automatically
-4. **Full mesh** — the coordinator assigns virtual IPs and broadcasts the peer list. Every peer connects directly to every other peer
-5. **Use it** — every peer gets a virtual IPv4 (100.64.x.x) and IPv6 (200::/7) address. Any app that uses TCP/UDP just works
+1. **Create** — one peer starts a network and becomes the coordinator.
+2. **Share** — the creator gets a public-key *join code* to hand to friends.
+3. **Join** — peers connect using the join code. iroh handles NAT traversal and encrypted transport.
+4. **Mesh** — the coordinator assigns virtual IPs and broadcasts the peer list; every peer connects directly to every other.
+5. **Use it** — each peer gets a virtual IPv4 and IPv6 address. Any app over TCP/UDP just works.
 
-Under the hood, Rayfish creates a TUN device on each machine, captures IP packets, and tunnels them through iroh's QUIC-based P2P connections. If direct connections aren't possible (~10% of cases), traffic falls back to encrypted relay servers.
+Under the hood, Rayfish creates a TUN device on each machine, captures IP packets, and tunnels them through iroh's QUIC-based P2P connections.
+
+---
 
 ## Quick start
 
@@ -26,9 +76,9 @@ Under the hood, Rayfish creates a TUN device on each machine, captures IP packet
 just deploy <ip>    # cross-build, install binary, create rayfish group, start daemon
 ```
 
-This installs `rayfish` to `/usr/local/bin`, creates a `rayfish` group for socket access, and enables a systemd service that runs the daemon on boot.
+This installs the binary to `/usr/local/bin`, creates a `rayfish` group for socket access, and enables a systemd service that runs the daemon on boot.
 
-Add your user to the group so you can run commands without sudo:
+Add your user to the group so you can run commands without `sudo`:
 
 ```bash
 sudo usermod -aG rayfish $USER
@@ -42,7 +92,9 @@ cargo build
 sudo ray daemon &    # start the daemon in the background
 ```
 
-### Usage
+> The daemon needs root (it creates the TUN device and owns the iroh endpoint). Every other command runs unprivileged and talks to the daemon over a Unix socket.
+
+### Basic usage
 
 ```bash
 # Create a network — you become the coordinator
@@ -58,30 +110,27 @@ ray create --hostname alice
 ray join 3f8a...c7d2 --name gaming --hostname bob
 # > Joined network 'gaming'.
 # >   IPv4: 100.64.7.201
-# >   IPv6: 200:e71a:f083:29b1::1
 # >   Hostname: bob.gaming.ray
 
-# Check what's running
+# See what's running
 ray status
-# > Endpoint: <your-endpoint-id>
-# >   gaming [coordinator] — alice.gaming.ray
-# >     Peers:
-# >       bob.gaming.ray (b3f2)
 
 # Reach each other by name or IP
 ping alice.gaming.ray    # from the joiner
 ping bob.ray             # from the coordinator (flat lookup)
 
-# Leave a network
+# Leave a network / shut down
 ray leave gaming
-
-# Shut down the daemon
 ray down
 ```
 
+---
+
+## Features
+
 ### Multiple networks
 
-You can run multiple isolated networks simultaneously through a single daemon:
+Run several isolated networks at once through a single daemon:
 
 ```bash
 ray create
@@ -89,183 +138,160 @@ ray create
 ray status    # shows both networks with live peer info
 ```
 
-Networks are fully isolated — different encryption contexts, different peer sets, no cross-talk.
+Networks are fully isolated — separate encryption contexts, separate peer sets, no cross-talk.
 
-### Access control
+### Access control (ACL)
 
-Coordinators can define who can reach whom within a network using identity/tag-based ACL rules:
+Coordinators decide who can reach whom using identity- and tag-based rules:
 
 ```bash
 # Tag peers by role
 ray acl gaming tag servers ab3f... d92c...
 ray acl gaming tag admins ee11...
 
-# Allow rules (no rules = open; any rules = deny-all except allowed)
-ray acl gaming allow admins all           # admins reach everyone
-ray acl gaming allow all servers          # everyone reaches servers
+# Allow rules (no rules = open; any rule = deny-all except what's allowed)
+ray acl gaming allow admins all      # admins reach everyone
+ray acl gaming allow all servers     # everyone reaches servers
 
-# Show current ACL
-ray acl gaming show
-
-# Push changes to all peers
-ray acl gaming apply
+ray acl gaming show                  # inspect current ACL
+ray acl gaming apply                 # push changes to all peers
 ```
 
-ACL rules are distributed to all peers via iroh-blobs and enforced at the packet forwarding layer on every node. ACL state is persisted to `~/.config/rayfish/acl/<network>.acl`.
+Rules are distributed via iroh-blobs and enforced at the packet-forwarding layer on every node. State persists to `~/.config/rayfish/acl/<network>.acl`.
 
 ### Local device firewall
 
-Each device can set its own firewall rules independently of the network ACL. This lets you protect your ports regardless of what the coordinator allows:
+Each device sets its own firewall rules, independent of the network ACL — so you protect your ports regardless of what the coordinator allows:
 
 ```bash
-# Block all inbound traffic by default
-ray firewall default deny
-
-# Allow inbound HTTPS and SSH from a trusted peer
-ray firewall add in allow --proto tcp --port 443
-ray firewall add in allow --proto tcp --port 22 --peer ab3f
-
-# Allow all outbound
-ray firewall add out allow
-
-# Check current rules
+ray firewall default deny                              # block inbound by default
+ray firewall add in allow --proto tcp --port 443       # allow HTTPS
+ray firewall add in allow --proto tcp --port 22 --peer ab3f   # SSH from one peer
+ray firewall add out allow                             # allow all outbound
 ray firewall show
-
-# Remove a rule by index
 ray firewall remove 0
 ```
 
-Rules are evaluated first-match-wins. Supports TCP, UDP, ICMP, port ranges (e.g. `80-443`), and per-peer filters. Firewall state is persisted to `~/.config/rayfish/firewall.toml`.
+Evaluated first-match-wins. Supports TCP, UDP, ICMP, port ranges (e.g. `80-443`), and per-peer filters. Persists to `~/.config/rayfish/firewall.toml`.
 
-The `self` keyword can be used to reference your own device in ACL and firewall commands (e.g. `ray acl gaming tag servers self`).
+> The `self` keyword refers to your own device in both ACL and firewall commands, e.g. `ray acl gaming tag servers self`.
 
 ### File sharing
 
-Send files directly between peers over the mesh — no cloud storage, no size limits:
+Send files directly between peers over the mesh — no cloud, no size limits:
 
 ```bash
-ray send photo.jpg alice          # send to peer by hostname or short ID
-ray files                         # list pending incoming transfers
+ray send photo.jpg alice          # send by hostname or short ID
+ray files                         # list pending transfers
 ray files accept 0                # accept, saves to ~/Downloads
 ray files accept 0 --output .     # accept to current directory
 ```
 
-Files are content-addressed (blake3) and transferred via iroh-blobs. The sender adds the file to the local blob store and sends a lightweight offer (filename, size, MIME type, hash) to the receiver. The receiver can inspect offers before accepting. On accept, the blob is fetched directly from the sender and verified by hash.
-
-### Tor transport
-
-Route all your network traffic through Tor for IP-level anonymity. Requires building with the `tor` feature and a running Tor daemon:
-
-```bash
-# Build with Tor support
-cargo build --features tor
-
-# Start Tor (in a separate terminal)
-tor --ControlPort 9051 --CookieAuthentication 0
-
-# Create a network over Tor
-ray create --tor --hostname alice
-
-# Join over Tor
-ray join 3f8a...c7d2 --tor --hostname bob
-
-# Status shows [tor] for Tor-routed connections
-ray status
-```
-
-Tor runs alongside the default relay transport — iroh picks the best path automatically. Both peers must use `--tor` to communicate over Tor; otherwise they fall back to relay.
+Files are content-addressed (blake3) and transferred via iroh-blobs. The sender sends a lightweight offer (filename, size, MIME type, hash); the receiver inspects it before accepting. On accept, the blob is fetched directly from the sender and verified by hash.
 
 ### Magic DNS
 
-Every peer gets a hostname resolvable under the `.ray` domain. No more memorizing IPs:
+Every peer gets a hostname under the `.ray` domain, so you never memorize an IP:
 
 ```bash
-# Create with a chosen hostname
 ray create --hostname alice
-
-# Join with a hostname
 ray join 3f8a...c7d2 --hostname bob
 
-# Now reach peers by name
 ping alice.gentle-amber-fox.ray    # fully qualified
-ping alice.ray                     # flat lookup (searches all networks)
+ping alice.ray                     # flat lookup across all networks
 ```
 
-Hostnames propagate via the membership blob and MeshHello messages — they're resolvable even when the named peer is offline. A (IPv4), AAAA (IPv6), and PTR (reverse DNS) records are served, so `ping6 alice.gaming.ray` and `dig -x 100.64.x.x` both work. EDNS/OPT and DNS-over-TCP are supported. If two peers choose the same hostname, a numeric suffix is appended automatically (e.g., `alice` → `alice2`). Hostnames persist across daemon restarts. The daemon configures your system DNS to route only `.ray` queries to its local resolver (macOS: SCDynamicStore, Linux: systemd-resolved/NetworkManager D-Bus, resolvconf, or direct); all other DNS is untouched.
+- **Stable & offline-resolvable** — hostnames propagate via the membership blob and persist across daemon restarts, so they resolve even when the named peer is offline.
+- **Full record support** — A (IPv4), AAAA (IPv6), and PTR (reverse DNS), so `ping6` and `dig -x 100.64.x.x` both work. EDNS/OPT and DNS-over-TCP supported.
+- **Collision-safe** — duplicate hostnames get a numeric suffix automatically (`alice` → `alice2`).
+- **Non-invasive** — the daemon routes only `.ray` queries to its local resolver; all other DNS is untouched (macOS: SCDynamicStore; Linux: systemd-resolved / NetworkManager / resolvconf / direct `/etc/resolv.conf`).
 
 ### Device pairing
 
-Use the same identity across multiple devices. The primary device signs a certificate for each secondary device, so all your devices share one identity for ACL purposes:
+Use one identity across multiple devices. The primary signs a certificate for each secondary, so the network treats all your devices as one user:
 
 ```bash
-# On your primary device — displays a QR code and pairing ticket
-ray pair
-
-# On your secondary device — pair using the ticket
-ray pair <ticket>
-
-# Backup your identity key (encrypted with a passphrase)
-ray pair backup
-
-# Restore on a new device
-ray pair restore <backup-code>
+ray pair                       # primary: shows a QR code + pairing ticket
+ray pair <ticket>              # secondary: pair using the ticket
+ray pair backup                # encrypt + back up your identity key
+ray pair restore <backup-code> # restore on a new device
 ```
 
-After pairing, ACL tags assigned to your user identity cover all your devices automatically. Each device still gets its own IP and connections, but the network treats them as one user.
+After pairing, ACL tags assigned to your user identity cover all your devices automatically. Each device still gets its own IP and connections.
 
 ### Local peer discovery (mDNS)
 
-Rayfish automatically discovers other peers on your local network via mDNS. When two peers are on the same LAN, they connect directly — skipping relay servers entirely for the lowest possible latency.
-
-This is enabled by default. To disable:
+Peers on the same LAN are discovered via mDNS and connect directly, skipping relays for the lowest possible latency. Enabled by default:
 
 ```bash
-ray mdns off     # disable mDNS discovery
-ray mdns on      # re-enable (restart daemon for changes to take effect)
+ray mdns off     # disable
+ray mdns on      # re-enable (restart daemon to apply)
 ```
 
-## Commands
+### Tor transport
+
+Route traffic through Tor for IP-level anonymity. Requires the `tor` build feature and a running Tor daemon:
+
+```bash
+cargo build --features tor
+tor --ControlPort 9051 --CookieAuthentication 0   # in a separate terminal
+
+ray create --tor --hostname alice
+ray join 3f8a...c7d2 --tor --hostname bob
+ray status                                        # shows [tor] for Tor-routed peers
+```
+
+Tor runs alongside the default relay transport and iroh picks the best path. Both peers must use `--tor` to communicate over Tor; otherwise they fall back to relay.
+
+---
+
+## Command reference
 
 | Command | Description | Needs daemon |
 |---------|-------------|:---:|
 | `sudo ray daemon` | Start the daemon (owns TUN + endpoint) | — |
 | `sudo ray up` | Alias for `daemon` | — |
-| `ray create [--tor]` | Create a network (generates three-word name + join code) | Yes |
-| `ray join KEY [--name ALIAS] [--tor]` | Join a network by public key join code | Yes |
+| `ray create [--tor]` | Create a network (generates name + join code) | Yes |
+| `ray join KEY [--name ALIAS] [--tor]` | Join a network by join code | Yes |
 | `ray leave NAME` | Leave a network and remove config | Yes |
-| `ray nuke NAME [--force]` | Publish empty records to DHT then leave | Yes |
+| `ray nuke NAME [--force]` | Publish empty DHT records, then leave | Yes |
 | `ray hostname NET NAME` | Change your hostname on a network | Yes |
-| `ray status` | Show all networks (active + inactive), peers, traffic | No* |
+| `ray status` | Show all networks, peers, traffic | No* |
 | `ray down` | Shut down the daemon | Yes |
-| `ray acl NAME tag TAG PEERS…` | Assign a tag to peers (coordinator) | Yes |
+| `ray acl NAME tag TAG PEERS…` | Tag peers (coordinator) | Yes |
 | `ray acl NAME allow SRC DST` | Add an allow rule (coordinator) | Yes |
-| `ray acl NAME show` | Display current ACL state | Yes |
+| `ray acl NAME show` | Display ACL state | Yes |
 | `ray acl NAME apply` | Push ACL changes to all peers | Yes |
 | `ray send FILE PEER` | Send a file to a peer | Yes |
-| `ray files` | List pending incoming file transfers | Yes |
+| `ray files` | List pending file transfers | Yes |
 | `ray files accept ID` | Accept a file transfer | Yes |
 | `ray firewall show` | Show local firewall rules | Yes |
 | `ray firewall default ACTION` | Set default policy (allow/deny) | Yes |
 | `ray firewall add DIR ACTION` | Add a firewall rule | Yes |
 | `ray firewall remove INDEX` | Remove a rule by index | Yes |
-| `ray pair` | Start device pairing (displays QR + ticket) | Yes |
-| `ray pair TICKET` | Pair with a primary device | Yes |
-| `ray pair backup` | Backup identity key (encrypted) | No |
+| `ray pair [TICKET]` | Start pairing, or pair with a ticket | Yes |
+| `ray pair backup` | Back up identity key (encrypted) | No |
 | `ray pair restore CODE` | Restore identity from backup | No |
-| `ray mdns on\|off` | Enable/disable mDNS local peer discovery | No |
+| `ray mdns on\|off` | Toggle mDNS local discovery | No |
 | `ray install-service` | Install systemd/launchd service | No |
 | `ray uninstall-service` | Remove system service | No |
 | `ray completions SHELL` | Generate shell completions | No |
 
-The daemon requires root (creates TUN devices). All other commands run unprivileged — they talk to the daemon over a Unix socket at `/var/run/rayfish/rayfish.sock`. Users in the `rayfish` group have socket access.
+<sub>\* `ray status` shows saved networks even without a running daemon.</sub>
+
+Commands other than the daemon run unprivileged — they talk to the daemon over a Unix socket at `/var/run/rayfish/rayfish.sock`. Users in the `rayfish` group have socket access.
+
+---
 
 ## Running as a service
 
 ```bash
-sudo ray install-service    # installs systemd unit or launchd plist
+sudo ray install-service    # installs a systemd unit or launchd plist
 ```
 
-The service runs `ray daemon` on boot, restoring all saved networks automatically. `just deploy <ip>` does this automatically on Linux servers.
+The service runs `ray daemon` on boot, restoring all saved networks automatically. `just deploy <ip>` sets this up on Linux servers.
+
+---
 
 ## Metrics
 
@@ -275,24 +301,38 @@ The daemon exposes Prometheus-compatible metrics on port 9090:
 curl http://localhost:9090/metrics
 ```
 
-Includes rayfish forwarding counters (`rayfish_packets_rx_total`, `rayfish_bytes_tx_total`, `rayfish_drops_total{reason="acl"}`, etc.), per-peer gauges (`rayfish_peer_rtt_us`, `rayfish_peer_bytes_tx/rx`, `rayfish_peer_lost_packets`), and iroh transport metrics (`socket_*`, `net_report_*`). `ray status` also shows aggregate traffic stats.
+Includes forwarding counters (`rayfish_packets_rx_total`, `rayfish_bytes_tx_total`, `rayfish_drops_total{reason="acl"}`, …), per-peer gauges (`rayfish_peer_rtt_us`, `rayfish_peer_bytes_tx/rx`, `rayfish_peer_lost_packets`), and iroh transport metrics (`socket_*`, `net_report_*`). `ray status` also shows aggregate traffic stats.
+
+---
 
 ## Configuration
 
-Network memberships are stored at `~/.config/rayfish/networks.toml`. Identity (Ed25519 keypair) persists at `~/.config/rayfish/secret_key` — same endpoint ID across restarts. IPv4 and IPv6 addresses are both derived deterministically from peer identity, so they are stable and never change.
+| Path | Contents |
+|------|----------|
+| `~/.config/rayfish/networks.toml` | Network memberships |
+| `~/.config/rayfish/secret_key` | Identity (Ed25519 keypair) — same endpoint ID across restarts |
+| `~/.config/rayfish/acl/<network>.acl` | Per-network ACL rules |
+| `~/.config/rayfish/firewall.toml` | Local firewall rules |
+
+IPv4 and IPv6 addresses are both derived deterministically from peer identity, so they are stable and never change.
+
+---
 
 ## Building
 
 ```bash
-cargo build
+cargo build                  # debug build
+cargo build --features tor   # with Tor transport
 ```
 
-Requires Rust 2024 edition. Cross-compile and deploy to Linux servers:
+Requires the Rust 2024 edition (Rust 1.85+). Cross-compile and deploy to Linux servers:
 
 ```bash
 just cross                   # build for x86_64 Linux
 just deploy <ip>             # cross-build + install + start daemon service
 ```
+
+---
 
 ## Architecture
 
@@ -303,12 +343,14 @@ App (Minecraft, etc.) → TUN device (100.64.x.x + 200::/7) → ray daemon → i
 Rayfish uses a daemon/client split similar to Tailscale. The daemon (`ray daemon`) is a long-lived root process that owns the iroh endpoint, TUN device, and all peer connections. CLI commands talk to it over a Unix socket.
 
 - Full mesh topology — every peer connects directly to every other peer
-- Coordinator assigns IPs and broadcasts peer list via a control channel (QUIC bidirectional stream)
+- Coordinator assigns IPs and broadcasts the peer list over a QUIC control stream
 - Data flows as QUIC datagrams (low-latency, no head-of-line blocking)
 - Routing table dispatches packets by destination IP from IPv4 and IPv6 headers
-- Split TUN I/O (TunReader/TunWriter) for lock-free concurrent read/write
+- Split TUN I/O (`TunReader`/`TunWriter`) for lock-free concurrent read/write
 - Per-network ALPN isolation on a single shared iroh endpoint
 - Dynamic network management — create, join, and leave without restarting
+
+---
 
 ## Roadmap
 
@@ -318,16 +360,16 @@ See [TODO.md](TODO.md) for the full roadmap. Current status:
 - [x] Multi-peer full mesh (N peers in one network)
 - [x] Multiple simultaneous networks with isolation
 - [x] Persistent network config
-- [x] Public key join codes for secure network sharing
+- [x] Public-key join codes for secure network sharing
 - [x] DHT network records for offline coordinator resilience
-- [x] Distributed ACLs with tag-based allow rules (coordinator-managed, enforced on all peers)
+- [x] Distributed ACLs with tag-based allow rules
 - [x] Local device firewall with port/protocol/peer filtering
-- [x] Magic DNS with .ray domain resolution
+- [x] Magic DNS with `.ray` domain resolution
 - [x] Dual-stack IPv6/IPv4 with stable addresses
 - [x] Tor transport (optional, per-peer)
 - [x] Systemd/launchd service integration
 - [x] Daemon architecture with Unix socket IPC
-- [x] mDNS local peer discovery (LAN peers get direct connections automatically)
+- [x] mDNS local peer discovery
 - [x] Multi-device identity via certificate-based pairing
 - [ ] Social discovery (Discord, Slack, Steam)
 - [ ] macOS Network Extension (no sudo)
