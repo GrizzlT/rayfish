@@ -237,33 +237,51 @@ async fn handle_query(
         return Some(make_soa_response(&packet, &question.qname));
     }
 
-    if !name_lower.ends_with(&suffix) {
-        tracing::debug!(name = %name_lower, "DNS query for non-.{} domain, refusing", DNS_DOMAIN);
-        return Some(make_refused(&packet));
-    }
-
-    // A or AAAA query for .pi names
-    if is_a || is_aaaa {
-        let entry = resolve_name(&name_lower, &suffix, table).await;
-        match entry {
-            Some((v4, v6)) => {
-                if is_a {
-                    tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
-                    Some(make_a_response(&packet, &question.qname, v4))
-                } else {
-                    tracing::info!(name = %name_lower, ip = %v6, "DNS resolved AAAA");
-                    Some(make_aaaa_response(&packet, &question.qname, v6))
-                }
-            }
-            None => {
-                tracing::info!(name = %name_lower, "DNS query NXDOMAIN");
-                Some(make_nxdomain(&packet))
-            }
+    // Try resolving: first as .pi name, then as bare <host>.<network>
+    let entry = if is_a || is_aaaa {
+        if name_lower.ends_with(&suffix) {
+            resolve_name(&name_lower, &suffix, table).await
+        } else {
+            resolve_bare_network_name(&name_lower, table).await
         }
     } else {
-        // Other query types for .pi names: NOERROR with empty answer
-        Some(make_nodata(&packet))
+        None
+    };
+
+    if let Some((v4, v6)) = entry {
+        if is_a {
+            tracing::info!(name = %name_lower, ip = %v4, "DNS resolved A");
+            return Some(make_a_response(&packet, &question.qname, v4));
+        } else {
+            tracing::info!(name = %name_lower, ip = %v6, "DNS resolved AAAA");
+            return Some(make_aaaa_response(&packet, &question.qname, v6));
+        }
     }
+
+    // For .pi names, return NXDOMAIN (A/AAAA) or NODATA (other types)
+    if name_lower.ends_with(&suffix) || name_lower == DNS_DOMAIN {
+        if is_a || is_aaaa {
+            tracing::info!(name = %name_lower, "DNS query NXDOMAIN");
+            return Some(make_nxdomain(&packet));
+        }
+        return Some(make_nodata(&packet));
+    }
+
+    // Bare network name that didn't resolve — check if the TLD is a known network
+    {
+        let tld = name_lower.rsplit_once('.').map(|(_, t)| t).unwrap_or(&name_lower);
+        let table_guard = table.read().await;
+        if table_guard.contains_key(tld) {
+            if is_a || is_aaaa {
+                tracing::info!(name = %name_lower, "DNS query NXDOMAIN (known network)");
+                return Some(make_nxdomain(&packet));
+            }
+            return Some(make_nodata(&packet));
+        }
+    }
+
+    tracing::debug!(name = %name_lower, "DNS query for unknown domain, refusing");
+    Some(make_refused(&packet))
 }
 
 async fn handle_ptr_query(
@@ -329,6 +347,14 @@ fn parse_ptr_name(name: &str) -> Option<IpAddr> {
     }
 
     None
+}
+
+/// Resolve `<hostname>.<network>` (without .pi suffix).
+/// Used when the OS routes a bare network domain to us via supplemental match.
+async fn resolve_bare_network_name(name: &str, table: &HostnameTable) -> Option<HostnameEntry> {
+    let (hostname, network) = name.rsplit_once('.')?;
+    let table_guard = table.read().await;
+    table_guard.get(network)?.get(hostname).copied()
 }
 
 pub async fn resolve_name(name: &str, suffix: &str, table: &HostnameTable) -> Option<HostnameEntry> {

@@ -94,43 +94,48 @@ pub fn restore_stale_backups() {
     }
 }
 
-/// Update system search domains so bare hostnames resolve through pitopi.
-/// Sets search domains to `pi` + `<network>.pi` for each active network.
+/// Update system DNS routing so bare hostnames and `<host>.<network>` resolve.
+/// Configures search domains (`<network>.pi`, `pi`) and supplemental match
+/// domains (each network name + `pi`) so the OS routes queries to pitopi.
 /// Call whenever networks are joined or left.
 pub fn update_search_domains(network_names: &[String], tun_name: &str) {
-    let mut domains: Vec<String> = network_names
+    let mut search: Vec<String> = network_names
         .iter()
         .map(|n| format!("{n}.{DNS_DOMAIN}"))
         .collect();
-    domains.push(DNS_DOMAIN.to_string());
+    search.push(DNS_DOMAIN.to_string());
 
-    if let Err(e) = set_search_domains(&domains, tun_name) {
+    if let Err(e) = set_search_domains(&search, network_names, tun_name) {
         tracing::warn!(error = %e, "failed to update search domains");
     } else {
-        tracing::info!(domains = ?domains, "updated search domains");
+        tracing::info!(search = ?search, match_domains = ?network_names, "updated search domains");
     }
 }
 
 /// Remove all pitopi search domains (called on daemon shutdown).
 pub fn clear_search_domains(tun_name: &str) {
-    if let Err(e) = set_search_domains(&[], tun_name) {
+    if let Err(e) = set_search_domains(&[], &[], tun_name) {
         tracing::warn!(error = %e, "failed to clear search domains");
     }
 }
 
-fn set_search_domains(pitopi_domains: &[String], tun_name: &str) -> Result<()> {
+fn set_search_domains(
+    pitopi_domains: &[String],
+    network_names: &[String],
+    tun_name: &str,
+) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let _ = tun_name;
-        write_dns_config_macos(pitopi_domains)
+        write_dns_config_macos(pitopi_domains, network_names)
     }
     #[cfg(target_os = "linux")]
     {
-        set_search_domains_linux(pitopi_domains, tun_name)
+        set_search_domains_linux(pitopi_domains, network_names, tun_name)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (pitopi_domains, tun_name);
+        let _ = (pitopi_domains, network_names, tun_name);
         Ok(())
     }
 }
@@ -188,7 +193,10 @@ mod macos {
         Ok(STORE.get().unwrap())
     }
 
-    pub fn write_dns_config(search_domains: &[String]) -> Result<()> {
+    pub fn write_dns_config(
+        search_domains: &[String],
+        network_names: &[String],
+    ) -> Result<()> {
         let store = get_or_init_store()?;
         let store = store.lock().unwrap();
 
@@ -197,9 +205,14 @@ mod macos {
         let server_val =
             CFArray::from_CFTypes(&[CFString::from_static_string(RESOLVER_IP)]);
 
+        // Route .pi + each bare network name to our resolver
         let match_key =
             unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSSupplementalMatchDomains) };
-        let match_val = CFArray::from_CFTypes(&[CFString::new(DNS_DOMAIN)]);
+        let mut match_domains: Vec<CFString> = vec![CFString::new(DNS_DOMAIN)];
+        for name in network_names {
+            match_domains.push(CFString::new(name));
+        }
+        let match_val = CFArray::from_CFTypes(&match_domains);
 
         let search_key =
             unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSSearchDomains) };
@@ -227,7 +240,7 @@ mod macos {
     impl DnsConfigurator for MacosDynamicStoreDns {
         fn apply(&self) -> Result<()> {
             init_store()?;
-            write_dns_config(&[DNS_DOMAIN.to_string()])?;
+            write_dns_config(&[DNS_DOMAIN.to_string()], &[])?;
             tracing::info!(
                 key = SC_DNS_KEY,
                 "configured macOS DNS via SCDynamicStore for .{DNS_DOMAIN}"
@@ -254,8 +267,8 @@ mod macos {
 use macos::MacosDynamicStoreDns;
 
 #[cfg(target_os = "macos")]
-fn write_dns_config_macos(search_domains: &[String]) -> Result<()> {
-    macos::write_dns_config(search_domains)
+fn write_dns_config_macos(search_domains: &[String], network_names: &[String]) -> Result<()> {
+    macos::write_dns_config(search_domains, network_names)
 }
 
 // ---------------------------------------------------------------------------
@@ -263,13 +276,21 @@ fn write_dns_config_macos(search_domains: &[String]) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-fn set_search_domains_linux(pitopi_domains: &[String], tun_name: &str) -> Result<()> {
+fn set_search_domains_linux(
+    pitopi_domains: &[String],
+    network_names: &[String],
+    tun_name: &str,
+) -> Result<()> {
     let ifindex = linux::get_ifindex(tun_name);
 
     // Try D-Bus first
     if let Some(idx) = ifindex {
         if let Ok(conn) = zbus::blocking::Connection::system() {
             let mut domains: Vec<(String, bool)> = vec![(DNS_DOMAIN.to_string(), true)];
+            // Each network name as a routing domain (~network)
+            for name in network_names {
+                domains.push((name.clone(), true));
+            }
             for d in pitopi_domains {
                 domains.push((d.clone(), false));
             }
@@ -291,6 +312,9 @@ fn set_search_domains_linux(pitopi_domains: &[String], tun_name: &str) -> Result
     if Command::new("resolvectl").arg("status").output().is_ok_and(|o| o.status.success()) {
         let mut args = vec!["domain".to_string(), tun_name.to_string()];
         args.push(format!("~{DNS_DOMAIN}"));
+        for name in network_names {
+            args.push(format!("~{name}"));
+        }
         args.extend(pitopi_domains.iter().cloned());
         let status = Command::new("resolvectl")
             .args(&args)
