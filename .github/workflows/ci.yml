@@ -11,9 +11,8 @@ env:
 
 jobs:
   check:
-    runs-on: runs-on=${{ github.run_id }}/runner=4cpu-linux-x64/image=ubuntu22-full-x64/extras=s3-cache
+    runs-on: ubuntu-22.04
     steps:
-      - uses: runs-on/action@v2
       - uses: actions/checkout@v4
 
       - name: Install Rust
