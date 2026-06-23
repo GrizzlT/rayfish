@@ -5,6 +5,8 @@
 //! of truth for that protocol so frontends never hand-mirror it.
 
 pub mod ipc;
+pub mod policy;
 mod types;
 
+pub use policy::{HostSuggestions, SuggestedFirewall};
 pub use types::{GroupMode, TransportMode};

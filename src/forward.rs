@@ -308,6 +308,7 @@ mod tests {
                 port: Some(firewall::PortRange { start: 22, end: 22 }),
                 peer: firewall::PeerFilter::Any,
                 network: None,
+                origin: firewall::RuleOrigin::Local,
             }],
         );
         let blocked = make_tcp_packet(22);

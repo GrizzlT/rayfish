@@ -9,6 +9,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Result, bail};
 use iroh::EndpointId;
+use ray_proto::SuggestedFirewall;
 use serde::{Deserialize, Serialize};
 
 use crate::control::DeviceCert;
@@ -321,21 +322,32 @@ impl IdentityProvider for IrohIdentityProvider {
 // ---------------------------------------------------------------------------
 
 /// The single authoritative blob for a network, published by the coordinator.
-/// Contains all state a joiner needs: members and the approved list.
+/// Contains all state a joiner needs: members, the approved list, and (for a
+/// trusted network) the coordinator-suggested firewall rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupBlob {
     pub members: Vec<Member>,
     pub approved: Vec<ApprovedEntry>,
+    /// Trusted network: members may take the suggested firewall rules below.
+    #[serde(default)]
+    pub trusted: bool,
+    /// Coordinator-suggested firewall rules, keyed by subject hostname. Empty on
+    /// a trustless network. `BTreeMap` keys keep the encoding canonical.
+    #[serde(default, skip_serializing_if = "SuggestedFirewall::is_empty")]
+    pub suggested_firewall: SuggestedFirewall,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
 /// Produces a deterministic msgpack encoding of a group blob.
 /// Members and approved entries are sorted by identity string to ensure
-/// identical output regardless of HashMap iteration order.
+/// identical output regardless of HashMap iteration order; the suggested
+/// firewall is a `BTreeMap`, so it is already canonically ordered.
 pub fn canonical_group_bytes(
     members: &MemberList,
     approved: &ApprovedList,
+    trusted: bool,
+    suggested_firewall: &SuggestedFirewall,
     name: Option<&str>,
 ) -> Vec<u8> {
     let mut sorted_members: Vec<Member> = members.all().into_iter().cloned().collect();
@@ -347,6 +359,8 @@ pub fn canonical_group_bytes(
     let data = GroupBlob {
         members: sorted_members,
         approved: sorted_approved,
+        trusted,
+        suggested_firewall: suggested_firewall.clone(),
         name: name.map(|s| s.to_string()),
     };
     rmp_serde::to_vec_named(&data).expect("msgpack serialize")
@@ -355,9 +369,11 @@ pub fn canonical_group_bytes(
 pub fn group_blob_hash(
     members: &MemberList,
     approved: &ApprovedList,
+    trusted: bool,
+    suggested_firewall: &SuggestedFirewall,
     name: Option<&str>,
 ) -> blake3::Hash {
-    let bytes = canonical_group_bytes(members, approved, name);
+    let bytes = canonical_group_bytes(members, approved, trusted, suggested_firewall, name);
     blake3::hash(&bytes)
 }
 
@@ -871,8 +887,8 @@ mod tests {
     fn test_canonical_bytes_deterministic() {
         let members = make_member_list(&[1, 2, 3]);
         let approved = ApprovedList::new();
-        let a = canonical_group_bytes(&members, &approved, None);
-        let b = canonical_group_bytes(&members, &approved, None);
+        let a = canonical_group_bytes(&members, &approved, false, &ray_proto::SuggestedFirewall::default(), None);
+        let b = canonical_group_bytes(&members, &approved, false, &ray_proto::SuggestedFirewall::default(), None);
         assert_eq!(a, b);
     }
 
@@ -882,8 +898,8 @@ mod tests {
         let m2 = make_member_list(&[3, 1, 2]);
         let approved = ApprovedList::new();
         assert_eq!(
-            canonical_group_bytes(&m1, &approved, None),
-            canonical_group_bytes(&m2, &approved, None),
+            canonical_group_bytes(&m1, &approved, false, &ray_proto::SuggestedFirewall::default(), None),
+            canonical_group_bytes(&m2, &approved, false, &ray_proto::SuggestedFirewall::default(), None),
         );
     }
 
@@ -891,9 +907,9 @@ mod tests {
     fn test_group_blob_hash_changes_on_mutation() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let h1 = group_blob_hash(&members, &approved, None);
+        let h1 = group_blob_hash(&members, &approved, false, &ray_proto::SuggestedFirewall::default(), None);
         let members2 = make_member_list(&[1, 2, 3]);
-        let h2 = group_blob_hash(&members2, &approved, None);
+        let h2 = group_blob_hash(&members2, &approved, false, &ray_proto::SuggestedFirewall::default(), None);
         assert_ne!(h1, h2);
     }
 
@@ -915,7 +931,7 @@ mod tests {
             )
             .unwrap();
 
-        let bytes = canonical_group_bytes(&members, &approved, None);
+        let bytes = canonical_group_bytes(&members, &approved, false, &ray_proto::SuggestedFirewall::default(), None);
         let data = decode_group_blob(&bytes).unwrap();
         assert_eq!(data.members.len(), 2);
         assert_eq!(data.approved.len(), 1);
@@ -925,8 +941,8 @@ mod tests {
     fn test_verify_group_blob_ok() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let bytes = canonical_group_bytes(&members, &approved, None);
-        let hash = group_blob_hash(&members, &approved, None);
+        let bytes = canonical_group_bytes(&members, &approved, false, &ray_proto::SuggestedFirewall::default(), None);
+        let hash = group_blob_hash(&members, &approved, false, &ray_proto::SuggestedFirewall::default(), None);
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members.len(), 2);
     }
@@ -935,11 +951,62 @@ mod tests {
     fn test_verify_group_blob_bad_hash() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let bytes = canonical_group_bytes(&members, &approved, None);
+        let bytes = canonical_group_bytes(&members, &approved, false, &ray_proto::SuggestedFirewall::default(), None);
         let bad_hash = blake3::hash(b"wrong data");
         let result = verify_group_blob(&bytes, &bad_hash);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn test_suggested_firewall_canonical_and_hashed() {
+        use ray_proto::{HostSuggestions, SuggestedFirewall};
+        let members = make_member_list(&[1, 2]);
+        let approved = ApprovedList::new();
+        let mut sf = SuggestedFirewall::new();
+        let mut hs = HostSuggestions::default();
+        hs.allows
+            .insert("peer-a".to_string(), "9000,8123".to_string());
+        sf.insert("subject".to_string(), hs);
+
+        // Deterministic: BTreeMap keys canonicalize regardless of insert order.
+        let a = canonical_group_bytes(&members, &approved, true, &sf, None);
+        let b = canonical_group_bytes(&members, &approved, true, &sf, None);
+        assert_eq!(a, b);
+
+        // Suggestions are part of the signed content, so they change the hash.
+        let h_empty =
+            group_blob_hash(&members, &approved, true, &SuggestedFirewall::new(), None);
+        let h_sf = group_blob_hash(&members, &approved, true, &sf, None);
+        assert_ne!(h_empty, h_sf);
+
+        // And `trusted` is part of the content too.
+        let h_untrusted =
+            group_blob_hash(&members, &approved, false, &SuggestedFirewall::new(), None);
+        assert_ne!(h_empty, h_untrusted);
+    }
+
+    #[test]
+    fn test_old_blob_without_trusted_fields_decodes() {
+        // A blob serialized before trusted networks existed (no `trusted` /
+        // `suggested_firewall` keys) must still decode, defaulting both.
+        #[derive(Serialize)]
+        struct OldBlob {
+            members: Vec<Member>,
+            approved: Vec<ApprovedEntry>,
+            name: Option<String>,
+        }
+        let members = make_member_list(&[1, 2]);
+        let old = OldBlob {
+            members: members.all().into_iter().cloned().collect(),
+            approved: vec![],
+            name: Some("net".to_string()),
+        };
+        let bytes = rmp_serde::to_vec_named(&old).unwrap();
+        let blob = decode_group_blob(&bytes).unwrap();
+        assert_eq!(blob.members.len(), 2);
+        assert!(!blob.trusted);
+        assert!(blob.suggested_firewall.is_empty());
     }
 
     // -- validate_member / validate_approved ---------------------------------
@@ -1064,6 +1131,8 @@ mod tests {
         let blob = GroupBlob {
             members: vec![bad_member],
             approved: vec![],
+            trusted: false,
+            suggested_firewall: Default::default(),
             name: None,
         };
         let bytes = rmp_serde::to_vec_named(&blob).unwrap();
@@ -1085,6 +1154,8 @@ mod tests {
         let blob = GroupBlob {
             members: vec![bad_member],
             approved: vec![],
+            trusted: false,
+            suggested_firewall: Default::default(),
             name: None,
         };
         let bytes = rmp_serde::to_vec_named(&blob).unwrap();

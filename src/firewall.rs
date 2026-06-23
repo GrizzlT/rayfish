@@ -85,6 +85,25 @@ impl PortRange {
     }
 }
 
+/// Where a [`FirewallRule`] came from. `Local` rules are hand-added by this
+/// device (`ray firewall add`) and are never touched by trusted-network
+/// reconvergence. `Network(net)` rules were materialized from a coordinator's
+/// suggestions for that network; the node replaces the whole `Network(net)` set
+/// on each blob update, so the blob stays authoritative for what it manages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleOrigin {
+    #[default]
+    Local,
+    Network(String),
+}
+
+impl RuleOrigin {
+    pub fn is_local(&self) -> bool {
+        matches!(self, RuleOrigin::Local)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirewallRule {
     pub direction: Direction,
@@ -98,6 +117,11 @@ pub struct FirewallRule {
     /// "allow :8080 only from peers reached via `db`".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
+    /// Provenance: hand-added (`Local`) vs. materialized from a network's
+    /// coordinator suggestions (`Network(net)`). Defaults to `Local` so older
+    /// `firewall.toml` files keep working.
+    #[serde(default, skip_serializing_if = "RuleOrigin::is_local")]
+    pub origin: RuleOrigin,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -675,6 +699,7 @@ mod tests {
                 port: Some(PortRange { start: 22, end: 22 }),
                 peer: PeerFilter::Any,
                 network: None,
+                origin: RuleOrigin::Local,
             }],
         });
         assert_eq!(fw.evaluate(Direction::In, 6, 22, &test_id(1)), Action::Deny);
@@ -702,6 +727,7 @@ mod tests {
                 port: Some(PortRange { start: 22, end: 22 }),
                 peer: PeerFilter::Any,
                 network: Some("db".to_string()),
+                origin: RuleOrigin::Local,
             }],
         });
         let info = PacketInfo {
@@ -744,6 +770,7 @@ mod tests {
                 }),
                 peer: PeerFilter::Any,
                 network: None,
+                origin: RuleOrigin::Local,
             }],
         });
         assert_eq!(
@@ -768,6 +795,7 @@ mod tests {
                 port: None,
                 peer: PeerFilter::Identity(test_id(1)),
                 network: None,
+                origin: RuleOrigin::Local,
             }],
         });
         assert_eq!(
@@ -789,6 +817,7 @@ mod tests {
                     port: Some(PortRange { start: 22, end: 22 }),
                     peer: PeerFilter::Any,
                     network: None,
+                    origin: RuleOrigin::Local,
                 },
                 FirewallRule {
                     direction: Direction::In,
@@ -797,6 +826,7 @@ mod tests {
                     port: None,
                     peer: PeerFilter::Any,
                     network: None,
+                    origin: RuleOrigin::Local,
                 },
             ],
         });
@@ -841,6 +871,7 @@ mod tests {
                 }),
                 peer: PeerFilter::Any,
                 network: None,
+                origin: RuleOrigin::Local,
             }],
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -904,6 +935,7 @@ mod tests {
                 port: Some(PortRange { start: 22, end: 22 }),
                 peer: PeerFilter::Any,
                 network: None,
+                origin: RuleOrigin::Local,
             }],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -948,6 +980,7 @@ mod tests {
                 }),
                 peer: PeerFilter::Any,
                 network: None,
+                origin: RuleOrigin::Local,
             }],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1004,6 +1037,7 @@ mod tests {
                 }),
                 peer: PeerFilter::Any,
                 network: None,
+                origin: RuleOrigin::Local,
             }],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1048,6 +1082,7 @@ mod tests {
                 port: Some(PortRange { start: 53, end: 53 }),
                 peer: PeerFilter::Any,
                 network: None,
+                origin: RuleOrigin::Local,
             }],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1089,6 +1124,7 @@ mod tests {
                 port: None,
                 peer: PeerFilter::Identity(test_id(9)),
                 network: None,
+                origin: RuleOrigin::Local,
             }],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);
@@ -1131,6 +1167,7 @@ mod tests {
                 }),
                 peer: PeerFilter::Any,
                 network: None,
+                origin: RuleOrigin::Local,
             }],
         });
         let me = Ipv4Addr::new(100, 64, 0, 2);

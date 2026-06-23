@@ -69,6 +69,7 @@ use crate::membership::{
     ApprovedEntry, ApprovedList, GroupMode, IdentityProvider, IrohIdentityProvider, Member,
     MemberList, canonical_group_bytes, derive_ipv6, group_blob_hash, verify_group_blob,
 };
+use ray_proto::SuggestedFirewall;
 use crate::network_name;
 use crate::peers::{self, PeerTable};
 use crate::stats::ForwardMetrics;
@@ -847,6 +848,13 @@ struct NetworkState {
     /// Access mode (open auto-admits; restricted gates unknown joiners). Only the
     /// coordinator's accept path consults this; members default to `Restricted`.
     mode: GroupMode,
+    /// Trusted network: the coordinator distributes the `suggested_firewall`
+    /// below in the signed blob and members may take it.
+    trusted: bool,
+    /// Coordinator-suggested firewall rules carried in the blob (keyed by subject
+    /// hostname). On a coordinator this is what it publishes; on a member it is
+    /// what it last received and materializes rules from.
+    suggested_firewall: SuggestedFirewall,
     /// Peers awaiting live operator approval on a closed network (coordinator
     /// only, in-memory, never persisted or published).
     pending: HashMap<EndpointId, PendingJoin>,
@@ -864,6 +872,8 @@ impl NetworkState {
         let bytes = canonical_group_bytes(
             &self.members,
             &self.approved,
+            self.trusted,
+            &self.suggested_firewall,
             self.network_name.as_deref(),
         );
         let hash = blake3::hash(&bytes);
@@ -1189,6 +1199,8 @@ impl DaemonState {
             network_public_key: net_public_key,
             network_name: Some(name.clone()),
             mode,
+            trusted: false,
+            suggested_firewall: SuggestedFirewall::default(),
             pending: HashMap::new(),
         };
 
@@ -1251,6 +1263,8 @@ impl DaemonState {
                 network_secret_key: Some(net_secret_key.clone()),
                 network_public_key: Some(net_public_key),
                 transport: None,
+                trusted: false,
+                allow_trusted: false,
             },
         );
         config::save(&app_config)?;
@@ -1878,6 +1892,8 @@ impl DaemonState {
                 network_public_key: net_pubkey,
                 network_name: data.name.clone(),
                 mode: GroupMode::Restricted,
+                trusted: false,
+                suggested_firewall: SuggestedFirewall::default(),
                 pending: HashMap::new(),
             };
             ns.refresh_snapshot();
@@ -2005,6 +2021,8 @@ impl DaemonState {
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),
             mode,
+            trusted: false,
+            suggested_firewall: SuggestedFirewall::default(),
             pending: HashMap::new(),
         };
 
@@ -2067,6 +2085,8 @@ impl DaemonState {
                 network_secret_key: Some(net_secret_key.clone()),
                 network_public_key: Some(net_public_key),
                 transport: None,
+                trusted: false,
+                allow_trusted: false,
             },
         );
         config::save(&app_config)?;
@@ -2222,7 +2242,7 @@ impl DaemonState {
         if let Some(key) = net_secret_key
             && let Ok(client) = dht::create_pkarr_client(&self.endpoint)
         {
-            let empty_hash = group_blob_hash(&MemberList::new(), &ApprovedList::new(), None);
+            let empty_hash = group_blob_hash(&MemberList::new(), &ApprovedList::new(), false, &SuggestedFirewall::default(), None);
             if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[]).await {
                 tracing::warn!(error = %e, "failed to publish empty network record on nuke");
             }
@@ -3154,6 +3174,7 @@ impl DaemonState {
             port,
             peer,
             network: network.map(str::to_string),
+            origin: firewall::RuleOrigin::Local,
         };
         let mut config = (*self.firewall.get_config()).clone();
         config.rules.push(rule);
@@ -3924,7 +3945,7 @@ fn spawn_network_publisher(
                     .as_ref()
                     .map(|snap| snap.hash)
                     .unwrap_or_else(|| {
-                        group_blob_hash(&s.members, &s.approved, s.network_name.as_deref())
+                        group_blob_hash(&s.members, &s.approved, s.trusted, &s.suggested_firewall, s.network_name.as_deref())
                     })
             };
             let mut seed_peers: Vec<EndpointId> = peers
@@ -4462,6 +4483,8 @@ async fn join_mesh_shared(
             network_secret_key: None,
             network_public_key: Some(net_pubkey),
             transport: None,
+            trusted: false,
+            allow_trusted: false,
         },
     );
     config::save(&app_config)?;
@@ -4564,6 +4587,8 @@ async fn join_mesh_shared(
             network_public_key: net_pubkey,
             network_name: Some(network_name.to_string()),
             mode: GroupMode::Restricted,
+            trusted: false,
+            suggested_firewall: SuggestedFirewall::default(),
             pending: HashMap::new(),
         };
         ns.refresh_snapshot();

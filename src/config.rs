@@ -113,6 +113,15 @@ pub struct NetworkConfig {
     pub network_public_key: Option<EndpointId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportMode>,
+    /// Trusted network: the coordinator may suggest firewall rules to members
+    /// via the signed blob. Set at create (`ray create --trusted`).
+    #[serde(default)]
+    pub trusted: bool,
+    /// This node auto-takes (installs) coordinator-suggested rules without a
+    /// manual review queue. Set by `ray join --allow-trusted` / `ray up
+    /// --allow-trusted`. Only meaningful on a `trusted` network.
+    #[serde(default)]
+    pub allow_trusted: bool,
 }
 
 fn default_true() -> bool {
@@ -229,6 +238,8 @@ mod tests {
                     network_public_key: None,
                     my_hostname: None,
                     transport: None,
+                    trusted: false,
+                    allow_trusted: false,
                 },
                 NetworkConfig {
                     name: "work".to_string(),
@@ -240,6 +251,8 @@ mod tests {
                     network_public_key: None,
                     my_hostname: None,
                     transport: None,
+                    trusted: false,
+                    allow_trusted: false,
                 },
             ],
             ..Default::default()
@@ -272,6 +285,8 @@ mod tests {
             network_public_key: None,
             my_hostname: None,
             transport: None,
+            trusted: false,
+            allow_trusted: false,
         };
         upsert_network(&mut config, net);
         assert_eq!(config.networks.len(), 1);
@@ -292,6 +307,8 @@ mod tests {
                 network_public_key: None,
                 my_hostname: None,
                 transport: None,
+                trusted: false,
+                allow_trusted: false,
             }],
             ..Default::default()
         };
@@ -305,6 +322,8 @@ mod tests {
             network_public_key: None,
             my_hostname: None,
             transport: None,
+            trusted: false,
+            allow_trusted: false,
         };
         upsert_network(&mut config, updated.clone());
         assert_eq!(config.networks.len(), 1);
@@ -329,6 +348,8 @@ mod tests {
                     network_public_key: None,
                     my_hostname: None,
                     transport: None,
+                    trusted: false,
+                    allow_trusted: false,
                 },
                 NetworkConfig {
                     name: "remove-me".to_string(),
@@ -340,6 +361,8 @@ mod tests {
                     network_public_key: None,
                     my_hostname: None,
                     transport: None,
+                    trusted: false,
+                    allow_trusted: false,
                 },
             ],
             ..Default::default()
@@ -379,6 +402,8 @@ mod tests {
                 network_public_key: None,
                 my_hostname: None,
                 transport: None,
+                trusted: false,
+                allow_trusted: false,
             }],
             ..Default::default()
         };
@@ -403,6 +428,8 @@ mod tests {
                 network_public_key: Some(public),
                 my_hostname: None,
                 transport: None,
+                trusted: false,
+                allow_trusted: false,
             }],
             ..Default::default()
         };
