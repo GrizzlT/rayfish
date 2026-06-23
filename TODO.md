@@ -39,6 +39,31 @@ an item serves that socket/DNS surface.
   - **DNS:** A + AAAA queries answered from `HostnameEntry = (Ipv4Addr, Ipv6Addr)`
   - **Hot-path:** SmolStr network names, Arc<AclData>, ArcSwap firewall — zero heap
     allocations and zero locks on the per-packet forwarding path
+  - **TUN MTU = 1280:** the IPv6 minimum (RFC 8200 §5). Below this, Linux refuses to
+    enable IPv6 on the device (`configure_ipv6`/`route_peer_range` fail with netlink
+    `EINVAL`, IPv6 silently dead — exactly the bug that hit the Scaleway Linux peer:
+    v4 ping worked, v6 timed out). 1280 is also WireGuard/Tailscale's TUN MTU.
+- [ ] **Per-peer PMTU feedback (synthetic ICMP) — fixes the MTU conflict**
+  - Two hard constraints conflict and **no single static TUN MTU satisfies both**:
+    - Linux enables IPv6 only at MTU ≥ 1280 (so 1280 is the floor for v6 to work at all)
+    - iroh QUIC datagrams cap the payload per-connection; on a measured *direct* path
+      the cap was ≈1223 bytes (`max_datagram_size()`, quinn's `max_datagram_frame_size`),
+      so any full-size TUN packet above that is dropped as `SendDatagramError::TooLarge`.
+      (The old MTU 1200 fit the datagram floor but broke IPv6; 1280 fixes v6 but makes
+      full-size packets to low-cap peers black-hole — small/interactive traffic is fine,
+      large transfers stall.)
+  - Keep TUN MTU at 1280 and give the OS path-MTU discovery instead:
+    - In `run_mesh` (`src/forward.rs`), handle `SendDatagramError::TooLarge` distinctly
+      from other send failures (today both hit `DropReason::SendFailure`).
+    - Read `route.conn.max_datagram_size()` → the real per-peer datagram cap.
+    - Synthesize **ICMPv4 Type 3 Code 4** ("fragmentation needed") or **ICMPv6 Type 2**
+      ("Packet Too Big") carrying `next-hop MTU = max_datagram_size() − transport overhead`,
+      using the original packet's src/dst, and inject it back into the TUN via `tun_tx`.
+      The OS then clamps TCP MSS / shrinks future packets to that peer per-destination.
+  - Wire-up: `tun_tx` must reach `run_mesh` (currently only peer readers own it); add an
+    ICMP-synthesis helper (v4 + v6, with checksums); unit-test the synthesized frames.
+    ~100 lines. This is the WireGuard/Tailscale model — each peer gets the largest MTU
+    its path supports, nothing silently drops, and v6 stays up.
 - [x] **Magic DNS**
   - Local resolver intercepts `.pi` queries → A records (IPv4) + AAAA records (IPv6)
   - Per-network names: `alice.gaming.pi`, registered on join via `--hostname`
