@@ -3195,16 +3195,27 @@ impl DaemonState {
             };
         };
 
-        // The target must be a member of this network. Open a fresh stream over
-        // the network's ALPN (already peer-authenticated by iroh's TLS).
-        let alpn = transport::network_alpn(&net_pubkey);
-        let conn = match transport::connect_to_peer_with_alpn(&self.endpoint, identity, &alpn).await {
+        // The target must be a member of this network. Send the grant over the
+        // *existing* mesh connection to that member (the one its control reader
+        // is accept_bi-ing on from join time). Opening a fresh connection would
+        // land the AdminGrant on the member's new-connection handler, which
+        // expects a MeshHello first and silently drops anything else.
+        let conn = self
+            .peers
+            .peers_for_network_with_conn(network)
+            .into_iter()
+            .find(|(id, _, _)| *id == identity)
+            .map(|(_, _, c)| c)
+            .ok_or_else(|| {
+                IpcMessage::Error {
+                    message: format!(
+                        "could not find an active connection to {identity} on '{network}'"
+                    ),
+                }
+            });
+        let conn = match conn {
             Ok(c) => c,
-            Err(e) => {
-                return IpcMessage::Error {
-                    message: format!("could not reach {identity}: {e}"),
-                };
-            }
+            Err(e) => return e,
         };
         let grant = ControlMsg::AdminGrant {
             network_pubkey: net_pubkey,
