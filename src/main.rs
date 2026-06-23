@@ -96,6 +96,11 @@ enum Command {
         /// Route traffic through Tor (requires running Tor daemon with ControlPort 9051)
         #[arg(long)]
         tor: bool,
+        /// Trusted network: as coordinator you may suggest firewall rules to
+        /// members (`ray firewall suggest` / `ray apply`), distributed in the
+        /// signed blob and taken by members that opt in with `--allow-trusted`.
+        #[arg(long)]
+        trusted: bool,
     },
     /// Join an existing network using its room id or an invite code
     Join {
@@ -110,6 +115,10 @@ enum Command {
         /// Route traffic through Tor (requires running Tor daemon with ControlPort 9051)
         #[arg(long)]
         tor: bool,
+        /// Auto-take coordinator-suggested firewall rules on this network without
+        /// a manual review queue (managed node).
+        #[arg(long)]
+        allow_trusted: bool,
     },
     /// Leave a network (remove from saved config)
     Leave {
@@ -137,6 +146,10 @@ enum Command {
         /// when create/join don't specify one; doesn't rename existing networks
         #[arg(long)]
         hostname: Option<String>,
+        /// Opt every saved network into auto-taking coordinator-suggested
+        /// firewall rules (persisted; applies to trusted networks).
+        #[arg(long)]
+        allow_trusted: bool,
     },
     /// Disconnect from all networks (signals daemon to shut down)
     Down,
@@ -285,6 +298,24 @@ enum FirewallAction {
     Default {
         /// Default action: allow or deny
         action: String,
+    },
+    /// Coordinator-only: suggest firewall rules for a subject host on a trusted
+    /// network. Distributed in the signed blob; members take them per consent.
+    Suggest {
+        /// Network name
+        network: String,
+        /// Subject host (the hostname the rules protect)
+        #[arg(long)]
+        subject: String,
+        /// Allow a peer on ports, e.g. `--allow earn01:9000,8123` (repeatable)
+        #[arg(long, value_name = "PEER:PORTS")]
+        allow: Vec<String>,
+        /// Deny a peer on ports (repeatable)
+        #[arg(long, value_name = "PEER:PORTS")]
+        deny: Vec<String>,
+        /// Default action for the subject on this network: allow or deny
+        #[arg(long)]
+        default: Option<String>,
     },
 }
 
@@ -520,20 +551,22 @@ async fn main() -> Result<()> {
             name,
             hostname,
             tor,
+            trusted,
         } => {
             let mode = if open {
                 GroupMode::Open
             } else {
                 GroupMode::Restricted
             };
-            ipc_create(mode, name, hostname, tor).await
+            ipc_create(mode, name, hostname, tor, trusted).await
         }
         Command::Join {
             network_key,
             name,
             hostname,
             tor,
-        } => ipc_join(&network_key, name.as_deref(), hostname, tor).await,
+            allow_trusted,
+        } => ipc_join(&network_key, name.as_deref(), hostname, tor, allow_trusted).await,
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
         Command::Status => ipc_status().await,
         Command::Report => ipc_report().await,
@@ -545,7 +578,10 @@ async fn main() -> Result<()> {
             stats.spawn_logger(token.clone());
             daemon::run_daemon(token, stats).await
         }
-        Command::Up { hostname } => cmd_up(hostname).await,
+        Command::Up {
+            hostname,
+            allow_trusted,
+        } => cmd_up(hostname, allow_trusted).await,
         Command::Down => ipc_down().await,
         Command::Uninstall => cmd_uninstall_service(),
         Command::Install => cmd_install().await,
@@ -632,6 +668,7 @@ async fn ipc_create(
     name: Option<String>,
     hostname: Option<String>,
     tor: bool,
+    trusted: bool,
 ) -> Result<()> {
     let transport = if tor {
         Some(config::TransportMode::Tor)
@@ -646,6 +683,7 @@ async fn ipc_create(
             name,
             hostname,
             transport,
+            trusted,
         },
     )
     .await?;
@@ -702,6 +740,7 @@ async fn ipc_join(
     name: Option<&str>,
     hostname: Option<String>,
     tor: bool,
+    allow_trusted: bool,
 ) -> Result<()> {
     let transport = if tor {
         Some(config::TransportMode::Tor)
@@ -725,6 +764,7 @@ async fn ipc_join(
             transport,
             invite,
             coordinator,
+            allow_trusted,
         },
     )
     .await?;
@@ -1225,6 +1265,16 @@ async fn ipc_deny_request(network: &str, id: &str) -> Result<()> {
 }
 
 async fn ipc_firewall(action: FirewallAction) -> Result<()> {
+    if let FirewallAction::Suggest {
+        network,
+        subject,
+        allow,
+        deny,
+        default,
+    } = action
+    {
+        return ipc_firewall_suggest(&network, &subject, allow, deny, default).await;
+    }
     let mut stream = ipc::connect().await?;
     let req = match action {
         FirewallAction::Add {
@@ -1245,6 +1295,8 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         FirewallAction::Remove { index } => ipc::IpcMessage::FirewallRemove { index },
         FirewallAction::Show => ipc::IpcMessage::FirewallShow,
         FirewallAction::Default { action } => ipc::IpcMessage::FirewallDefault { action },
+        // Handled above by early return (needs a read-modify-write round trip).
+        FirewallAction::Suggest { .. } => unreachable!(),
     };
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
@@ -1253,6 +1305,82 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         ipc::IpcMessage::FirewallState { display } => print!("{}", display),
         ipc::IpcMessage::Error { message } => eprintln!("Error: {}", message),
         other => eprintln!("Unexpected response: {:?}", other),
+    }
+    Ok(())
+}
+
+/// `ray firewall suggest`: read the network's current suggestions, merge the
+/// requested subject edits, and publish the updated set (coordinator-only).
+async fn ipc_firewall_suggest(
+    network: &str,
+    subject: &str,
+    allow: Vec<String>,
+    deny: Vec<String>,
+    default: Option<String>,
+) -> Result<()> {
+    use ray_proto::HostSuggestions;
+
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::FirewallSuggestions {
+            network: network.to_string(),
+        },
+    )
+    .await?;
+    let mut suggestions = match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::FirewallSuggestionsResponse { suggestions } => suggestions,
+        ipc::IpcMessage::Error { message } => {
+            eprintln!("Error: {message}");
+            std::process::exit(1);
+        }
+        other => {
+            eprintln!("Unexpected response: {other:?}");
+            std::process::exit(1);
+        }
+    };
+
+    let parse = |spec: &str, flag: &str| -> Result<(String, String)> {
+        let (peer, ports) = spec
+            .split_once(':')
+            .with_context(|| format!("{flag} expects PEER:PORTS, got '{spec}'"))?;
+        anyhow::ensure!(
+            !peer.is_empty() && !ports.is_empty(),
+            "{flag} expects PEER:PORTS, got '{spec}'"
+        );
+        Ok((peer.to_string(), ports.to_string()))
+    };
+
+    let entry = suggestions.entry(subject.to_string()).or_default();
+    if let Some(d) = default {
+        entry.default = Some(d);
+    }
+    for a in &allow {
+        let (peer, ports) = parse(a, "--allow")?;
+        entry.allows.insert(peer, ports);
+    }
+    for d in &deny {
+        let (peer, ports) = parse(d, "--deny")?;
+        entry.denies.insert(peer, ports);
+    }
+    // Drop a now-empty subject so removing all of a host's rules clears it.
+    if entry == &HostSuggestions::default() {
+        suggestions.remove(subject);
+    }
+
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::FirewallSuggest {
+            network: network.to_string(),
+            suggestions,
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::Error { message } => eprintln!("Error: {message}"),
+        other => eprintln!("Unexpected response: {other:?}"),
     }
     Ok(())
 }
@@ -1553,9 +1681,16 @@ fn ensure_service_installed() -> Result<()> {
 /// to bring the TUN up, configure DNS, and reconnect networks. Only when no
 /// daemon is reachable do we fall back to installing/starting the system
 /// service, which requires root.
-async fn cmd_up(hostname: Option<String>) -> Result<()> {
+async fn cmd_up(hostname: Option<String>, allow_trusted: bool) -> Result<()> {
     if let Ok(mut stream) = ipc::connect().await {
-        ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
+        ipc::send(
+            &mut stream,
+            ipc::IpcMessage::Up {
+                hostname,
+                allow_trusted,
+            },
+        )
+        .await?;
         match ipc::recv(&mut stream).await? {
             ipc::IpcMessage::Ok { message } => println!("{message}"),
             ipc::IpcMessage::Error { message } => eprintln!("Error: {message}"),
@@ -1572,7 +1707,7 @@ async fn cmd_up(hostname: Option<String>) -> Result<()> {
         );
         std::process::exit(1);
     }
-    install_and_start_service(hostname).await
+    install_and_start_service(hostname, allow_trusted).await
 }
 
 /// Install/refresh the system service and (re)start it. Requires root.
@@ -1582,7 +1717,7 @@ async fn cmd_up(hostname: Option<String>) -> Result<()> {
 /// it never comes up (e.g. it crashed on a port/route conflict with another
 /// VPN), we surface the tail of its log so the user knows what went wrong
 /// instead of seeing a cheerful "started" followed by a dead `ray status`.
-async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
+async fn install_and_start_service(hostname: Option<String>, allow_trusted: bool) -> Result<()> {
     ensure_service_installed()?;
 
     #[cfg(target_os = "linux")]
@@ -1608,7 +1743,14 @@ async fn install_and_start_service(hostname: Option<String>) -> Result<()> {
     // Wait for the freshly started daemon to accept IPC, then activate the VPN.
     match wait_for_daemon(std::time::Duration::from_secs(8)).await {
         Some(mut stream) => {
-            ipc::send(&mut stream, ipc::IpcMessage::Up { hostname }).await?;
+            ipc::send(
+                &mut stream,
+                ipc::IpcMessage::Up {
+                    hostname,
+                    allow_trusted,
+                },
+            )
+            .await?;
             match ipc::recv(&mut stream).await? {
                 ipc::IpcMessage::Ok { message } => println!("rayfish service started. {message}"),
                 ipc::IpcMessage::Error { message } => eprintln!("Error: {message}"),
@@ -1670,7 +1812,7 @@ fn require_root() -> Result<()> {
 /// install), then start it and verify the daemon comes up. Requires root.
 async fn cmd_install() -> Result<()> {
     require_root()?;
-    install_and_start_service(None).await
+    install_and_start_service(None, false).await
 }
 
 /// `ray restart`: restart the already-installed system service via the OS

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
-use crate::{GroupMode, TransportMode};
+use crate::{GroupMode, SuggestedFirewall, TransportMode};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IpcMessage {
@@ -19,6 +19,9 @@ pub enum IpcMessage {
         name: Option<String>,
         hostname: Option<String>,
         transport: Option<TransportMode>,
+        /// Trusted network: the coordinator may suggest firewall rules to members.
+        #[serde(default)]
+        trusted: bool,
     },
     Join {
         network_key: String,
@@ -32,6 +35,10 @@ pub enum IpcMessage {
         /// Coordinator endpoint id to dial directly when joining via an invite.
         #[serde(default)]
         coordinator: Option<EndpointId>,
+        /// Auto-take coordinator-suggested firewall rules on this network without
+        /// a manual review queue (`--allow-trusted`).
+        #[serde(default)]
+        allow_trusted: bool,
     },
     Leave {
         name: String,
@@ -53,6 +60,10 @@ pub enum IpcMessage {
     Up {
         #[serde(default)]
         hostname: Option<String>,
+        /// Auto-take coordinator-suggested rules on trusted networks being
+        /// activated (`--allow-trusted`).
+        #[serde(default)]
+        allow_trusted: bool,
     },
     /// Put the daemon on standby: tear down active network connections, revert
     /// system DNS, and bring the TUN interface down. The daemon process keeps
@@ -73,6 +84,18 @@ pub enum IpcMessage {
     FirewallShow,
     FirewallDefault {
         action: String,
+    },
+    /// Coordinator-only: replace the network's suggested firewall rules and
+    /// republish the signed blob. Gated on a trusted network whose secret key
+    /// the caller holds.
+    FirewallSuggest {
+        network: String,
+        suggestions: SuggestedFirewall,
+    },
+    /// Read the current suggested firewall rules for a network (open, like other
+    /// reads). Used by `ray firewall suggest` (read-modify-write) and `ray apply`.
+    FirewallSuggestions {
+        network: String,
     },
     SetHostname {
         network: String,
@@ -157,6 +180,11 @@ pub enum IpcMessage {
     },
     FirewallState {
         display: String,
+    },
+    /// Current suggested firewall rules for a network (reply to
+    /// `FirewallSuggestions`).
+    FirewallSuggestionsResponse {
+        suggestions: SuggestedFirewall,
     },
     FileList {
         files: Vec<PendingFileInfo>,
@@ -354,6 +382,7 @@ mod tests {
             name: None,
             hostname: None,
             transport: None,
+            trusted: false,
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
@@ -460,6 +489,7 @@ mod tests {
             transport: None,
             invite: Some(vec![1, 2, 3]),
             coordinator: Some(coord),
+            allow_trusted: false,
         };
         let bytes = rmp_serde::to_vec(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();

@@ -971,6 +971,7 @@ impl DaemonState {
             IpcMessage::Status
                 | IpcMessage::Report
                 | IpcMessage::FirewallShow
+                | IpcMessage::FirewallSuggestions { .. }
                 | IpcMessage::ListFiles
         ) {
             return None;
@@ -1041,7 +1042,8 @@ impl DaemonState {
                 name,
                 hostname,
                 transport: _,
-            } => self.create_network(mode, name, hostname).await,
+                trusted,
+            } => self.create_network(mode, name, hostname, trusted).await,
             IpcMessage::Join {
                 network_key,
                 name,
@@ -1049,15 +1051,26 @@ impl DaemonState {
                 transport: _,
                 invite,
                 coordinator,
+                allow_trusted,
             } => {
-                self.join_network(&network_key, name.as_deref(), hostname, invite, coordinator)
-                    .await
+                self.join_network(
+                    &network_key,
+                    name.as_deref(),
+                    hostname,
+                    invite,
+                    coordinator,
+                    allow_trusted,
+                )
+                .await
             }
             IpcMessage::Leave { name } => self.leave_network(&name).await,
             IpcMessage::Nuke { name, force } => self.nuke_network(&name, force).await,
             IpcMessage::Status => self.status(),
             IpcMessage::Report => self.build_report(peer_cred),
-            IpcMessage::Up { hostname } => self.activate(hostname).await,
+            IpcMessage::Up {
+                hostname,
+                allow_trusted,
+            } => self.activate(hostname, allow_trusted).await,
             IpcMessage::Down => self.deactivate().await,
             IpcMessage::Shutdown => {
                 self.shutdown_token.cancel();
@@ -1083,6 +1096,11 @@ impl DaemonState {
             IpcMessage::FirewallRemove { index } => self.firewall_remove(index),
             IpcMessage::FirewallShow => self.firewall_show(),
             IpcMessage::FirewallDefault { action } => self.firewall_default(&action),
+            IpcMessage::FirewallSuggest {
+                network,
+                suggestions,
+            } => self.firewall_suggest(&network, suggestions).await,
+            IpcMessage::FirewallSuggestions { network } => self.firewall_suggestions(&network),
             IpcMessage::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await
             }
@@ -1116,8 +1134,9 @@ impl DaemonState {
         mode: GroupMode,
         name: Option<String>,
         hostname: Option<String>,
+        trusted: bool,
     ) -> IpcMessage {
-        match self.create_network_inner(mode, name, hostname).await {
+        match self.create_network_inner(mode, name, hostname, trusted).await {
             Ok(resp) => resp,
             Err(e) => IpcMessage::Error {
                 message: format!("{e:#}"),
@@ -1130,6 +1149,7 @@ impl DaemonState {
         mode: GroupMode,
         custom_name: Option<String>,
         hostname: Option<String>,
+        trusted: bool,
     ) -> Result<IpcMessage> {
         let name = match custom_name {
             Some(n) => {
@@ -1199,7 +1219,7 @@ impl DaemonState {
             network_public_key: net_public_key,
             network_name: Some(name.clone()),
             mode,
-            trusted: false,
+            trusted,
             suggested_firewall: SuggestedFirewall::default(),
             pending: HashMap::new(),
         };
@@ -1263,7 +1283,7 @@ impl DaemonState {
                 network_secret_key: Some(net_secret_key.clone()),
                 network_public_key: Some(net_public_key),
                 transport: None,
-                trusted: false,
+                trusted,
                 allow_trusted: false,
             },
         );
@@ -1361,6 +1381,7 @@ impl DaemonState {
         hostname: Option<String>,
         invite: Option<Vec<u8>>,
         coordinator: Option<EndpointId>,
+        allow_trusted: bool,
     ) -> IpcMessage {
         match self
             .join_network_inner(
@@ -1369,6 +1390,7 @@ impl DaemonState {
                 hostname.clone(),
                 invite.clone(),
                 coordinator,
+                allow_trusted,
                 true,
             )
             .await
@@ -1395,6 +1417,7 @@ impl DaemonState {
                                 hostname.clone(),
                                 invite.clone(),
                                 coordinator,
+                                allow_trusted,
                                 true,
                             )
                             .await
@@ -1421,6 +1444,7 @@ impl DaemonState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn join_network_inner(
         self: &Arc<Self>,
         network_key: &str,
@@ -1428,6 +1452,9 @@ impl DaemonState {
         hostname: Option<String>,
         invite: Option<Vec<u8>>,
         coordinator: Option<EndpointId>,
+        // Auto-take coordinator-suggested firewall rules on this network
+        // (`--allow-trusted`); persisted so it survives restarts.
+        allow_trusted: bool,
         // True for a fresh join (we send a JoinRequest first); false when
         // restoring a network we're already a member of (legacy handshake where
         // the coordinator speaks first).
@@ -1556,6 +1583,9 @@ impl DaemonState {
             self.hostname_table.clone(),
             self.reverse_table.clone(),
             invite,
+            data.trusted,
+            data.suggested_firewall.clone(),
+            allow_trusted,
             initial,
         )
         .await?
@@ -2256,7 +2286,21 @@ impl DaemonState {
     /// reconnect every saved network. Idempotent — a no-op if already active.
     /// Runs entirely inside the (root) daemon, so the IPC client needs no
     /// privileges.
-    async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
+    async fn activate(self: &Arc<Self>, hostname: Option<String>, allow_trusted: bool) -> IpcMessage {
+        // `ray up --allow-trusted` opts every saved network into auto-taking
+        // coordinator-suggested firewall rules (persisted), so it also covers
+        // networks joined later in the same `up; join; join` sequence is handled
+        // at join time. Here we flip the flag on already-saved networks.
+        if allow_trusted
+            && let Ok(mut app_config) = config::load()
+        {
+            for net in &mut app_config.networks {
+                net.allow_trusted = true;
+            }
+            if let Err(e) = config::save(&app_config) {
+                tracing::warn!(error = %e, "failed to persist --allow-trusted");
+            }
+        }
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
         // when the VPN is already up. Used as the fallback for future
@@ -2357,6 +2401,7 @@ impl DaemonState {
                 // We're a member — rejoin via DHT lookup.
                 let name = net.name.clone();
                 let persisted_hostname = net.my_hostname.clone();
+                let net_allow_trusted = net.allow_trusted;
                 let net_pubkey = match &net.network_public_key {
                     Some(k) => k.to_string(),
                     None => {
@@ -2373,6 +2418,7 @@ impl DaemonState {
                             persisted_hostname,
                             None,
                             None,
+                            net_allow_trusted,
                             false,
                         )
                         .await
@@ -3215,6 +3261,64 @@ impl DaemonState {
         IpcMessage::FirewallState { display }
     }
 
+    /// Coordinator-only: replace a trusted network's suggested firewall rules and
+    /// republish the signed blob. Authority comes from holding the per-network
+    /// secret key (so any admin granted the key can suggest).
+    async fn firewall_suggest(
+        &self,
+        network: &str,
+        suggestions: SuggestedFirewall,
+    ) -> IpcMessage {
+        let (state, dht_notify, trusted, has_key) = match self.networks.get(network) {
+            Some(h) => {
+                let (trusted, has_key) = {
+                    let s = h.state.read().unwrap();
+                    (s.trusted, s.network_secret_key.is_some())
+                };
+                (h.state.clone(), h.dht_notify.clone(), trusted, has_key)
+            }
+            None => {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not found"),
+                };
+            }
+        };
+        if !trusted {
+            return IpcMessage::Error {
+                message: format!(
+                    "network '{network}' is not trusted; recreate it with `--trusted` to suggest rules"
+                ),
+            };
+        }
+        if !has_key {
+            return IpcMessage::Error {
+                message: "only a coordinator (network key holder) can suggest firewall rules"
+                    .to_string(),
+            };
+        }
+        let count: usize = suggestions.len();
+        {
+            let mut s = state.write().unwrap();
+            s.suggested_firewall = suggestions;
+        }
+        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+        IpcMessage::Ok {
+            message: format!("published firewall suggestions for '{network}' ({count} subjects)"),
+        }
+    }
+
+    fn firewall_suggestions(&self, network: &str) -> IpcMessage {
+        match self.networks.get(network) {
+            Some(h) => {
+                let suggestions = h.state.read().unwrap().suggested_firewall.clone();
+                IpcMessage::FirewallSuggestionsResponse { suggestions }
+            }
+            None => IpcMessage::Error {
+                message: format!("network '{network}' not found"),
+            },
+        }
+    }
+
     fn firewall_default(&self, action: &str) -> IpcMessage {
         let action = match firewall::parse_action(action) {
             Ok(a) => a,
@@ -3641,7 +3745,7 @@ pub async fn run_daemon(token: CancellationToken, stats: Arc<ForwardMetrics>) ->
 
     // Start active by default so a fresh boot behaves like before; `ray up` /
     // `ray down` toggle this at runtime without restarting the process.
-    daemon.activate(None).await;
+    daemon.activate(None, false).await;
 
     serve_ipc(&daemon, token).await
 }
@@ -4366,6 +4470,12 @@ async fn join_mesh_shared(
     hostname_table: dns::HostnameTable,
     reverse_table: dns::ReverseLookupTable,
     invite_secret: Option<Vec<u8>>,
+    // From the fetched blob: whether this is a trusted network and its current
+    // coordinator-suggested firewall rules. Persisted so a member inherits both.
+    trusted: bool,
+    suggested_firewall: SuggestedFirewall,
+    // Consent: auto-take suggested rules without a manual review queue.
+    allow_trusted: bool,
     initial: bool,
 ) -> Result<JoinResult> {
     let my_identity = identity.local_identity();
@@ -4483,8 +4593,8 @@ async fn join_mesh_shared(
             network_secret_key: None,
             network_public_key: Some(net_pubkey),
             transport: None,
-            trusted: false,
-            allow_trusted: false,
+            trusted,
+            allow_trusted,
         },
     );
     config::save(&app_config)?;
@@ -4587,8 +4697,8 @@ async fn join_mesh_shared(
             network_public_key: net_pubkey,
             network_name: Some(network_name.to_string()),
             mode: GroupMode::Restricted,
-            trusted: false,
-            suggested_firewall: SuggestedFirewall::default(),
+            trusted,
+            suggested_firewall,
             pending: HashMap::new(),
         };
         ns.refresh_snapshot();
