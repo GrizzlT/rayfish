@@ -1,3 +1,4 @@
+mod apply;
 mod config;
 mod control;
 mod daemon;
@@ -203,6 +204,27 @@ enum Command {
     Firewall {
         #[command(subcommand)]
         action: FirewallAction,
+    },
+    /// Reconcile trusted networks against a deploy spec file (Phase B). Creates
+    /// missing trusted networks, publishes idempotent firewall suggestions, and
+    /// reports the membership gap (expected vs joined hosts). Never joins.
+    Apply {
+        /// Path to a TOML spec file (see `ray apply --example`).
+        spec: Option<String>,
+        /// Drop suggested-firewall subjects that are no longer in the spec.
+        #[arg(long)]
+        prune: bool,
+        /// Show what would change without applying it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Mint one-time invites for hosts the spec expects but that haven't
+        /// joined yet (hostname-bound). Without this flag, the commands are
+        /// only printed.
+        #[arg(long)]
+        invite_missing: bool,
+        /// Print an example spec file and exit.
+        #[arg(long, conflicts_with_all = ["spec", "prune", "dry_run", "invite_missing"])]
+        example: bool,
     },
     /// Change your hostname on a network
     Hostname {
@@ -636,6 +658,13 @@ async fn main() -> Result<()> {
         Command::Deny { network, id } => ipc_deny_request(&network, &id).await,
         Command::Admin { network, action } => ipc_admin(&network, action).await,
         Command::Firewall { action } => ipc_firewall(action).await,
+        Command::Apply {
+            spec,
+            prune,
+            dry_run,
+            invite_missing,
+            example,
+        } => ipc_apply(spec, prune, dry_run, invite_missing, example).await,
         Command::Hostname { network, name } => ipc_set_hostname(&network, &name).await,
         Command::Mdns { state } => cmd_mdns(&state),
         Command::SetOperator { user } => cmd_set_operator(&user).await,
@@ -1472,6 +1501,229 @@ async fn ipc_firewall_suggest(
         other => eprintln!("Unexpected response: {other:?}"),
     }
     Ok(())
+}
+
+/// `ray apply <spec>`: reconcile trusted networks against a deploy spec.
+///
+/// B2 — orchestrator: for each network in the spec, `Create { trusted }` if it
+/// isn't active, then publish the spec's `firewall` block as suggestions
+/// (idempotent — always replaces the live set). `--prune` limits the published
+/// set to subjects present in the spec, dropping any live suggestions for
+/// hosts no longer mentioned. Never joins.
+///
+/// B3 — membership diff: expected hosts = union of hostnames in the spec's
+/// `firewall:` blocks; joined hosts = hostnames from `Status` (this node +
+/// peers). Reports the gap and prints hostname-bound invite commands; with
+/// `--invite-missing` mints them via IPC.
+async fn ipc_apply(
+    spec_path: Option<String>,
+    prune: bool,
+    dry_run: bool,
+    invite_missing: bool,
+    example: bool,
+) -> Result<()> {
+    if example {
+        print!("{}", apply::EXAMPLE_SPEC);
+        return Ok(());
+    }
+    let Some(spec_path) = spec_path else {
+        anyhow::bail!("a spec file path is required (or use --example to print a template)");
+    };
+    let spec = apply::load(std::path::Path::new(&spec_path))?;
+    if spec.is_empty() {
+        anyhow::bail!("spec contains no networks");
+    }
+    if dry_run {
+        println!("{}", style::bold("Spec (normalized):"));
+        print!("{}", apply::to_toml(&spec)?);
+        println!("{}", style::faint("(dry-run; no changes applied)"));
+        return Ok(());
+    }
+
+    // Fetch live state once: status gives active networks + joined hostnames.
+    let status_networks = ipc_status_networks().await?;
+    let active_names: std::collections::HashSet<&str> =
+        status_networks.iter().map(|n| n.name.as_str()).collect();
+
+    let mut missing_hosts: Vec<(String, String)> = Vec::new(); // (network, hostname)
+
+    for (net_name, net_spec) in &spec {
+        let is_active = active_names.contains(net_name.as_str());
+        // B2 — create-if-absent.
+        if !is_active {
+            println!(
+                "{} {}: creating trusted network",
+                style::label("apply"),
+                style::bold(net_name)
+            );
+            if let Err(e) = ipc_create_trusted(net_name).await {
+                eprintln!("{}  create failed: {e}", style::red("  !"));
+                continue;
+            }
+        } else {
+            println!(
+                "{} {}: already active",
+                style::label("apply"),
+                style::bold(net_name)
+            );
+        }
+
+        // B2 — publish suggestions (idempotent). With --prune, publish exactly
+        // the spec's set; without it, merge into the live set (so `apply` never
+        // silently drops subjects authored out-of-band — use --prune for that).
+        let to_publish = if prune {
+            net_spec.firewall.clone()
+        } else {
+            let mut live = ipc_firewall_suggestions_get(net_name).await.unwrap_or_default();
+            // Merge spec subjects over live (spec wins on conflict).
+            for (subj, rules) in &net_spec.firewall {
+                live.insert(subj.clone(), rules.clone());
+            }
+            live
+        };
+        match ipc_firewall_suggest_set(net_name, to_publish).await {
+            Ok(msg) => println!("{}   {msg}", style::faint("→")),
+            Err(e) => {
+                eprintln!("{}   suggest failed: {e}", style::red("  !"));
+                if !net_spec.trusted {
+                    eprintln!("{}    network is not trusted; recreate with --trusted", style::faint(""));
+                }
+            }
+        }
+
+        // B3 — membership diff for this network.
+        let joined = joined_hostnames(&status_networks, net_name);
+        for host in apply::expected_hosts(&spec) {
+            if !joined.iter().any(|j| j == &host) {
+                missing_hosts.push((net_name.clone(), host));
+            }
+        }
+    }
+
+    // B3 — report the membership gap.
+    if missing_hosts.is_empty() {
+        println!("{}", style::green("All expected hosts have joined."));
+    } else {
+        println!("\n{} Missing hosts (spec expects them):", style::label("diff"));
+        for (net, host) in &missing_hosts {
+            let cmd = format!("ray invite {net} --hostname {host}");
+            if invite_missing {
+                match ipc_invite_mint(net, Some(host.clone())).await {
+                    Ok(code) => println!("  {}  {}  {}", style::bold(host), cmd, style::faint(&format!("→ {code}"))),
+                    Err(e) => eprintln!("  {}  {cmd}  {}", style::red(host), style::red(&e.to_string())),
+                }
+            } else {
+                println!("  {}  {cmd}", style::bold(host));
+            }
+        }
+        if !invite_missing {
+            println!("\n{} re-run with --invite-missing to mint these invites.", style::faint("tip:"));
+        }
+    }
+    Ok(())
+}
+
+/// Joined hostnames on `network` (this node's hostname + every peer's hostname).
+fn joined_hostnames(networks: &[ipc::NetworkStatus], network: &str) -> Vec<String> {
+    let Some(net) = networks.iter().find(|n| n.name == network) else {
+        return Vec::new();
+    };
+    let mut hosts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Some(h) = &net.my_hostname {
+        hosts.insert(h.clone());
+    }
+    for p in &net.peers {
+        if let Some(h) = &p.hostname {
+            hosts.insert(h.clone());
+        }
+    }
+    hosts.into_iter().collect()
+}
+
+async fn ipc_status_networks() -> Result<Vec<ipc::NetworkStatus>> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, ipc::IpcMessage::Status).await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::StatusResponse { networks, .. } => Ok(networks),
+        other => anyhow::bail!("unexpected status response: {other:?}"),
+    }
+}
+
+async fn ipc_create_trusted(name: &str) -> Result<()> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::Create {
+            mode: ray_proto::GroupMode::Restricted,
+            name: Some(name.to_string()),
+            hostname: None,
+            transport: None,
+            trusted: true,
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Created { name: n, .. } => {
+            println!("{}   created '{n}'", style::faint("→"));
+            Ok(())
+        }
+        ipc::IpcMessage::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected create response: {other:?}"),
+    }
+}
+
+async fn ipc_firewall_suggestions_get(network: &str) -> Result<ray_proto::SuggestedFirewall> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::FirewallSuggestions {
+            network: network.to_string(),
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::FirewallSuggestionsResponse { suggestions } => Ok(suggestions),
+        ipc::IpcMessage::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected suggestions response: {other:?}"),
+    }
+}
+
+async fn ipc_firewall_suggest_set(
+    network: &str,
+    suggestions: ray_proto::SuggestedFirewall,
+) -> Result<String> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::FirewallSuggest {
+            network: network.to_string(),
+            suggestions,
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::Ok { message } => Ok(message),
+        ipc::IpcMessage::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected suggest response: {other:?}"),
+    }
+}
+
+async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> Result<String> {
+    let mut stream = ipc::connect().await?;
+    ipc::send(
+        &mut stream,
+        ipc::IpcMessage::InviteCreate {
+            network: network.to_string(),
+            expires_secs: 7 * 24 * 3600,
+            hostname,
+        },
+    )
+    .await?;
+    match ipc::recv(&mut stream).await? {
+        ipc::IpcMessage::InviteCreated { code, .. } => Ok(code),
+        ipc::IpcMessage::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected invite response: {other:?}"),
+    }
 }
 
 async fn ipc_send_file(file: &str, peer: &str) -> Result<()> {

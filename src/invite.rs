@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
@@ -184,7 +184,11 @@ impl InviteStore {
     /// The raw secret is returned only here so it can be encoded into the code.
     /// `hostname` (trusted networks) is assigned authoritatively on redemption,
     /// so the holder joins with `ray join <code>` and no `--hostname`.
-    pub fn mint(&mut self, ttl: Duration, hostname: Option<String>) -> Result<([u8; SECRET_LEN], String)> {
+    pub fn mint(
+        &mut self,
+        ttl: Duration,
+        hostname: Option<String>,
+    ) -> Result<([u8; SECRET_LEN], String)> {
         let secret = generate_secret();
         let secret_hash = hash_secret(&secret);
         let id = secret_hash[..8].to_string();
