@@ -181,11 +181,12 @@ impl CoordinatorAcceptState {
                 Ok(Ok(pair)) => pair,
                 _ => return,
             };
-        let msg =
-            match tokio::time::timeout(Duration::from_secs(5), control::recv_msg(&mut recv)).await {
-                Ok(Ok(m)) => m,
-                _ => return,
-            };
+        let msg = match tokio::time::timeout(Duration::from_secs(5), control::recv_msg(&mut recv))
+            .await
+        {
+            Ok(Ok(m)) => m,
+            _ => return,
+        };
         let (invite_secret, hostname, device_cert) = match msg {
             ControlMsg::JoinRequest {
                 invite_secret,
@@ -393,8 +394,13 @@ impl CoordinatorAcceptState {
 
         let peer_ipv6 = derive_ipv6(&remote_id);
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
-        self.peers
-            .add(peer_ip, peer_ipv6, conn.clone(), remote_id, &self.network_name);
+        self.peers.add(
+            peer_ip,
+            peer_ipv6,
+            conn.clone(),
+            remote_id,
+            &self.network_name,
+        );
         forward::spawn_peer_reader(
             conn,
             remote_id,
@@ -1117,12 +1123,14 @@ impl DaemonState {
                 protocol,
                 port,
                 peer,
+                network,
             } => self.firewall_add(
                 &direction,
                 &action,
                 &protocol,
                 port.as_deref(),
                 peer.as_deref(),
+                network.as_deref(),
             ),
             IpcMessage::FirewallRemove { index } => self.firewall_remove(index),
             IpcMessage::FirewallShow => self.firewall_show(),
@@ -3245,7 +3253,8 @@ impl DaemonState {
                 .pending
                 .keys()
                 .find(|k| {
-                    k.fmt_short().to_string().starts_with(id_prefix) || k.to_string().starts_with(id_prefix)
+                    k.fmt_short().to_string().starts_with(id_prefix)
+                        || k.to_string().starts_with(id_prefix)
                 })
                 .copied();
             found.and_then(|id| s.pending.remove(&id).map(|pj| (id, pj)))
@@ -3307,7 +3316,10 @@ impl DaemonState {
         let found = s
             .pending
             .keys()
-            .find(|k| k.fmt_short().to_string().starts_with(id_prefix) || k.to_string().starts_with(id_prefix))
+            .find(|k| {
+                k.fmt_short().to_string().starts_with(id_prefix)
+                    || k.to_string().starts_with(id_prefix)
+            })
             .copied();
         match found {
             Some(id) => {
@@ -3368,6 +3380,7 @@ impl DaemonState {
         protocol: &str,
         port: Option<&str>,
         peer: Option<&str>,
+        network: Option<&str>,
     ) -> IpcMessage {
         let direction = match firewall::parse_direction(direction) {
             Ok(d) => d,
@@ -3416,12 +3429,20 @@ impl DaemonState {
             None => firewall::PeerFilter::Any,
         };
 
+        if let Some(net) = network
+            && !self.networks.contains_key(net)
+        {
+            return IpcMessage::Error {
+                message: format!("unknown network '{net}'"),
+            };
+        }
         let rule = firewall::FirewallRule {
             direction,
             action,
             protocol,
             port,
             peer,
+            network: network.map(str::to_string),
         };
         let mut config = (*self.firewall.get_config()).clone();
         config.rules.push(rule);
@@ -3502,8 +3523,8 @@ impl DaemonState {
         };
         if let Some((ip, _)) = dns::resolve_name(&qualified, &suffix, &self.hostname_table).await {
             // Try connected peers first
-            if let Some((_, eid, _)) = self.peers.lookup_v4(&ip) {
-                return Some(eid);
+            if let Some(route) = self.peers.lookup_v4(&ip) {
+                return Some(route.endpoint_id);
             }
             // Fall back to member list (peer may be offline or it's us)
             for entry in self.networks.iter() {
@@ -4370,8 +4391,10 @@ fn spawn_peer_cleanup(
                 event = disconnect_rx.recv() => {
                     match event {
                         Some(ev) => {
-                            tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, intentional = ev.intentional, "removing dead peer");
-                            peers.remove(&ev.ip, &ev.ipv6);
+                            tracing::info!(peer = %ev.endpoint_id.fmt_short(), ip = %ev.ip, network = %ev.network, intentional = ev.intentional, "removing dead peer");
+                            // Drop only this network's route; a multi-homed peer
+                            // stays reachable via its other networks.
+                            peers.remove_peer_from_network(&ev.ip, &ev.ipv6, &ev.network);
 
                             // A deliberate `ray leave` (graceful close with the
                             // leave code) prunes the member from the roster and
@@ -4863,20 +4886,21 @@ fn spawn_reconnect_loop(
     use tracing::Instrument as _;
     // Tag all reconnect-loop logs for this network so they correlate in reports.
     let span = tracing::info_span!("reconnect", net = %network_name);
-    tokio::spawn(
-        async move {
-            loop {
-                let event = tokio::select! {
-                    _ = token.cancelled() => return,
-                    event = disconnect_rx.recv() => match event {
-                        Some(ev) => ev,
-                        None => return,
+    let reconnect_loop = async move {
+        loop {
+            let event = tokio::select! {
+                _ = token.cancelled() => return,
+                event = disconnect_rx.recv() => match event {
+                    Some(ev) => ev,
+                    None => return,
                 },
             };
             let peer_id = event.endpoint_id;
             let peer_ip = event.ip;
             let peer_ipv6 = event.ipv6;
-            peers.remove(&peer_ip, &peer_ipv6);
+            // Drop only this network's route; other networks the peer shares with
+            // us stay live.
+            peers.remove_peer_from_network(&peer_ip, &peer_ipv6, &event.network);
 
             // A deliberate `ray leave` (graceful close with the leave code) means
             // the peer is gone for good — don't spin a reconnect task against it.
@@ -4963,9 +4987,8 @@ fn spawn_reconnect_loop(
                 }
             });
         }
-        }
-        .instrument(span),
-    )
+    };
+    tokio::spawn(reconnect_loop.instrument(span))
 }
 
 // ---------------------------------------------------------------------------

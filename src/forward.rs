@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::acl::AclData;
-use crate::firewall::{self, Action, Direction, SharedFirewall};
+use crate::firewall::{self, Direction, SharedFirewall};
 use crate::peers::{DeviceUserMap, PeerTable};
 use crate::stats::{DropReason, ForwardMetrics};
 use crate::tun::{TunReader, TunWriter};
@@ -51,6 +51,7 @@ pub(crate) fn evaluate_inbound(
     firewall: &SharedFirewall,
     peer_id: &EndpointId,
     local_id: &EndpointId,
+    network: &str,
 ) -> InboundDecision {
     if packet.len() > MAX_PEER_DATAGRAM {
         return InboundDecision::DropMalformed;
@@ -61,7 +62,10 @@ pub(crate) fn evaluate_inbound(
     let Some(info) = firewall::parse_packet_info(packet) else {
         return InboundDecision::DropMalformed;
     };
-    if firewall.evaluate_packet(Direction::In, &info, peer_id) == Action::Deny {
+    if firewall
+        .evaluate_packet(Direction::In, &info, peer_id, Some(network))
+        .is_deny()
+    {
         return InboundDecision::DropFirewall;
     }
     InboundDecision::Accept
@@ -106,6 +110,9 @@ pub struct DisconnectEvent {
     pub endpoint_id: EndpointId,
     pub ip: Ipv4Addr,
     pub ipv6: std::net::Ipv6Addr,
+    /// The network whose connection dropped. A multi-homed peer keeps its routes
+    /// in the other networks; only this network's connection is torn down.
+    pub network: String,
     /// True when the peer closed gracefully with [`LEAVE_CODE`] (it ran
     /// `ray leave`), as opposed to a timeout/reset.
     pub intentional: bool,
@@ -131,42 +138,51 @@ pub async fn run_mesh(
             _ = token.cancelled() => return Ok(()),
             result = tun.read_packet(&mut buf) => {
                 let n = result?;
-                if n > 0 {
-                    tracing::debug!(len = n, first_byte = buf[0], "TUN read");
-                    let pkt = &buf[..n];
-                    if let Some(info) = firewall::parse_packet_info(pkt) {
-                        let lookup = match info.dst_ip {
-                            IpAddr::V4(v4) => peers.lookup_v4(&v4),
-                            IpAddr::V6(v6) => peers.lookup_v6(&v6),
-                        };
-                        if let Some((conn, peer_endpoint_id, network)) = lookup {
-                            let acl = shared_acl.get(&network);
-                            let local_user = device_user_map.resolve(&local_id);
-                            let peer_user = device_user_map.resolve(&peer_endpoint_id);
-                            if !acl.is_allowed(&local_user, &peer_user) {
-                                tracing::debug!(dst = %info.dst_ip, "ACL denied outbound");
-                                stats.record_drop(DropReason::Acl);
-                                continue;
-                            }
-                            if firewall.evaluate_packet(Direction::Out, &info, &peer_endpoint_id) == Action::Deny {
-                                tracing::debug!(dst = %info.dst_ip, port = info.dst_port, "firewall denied outbound");
-                                stats.record_drop(DropReason::Firewall);
-                                continue;
-                            }
-                            tracing::debug!(dst = %info.dst_ip, "routing to peer");
-                            match conn.send_datagram(Bytes::copy_from_slice(pkt)) {
-                                Ok(()) => stats.record_tx(n),
-                                Err(e) => {
-                                    tracing::debug!(dst = %info.dst_ip, error = %e, "datagram send failed");
-                                    stats.record_drop(DropReason::SendFailure);
-                                }
-                            }
-                        } else {
-                            tracing::debug!(dst = %info.dst_ip, "no peer for dst");
-                            stats.record_drop(DropReason::NoPeer);
-                        }
-                    } else {
-                        tracing::debug!(len = n, "not IP, dropping");
+                if n == 0 {
+                    continue;
+                }
+                tracing::debug!(len = n, first_byte = buf[0], "TUN read");
+                let pkt = &buf[..n];
+                let Some(info) = firewall::parse_packet_info(pkt) else {
+                    tracing::debug!(len = n, "not IP, dropping");
+                    continue;
+                };
+                let lookup = match info.dst_ip {
+                    IpAddr::V4(v4) => peers.lookup_v4(&v4),
+                    IpAddr::V6(v6) => peers.lookup_v6(&v6),
+                };
+                let Some(route) = lookup else {
+                    tracing::debug!(dst = %info.dst_ip, "no peer for dst");
+                    stats.record_drop(DropReason::NoPeer);
+                    continue;
+                };
+                let local_user = device_user_map.resolve(&local_id);
+                let peer_user = device_user_map.resolve(&route.endpoint_id);
+                // Reachability is "we share a network". With overlapping
+                // membership, allow if *any* shared network's ACL permits
+                // (union); the default ACL is allow-all, so this is a no-op
+                // for users who don't set ACL rules. The firewall is the
+                // real per-host gate.
+                let acl_allowed = route
+                    .shared_networks
+                    .iter()
+                    .any(|net| shared_acl.get(net).is_allowed(&local_user, &peer_user));
+                if !acl_allowed {
+                    tracing::debug!(dst = %info.dst_ip, "ACL denied outbound");
+                    stats.record_drop(DropReason::Acl);
+                    continue;
+                }
+                if firewall.evaluate_packet(Direction::Out, &info, &route.endpoint_id, Some(&route.network)).is_deny() {
+                    tracing::debug!(dst = %info.dst_ip, port = info.dst_port, "firewall denied outbound");
+                    stats.record_drop(DropReason::Firewall);
+                    continue;
+                }
+                tracing::debug!(dst = %info.dst_ip, "routing to peer");
+                match route.conn.send_datagram(Bytes::copy_from_slice(pkt)) {
+                    Ok(()) => stats.record_tx(n),
+                    Err(e) => {
+                        tracing::debug!(dst = %info.dst_ip, error = %e, "datagram send failed");
+                        stats.record_drop(DropReason::SendFailure);
                     }
                 }
             }
@@ -197,46 +213,60 @@ pub fn spawn_peer_reader(
     // Tag every event from this reader (drops, connection-lost) with the peer
     // and network so the report bundle's logs are correlatable per peer.
     let span = tracing::info_span!("peer", peer = %peer_id.fmt_short(), net = %network);
-    tokio::spawn(
-        async move {
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => return,
-                    result = conn.read_datagram() => {
-                    match result {
-                        Ok(datagram) => {
-                            let acl = shared_acl.get(&network);
-                            let peer_user = device_user_map.resolve(&peer_id);
-                            let local_user = device_user_map.resolve(&local_id);
-                            match evaluate_inbound(&datagram, &acl, &firewall, &peer_user, &local_user) {
-                                InboundDecision::Accept => {
-                                    stats.record_rx(datagram.len());
-                                    if tun_tx.send(datagram.to_vec()).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                InboundDecision::DropAcl => stats.record_drop(DropReason::Acl),
-                                InboundDecision::DropFirewall => stats.record_drop(DropReason::Firewall),
-                                InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
-                            }
-                        }
-                        Err(e) => {
-                            let intentional = matches!(
-                                &e,
-                                ConnectionError::ApplicationClosed(ac)
-                                    if ac.error_code == VarInt::from_u32(LEAVE_CODE)
-                            );
-                            tracing::warn!(peer = %peer_id.fmt_short(), ip = %peer_ip, error = %e, intentional, "peer connection lost");
-                            let _ = disconnect_tx.send(DisconnectEvent { endpoint_id: peer_id, ip: peer_ip, ipv6: peer_ipv6, intentional }).await;
-                            return;
-                        }
+    let reader = async move {
+        loop {
+            // Wait for the next datagram, exiting on cancellation or connection
+            // loss. Keeping the `select!` to "yield a datagram or return" leaves
+            // the actual forwarding below at loop-body depth.
+            let datagram = tokio::select! {
+                _ = token.cancelled() => return,
+                result = conn.read_datagram() => match result {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let intentional = matches!(
+                            &e,
+                            ConnectionError::ApplicationClosed(ac)
+                                if ac.error_code == VarInt::from_u32(LEAVE_CODE)
+                        );
+                        tracing::warn!(peer = %peer_id.fmt_short(), ip = %peer_ip, error = %e, intentional, "peer connection lost");
+                        let _ = disconnect_tx
+                            .send(DisconnectEvent {
+                                endpoint_id: peer_id,
+                                ip: peer_ip,
+                                ipv6: peer_ipv6,
+                                network: network.clone(),
+                                intentional,
+                            })
+                            .await;
+                        return;
+                    }
+                },
+            };
+
+            let acl = shared_acl.get(&network);
+            let peer_user = device_user_map.resolve(&peer_id);
+            let local_user = device_user_map.resolve(&local_id);
+            match evaluate_inbound(
+                &datagram,
+                &acl,
+                &firewall,
+                &peer_user,
+                &local_user,
+                &network,
+            ) {
+                InboundDecision::Accept => {
+                    stats.record_rx(datagram.len());
+                    if tun_tx.send(datagram.to_vec()).await.is_err() {
+                        return;
                     }
                 }
+                InboundDecision::DropAcl => stats.record_drop(DropReason::Acl),
+                InboundDecision::DropFirewall => stats.record_drop(DropReason::Firewall),
+                InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
             }
         }
-        }
-        .instrument(span),
-    )
+    };
+    tokio::spawn(reader.instrument(span))
 }
 
 /// Spawns a task that consumes packets from `tun_rx` and writes them to the TUN device.
@@ -258,6 +288,7 @@ pub fn spawn_tun_writer(
 mod tests {
     use super::*;
     use crate::acl;
+    use crate::firewall::Action;
 
     #[test]
     fn test_parse_packet_valid_ipv4() {
@@ -317,7 +348,7 @@ mod tests {
         let me = iroh::SecretKey::generate().public();
         let huge = vec![0u8; MAX_PEER_DATAGRAM + 1];
         assert!(matches!(
-            evaluate_inbound(&huge, &acl, &fw, &peer, &me),
+            evaluate_inbound(&huge, &acl, &fw, &peer, &me, "test-net"),
             InboundDecision::DropMalformed
         ));
     }
@@ -332,7 +363,7 @@ mod tests {
         pkt[0] = 0x60; // IPv6
         pkt[6] = 6; // TCP
         assert!(matches!(
-            evaluate_inbound(&pkt, &acl, &fw, &peer, &me),
+            evaluate_inbound(&pkt, &acl, &fw, &peer, &me, "test-net"),
             InboundDecision::DropFirewall
         ));
     }
@@ -353,7 +384,7 @@ mod tests {
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
         let pkt = make_tcp_packet(443);
         assert!(matches!(
-            evaluate_inbound(&pkt, &acl, &fw, &other, &me),
+            evaluate_inbound(&pkt, &acl, &fw, &other, &me, "test-net"),
             InboundDecision::DropAcl
         ));
     }
@@ -371,16 +402,17 @@ mod tests {
                 protocol: firewall::Protocol::Tcp,
                 port: Some(firewall::PortRange { start: 22, end: 22 }),
                 peer: firewall::PeerFilter::Any,
+                network: None,
             }],
         );
         let blocked = make_tcp_packet(22);
         let allowed = make_tcp_packet(80);
         assert!(matches!(
-            evaluate_inbound(&blocked, &acl, &fw, &peer, &me),
+            evaluate_inbound(&blocked, &acl, &fw, &peer, &me, "test-net"),
             InboundDecision::DropFirewall
         ));
         assert!(matches!(
-            evaluate_inbound(&allowed, &acl, &fw, &peer, &me),
+            evaluate_inbound(&allowed, &acl, &fw, &peer, &me, "test-net"),
             InboundDecision::Accept
         ));
     }
@@ -393,7 +425,7 @@ mod tests {
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
         let pkt = make_tcp_packet(443);
         assert!(matches!(
-            evaluate_inbound(&pkt, &acl, &fw, &peer, &me),
+            evaluate_inbound(&pkt, &acl, &fw, &peer, &me, "test-net"),
             InboundDecision::Accept
         ));
     }

@@ -307,6 +307,9 @@ enum FirewallAction {
         /// Peer short ID (omit for any peer)
         #[arg(long)]
         peer: Option<String>,
+        /// Restrict to a network (omit to match any network the peer is reached through)
+        #[arg(long)]
+        network: Option<String>,
     },
     /// Remove a rule by index
     Remove {
@@ -747,9 +750,7 @@ async fn ipc_join(
     // a self-contained invite code. An invite decodes to the network key plus the
     // coordinator to dial and a one-time secret to present.
     let (network_key, invite, coordinator) = match invite::decode_invite_code(network_key) {
-        Ok((net_pubkey, coord, secret)) => {
-            (net_pubkey.to_string(), Some(secret), Some(coord))
-        }
+        Ok((net_pubkey, coord, secret)) => (net_pubkey.to_string(), Some(secret), Some(coord)),
         Err(_) => (network_key.to_string(), None, None),
     };
     let mut stream = ipc::connect().await?;
@@ -1220,10 +1221,7 @@ async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
                 println!("No invites.");
             } else {
                 for inv in invites {
-                    let who = inv
-                        .redeemer
-                        .map(|r| format!(" by {r}"))
-                        .unwrap_or_default();
+                    let who = inv.redeemer.map(|r| format!(" by {r}")).unwrap_or_default();
                     println!("  {}  {}{}", style::rose(&inv.id), inv.status, who);
                 }
             }
@@ -1313,12 +1311,14 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
             proto,
             port,
             peer,
+            network,
         } => ipc::IpcMessage::FirewallAdd {
             direction,
             action,
             protocol: proto,
             port,
             peer,
+            network,
         },
         FirewallAction::Remove { index } => ipc::IpcMessage::FirewallRemove { index },
         FirewallAction::Show => ipc::IpcMessage::FirewallShow,

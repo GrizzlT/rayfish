@@ -97,7 +97,11 @@ pub fn invite_path(network: &str) -> Result<PathBuf> {
 }
 
 /// Encode an invite code: `bs58(network_pubkey(32) || coordinator(32) || secret(16))`.
-pub fn encode_invite_code(network_pubkey: &EndpointId, coordinator: &EndpointId, secret: &[u8]) -> String {
+pub fn encode_invite_code(
+    network_pubkey: &EndpointId,
+    coordinator: &EndpointId,
+    secret: &[u8],
+) -> String {
     let mut bytes = Vec::with_capacity(32 + 32 + SECRET_LEN);
     bytes.extend_from_slice(network_pubkey.as_bytes());
     bytes.extend_from_slice(coordinator.as_bytes());

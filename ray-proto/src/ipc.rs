@@ -85,6 +85,8 @@ pub enum IpcMessage {
         protocol: String,
         port: Option<String>,
         peer: Option<String>,
+        #[serde(default)]
+        network: Option<String>,
     },
     FirewallRemove {
         index: usize,
@@ -525,7 +527,9 @@ mod tests {
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
             IpcMessage::Join {
-                invite, coordinator, ..
+                invite,
+                coordinator,
+                ..
             } => {
                 assert_eq!(invite, Some(vec![1, 2, 3]));
                 assert_eq!(coordinator, Some(coord));

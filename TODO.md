@@ -84,6 +84,20 @@ These are where bulk throughput matters and where the optional WG fast path appl
 
 ## Tier 2 — UX / friction reduction
 
+- [ ] **Declarative deploy (`ray apply config.yaml`)**
+  - Terraform-like, idempotent: define networks, per-host membership, and firewall
+    rules in one version-controlled YAML; apply composes existing IPC ops
+    (Create/Join/Leave/Firewall*/Status) by diffing desired vs. current state.
+  - Replaces hand-typed `ray create`/`join`/`firewall add` for fleets; the network
+    split + per-host firewall carry the policy, so no ACL sprawl.
+  - Hard part: per-network keys are random at create, but members join by public key.
+    Resolve logical names → keys via a committed lock/state file (`ray.lock.yaml`)
+    produced by the coordinator's apply. Never put secret keys in the spec or derive
+    keys from a spec seed.
+  - Add a YAML dep (`serde_yml` / `serde_yaml_ng`; upstream `serde_yaml` is archived).
+  - Decide: per-host apply (each host runs it with shared spec+lock) vs. single-operator
+    remote push (SSH, like `just deploy`).
+  - Builds on multi-homing (a host in many networks) + the firewall per-network rule field.
 - [ ] **Invite links**
   - `rayfish://join/<base58>` URI scheme handler, click-to-join anywhere
   - **Sign them** — unsigned handlers are a forgery/phishing surface
