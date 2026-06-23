@@ -581,22 +581,38 @@ mod tests {
         )
         .await;
         assert_eq!(
-            resolve_name("alice.net.ray", SUFFIX, &table).await.map(|(v4, _)| v4),
+            resolve_name("alice.net.ray", SUFFIX, &table)
+                .await
+                .map(|(v4, _)| v4),
             Some(alice_v4)
         );
-        assert_eq!(reverse.get(&IpAddr::V4(alice_v4)).map(|e| e.0.clone()), Some("alice".to_string()));
+        assert_eq!(
+            reverse.get(&IpAddr::V4(alice_v4)).map(|e| e.0.clone()),
+            Some("alice".to_string())
+        );
 
         // alice renames to dario; bob leaves.
-        sync_network_hostnames(&table, &reverse, "net", &[("dario".to_string(), alice_v4, v6(1))]).await;
+        sync_network_hostnames(
+            &table,
+            &reverse,
+            "net",
+            &[("dario".to_string(), alice_v4, v6(1))],
+        )
+        .await;
         assert_eq!(
-            resolve_name("dario.net.ray", SUFFIX, &table).await.map(|(v4, _)| v4),
+            resolve_name("dario.net.ray", SUFFIX, &table)
+                .await
+                .map(|(v4, _)| v4),
             Some(alice_v4)
         );
         // Old name and departed peer no longer resolve; reverse is rebuilt.
         assert_eq!(resolve_name("alice.net.ray", SUFFIX, &table).await, None);
         assert_eq!(resolve_name("bob.net.ray", SUFFIX, &table).await, None);
         assert_eq!(reverse.get(&IpAddr::V4(bob_v4)).map(|e| e.0.clone()), None);
-        assert_eq!(reverse.get(&IpAddr::V4(alice_v4)).map(|e| e.0.clone()), Some("dario".to_string()));
+        assert_eq!(
+            reverse.get(&IpAddr::V4(alice_v4)).map(|e| e.0.clone()),
+            Some("dario".to_string())
+        );
     }
 
     #[tokio::test]

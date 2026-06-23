@@ -466,216 +466,162 @@ impl MemberAcceptState {
             return;
         };
         let transport_id = conn.remote_id();
-        match control::recv_msg(&mut recv).await {
-            Ok(ControlMsg::MeshHello {
-                identity: peer_identity,
+        let Ok(ControlMsg::MeshHello {
+            identity: peer_identity,
+            ip,
+            hostname,
+            device_cert,
+            ..
+        }) = control::recv_msg(&mut recv).await
+        else {
+            return;
+        };
+        // Verify identity: either transport key matches, or a valid device cert is present
+        let effective_user_id = if peer_identity == transport_id {
+            peer_identity
+        } else if let Some(ref cert) = device_cert {
+            if !cert.verify()
+                || cert.device_key != transport_id
+                || cert.user_identity != peer_identity
+            {
+                tracing::warn!(peer = %transport_id.fmt_short(), "invalid device certificate");
+                return;
+            }
+            cert.user_identity
+        } else {
+            return;
+        };
+        if let Some(ref cert) = device_cert {
+            self.device_user_map
+                .insert(transport_id, cert.user_identity);
+        }
+        let _ = effective_user_id;
+        let (is_member, is_approved) = {
+            let s = self.state.read().unwrap();
+            (
+                s.members.is_member(&peer_identity),
+                s.approved.is_approved(&peer_identity),
+            )
+        };
+        // Resolve hostname collisions
+        let final_hostname = if let Some(desired) = hostname {
+            let taken: Vec<String> = {
+                let s = self.state.read().unwrap();
+                s.members
+                    .all()
+                    .iter()
+                    .filter(|m| m.identity != peer_identity)
+                    .filter_map(|m| m.hostname.clone())
+                    .collect()
+            };
+            let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
+            Some(crate::hostname::resolve_collision(&desired, &taken_refs))
+        } else {
+            None
+        };
+        // Update DNS table
+        if let Some(ref h) = final_hostname {
+            let ipv6 = derive_ipv6(&peer_identity);
+            dns::update_hostname(
+                &self.hostname_table,
+                &self.reverse_table,
+                &self.network_name,
+                h,
                 ip,
-                hostname,
-                device_cert,
-                ..
-            }) => {
-                // Verify identity: either transport key matches, or a valid device cert is present
-                let effective_user_id = if peer_identity == transport_id {
-                    peer_identity
-                } else if let Some(ref cert) = device_cert {
-                    if !cert.verify()
-                        || cert.device_key != transport_id
-                        || cert.user_identity != peer_identity
-                    {
-                        tracing::warn!(peer = %transport_id.fmt_short(), "invalid device certificate");
-                        return;
-                    }
-                    cert.user_identity
-                } else {
-                    return;
-                };
-                if let Some(ref cert) = device_cert {
-                    self.device_user_map
-                        .insert(transport_id, cert.user_identity);
-                }
-                let _ = effective_user_id;
-                let (is_member, is_approved) = {
-                    let s = self.state.read().unwrap();
-                    (
-                        s.members.is_member(&peer_identity),
-                        s.approved.is_approved(&peer_identity),
-                    )
-                };
-                // Resolve hostname collisions
-                let final_hostname = if let Some(desired) = hostname {
-                    let taken: Vec<String> = {
-                        let s = self.state.read().unwrap();
-                        s.members
-                            .all()
-                            .iter()
-                            .filter(|m| m.identity != peer_identity)
-                            .filter_map(|m| m.hostname.clone())
-                            .collect()
-                    };
-                    let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
-                    Some(crate::hostname::resolve_collision(&desired, &taken_refs))
-                } else {
-                    None
-                };
-                // Update DNS table
-                if let Some(ref h) = final_hostname {
-                    let ipv6 = derive_ipv6(&peer_identity);
-                    dns::update_hostname(
-                        &self.hostname_table,
-                        &self.reverse_table,
-                        &self.network_name,
-                        h,
-                        ip,
-                        ipv6,
-                    )
-                    .await;
-                }
-                if is_approved {
-                    let snap_bytes = {
-                        let mut s = self.state.write().unwrap();
-                        s.approved.remove(&peer_identity);
-                        let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
-                        let _ = s.members.add(Member {
-                            identity: peer_identity,
-                            ip,
-                            is_coordinator: false,
-                            hostname: final_hostname.clone(),
-                            user_identity: user_id_opt,
-                            device_cert: device_cert.clone(),
-                        });
-                        s.refresh_snapshot();
-                        s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
-                    };
-                    if let Some(bytes) = snap_bytes {
-                        let _ = self.blob_store.blobs().add_slice(&bytes).await;
-                    }
-                    let (members, approved_list) = {
-                        let s = self.state.read().unwrap();
-                        (
-                            s.members.all().into_iter().cloned().collect::<Vec<_>>(),
-                            s.approved.all().into_iter().cloned().collect::<Vec<_>>(),
-                        )
-                    };
-                    if let Ok((mut send, _)) = conn.open_bi().await {
-                        let _ = control::send_msg(
-                            &mut send,
-                            &ControlMsg::Welcome {
-                                members: members.clone(),
-                                approved: approved_list,
-                            },
-                        )
-                        .await;
-                    }
-                    let peer_ipv6 = derive_ipv6(&peer_identity);
-                    self.peers.add(
-                        ip,
-                        peer_ipv6,
-                        conn.clone(),
-                        peer_identity,
-                        &self.network_name,
-                    );
-                    forward::spawn_peer_reader(
-                        conn,
-                        peer_identity,
-                        ip,
-                        peer_ipv6,
-                        self.endpoint.id(),
-                        self.network_name.clone(),
-                        self.shared_acl.clone(),
-                        self.firewall.clone(),
-                        self.tun_tx.clone(),
-                        self.disconnect_tx.clone(),
-                        self.token.clone(),
-                        self.stats.clone(),
-                        self.device_user_map.clone(),
-                    );
-                    broadcast_member_sync(&self.peers, &members, Some(ip)).await;
-                } else if is_member {
-                    if final_hostname.is_some() {
-                        let mut s = self.state.write().unwrap();
-                        if let Some(m) = s.members.get_mut(&peer_identity) {
-                            m.hostname = final_hostname;
-                        }
-                    }
-                    let peer_ipv6 = derive_ipv6(&peer_identity);
-                    self.peers.add(
-                        ip,
-                        peer_ipv6,
-                        conn.clone(),
-                        peer_identity,
-                        &self.network_name,
-                    );
-                    forward::spawn_peer_reader(
-                        conn,
-                        peer_identity,
-                        ip,
-                        peer_ipv6,
-                        self.endpoint.id(),
-                        self.network_name.clone(),
-                        self.shared_acl.clone(),
-                        self.firewall.clone(),
-                        self.tun_tx.clone(),
-                        self.disconnect_tx.clone(),
-                        self.token.clone(),
-                        self.stats.clone(),
-                        self.device_user_map.clone(),
-                    );
+                ipv6,
+            )
+            .await;
+        }
+        if is_approved {
+            let snap_bytes = {
+                let mut s = self.state.write().unwrap();
+                s.approved.remove(&peer_identity);
+                let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
+                let _ = s.members.add(Member {
+                    identity: peer_identity,
+                    ip,
+                    is_coordinator: false,
+                    hostname: final_hostname.clone(),
+                    user_identity: user_id_opt,
+                    device_cert: device_cert.clone(),
+                });
+                s.refresh_snapshot();
+                s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+            };
+            if let Some(bytes) = snap_bytes {
+                let _ = self.blob_store.blobs().add_slice(&bytes).await;
+            }
+            let (members, approved_list) = {
+                let s = self.state.read().unwrap();
+                (
+                    s.members.all().into_iter().cloned().collect::<Vec<_>>(),
+                    s.approved.all().into_iter().cloned().collect::<Vec<_>>(),
+                )
+            };
+            if let Ok((mut send, _)) = conn.open_bi().await {
+                let _ = control::send_msg(
+                    &mut send,
+                    &ControlMsg::Welcome {
+                        members: members.clone(),
+                        approved: approved_list,
+                    },
+                )
+                .await;
+            }
+            let peer_ipv6 = derive_ipv6(&peer_identity);
+            self.peers.add(
+                ip,
+                peer_ipv6,
+                conn.clone(),
+                peer_identity,
+                &self.network_name,
+            );
+            forward::spawn_peer_reader(
+                conn,
+                peer_identity,
+                ip,
+                peer_ipv6,
+                self.endpoint.id(),
+                self.network_name.clone(),
+                self.shared_acl.clone(),
+                self.firewall.clone(),
+                self.tun_tx.clone(),
+                self.disconnect_tx.clone(),
+                self.token.clone(),
+                self.stats.clone(),
+                self.device_user_map.clone(),
+            );
+            broadcast_member_sync(&self.peers, &members, Some(ip)).await;
+        } else if is_member {
+            if final_hostname.is_some() {
+                let mut s = self.state.write().unwrap();
+                if let Some(m) = s.members.get_mut(&peer_identity) {
+                    m.hostname = final_hostname;
                 }
             }
-            Ok(ControlMsg::ReconnectRequest {
-                identity: peer_identity,
+            let peer_ipv6 = derive_ipv6(&peer_identity);
+            self.peers.add(
                 ip,
-                ..
-            }) => {
-                if peer_identity != transport_id {
-                    return;
-                }
-                let is_known = self.state.read().unwrap().members.is_member(&peer_identity);
-                if is_known {
-                    let peer_ipv6 = derive_ipv6(&peer_identity);
-                    self.peers.add(
-                        ip,
-                        peer_ipv6,
-                        conn.clone(),
-                        peer_identity,
-                        &self.network_name,
-                    );
-                    let current_members: Vec<Member> = self
-                        .state
-                        .read()
-                        .unwrap()
-                        .members
-                        .all()
-                        .into_iter()
-                        .cloned()
-                        .collect();
-                    if let Ok((mut send, _)) = conn.open_bi().await {
-                        let _ = control::send_msg(
-                            &mut send,
-                            &ControlMsg::MemberSync {
-                                members: current_members,
-                            },
-                        )
-                        .await;
-                    }
-                    forward::spawn_peer_reader(
-                        conn,
-                        peer_identity,
-                        ip,
-                        peer_ipv6,
-                        self.endpoint.id(),
-                        self.network_name.clone(),
-                        self.shared_acl.clone(),
-                        self.firewall.clone(),
-                        self.tun_tx.clone(),
-                        self.disconnect_tx.clone(),
-                        self.token.clone(),
-                        self.stats.clone(),
-                        self.device_user_map.clone(),
-                    );
-                }
-            }
-            _ => {}
+                peer_ipv6,
+                conn.clone(),
+                peer_identity,
+                &self.network_name,
+            );
+            forward::spawn_peer_reader(
+                conn,
+                peer_identity,
+                ip,
+                peer_ipv6,
+                self.endpoint.id(),
+                self.network_name.clone(),
+                self.shared_acl.clone(),
+                self.firewall.clone(),
+                self.tun_tx.clone(),
+                self.disconnect_tx.clone(),
+                self.token.clone(),
+                self.stats.clone(),
+                self.device_user_map.clone(),
+            );
         }
     }
 }
@@ -2335,7 +2281,9 @@ impl DaemonState {
                         tracing::warn!(error = %e, "failed to persist default hostname");
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "failed to load config to set default hostname"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load config to set default hostname")
+                }
             }
         }
 
@@ -2847,8 +2795,14 @@ impl DaemonState {
             // Authoritative: republish the group blob and push the new roster to
             // every peer immediately.
             update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
-            let members: Vec<Member> =
-                state.read().unwrap().members.all().into_iter().cloned().collect();
+            let members: Vec<Member> = state
+                .read()
+                .unwrap()
+                .members
+                .all()
+                .into_iter()
+                .cloned()
+                .collect();
             broadcast_member_sync(&self.peers, &members, None).await;
         } else {
             // Notify the coordinator via MeshHello (sent to all connected peers;
@@ -4618,7 +4572,8 @@ fn spawn_coordinator_control_reader(
 
             // Re-assert this peer's DNS entry (idempotent; clears any stale name
             // sharing its IP before inserting the current one).
-            dns::remove_hostname_by_ip(&hostname_table, &reverse_table, &network_name, peer_ip).await;
+            dns::remove_hostname_by_ip(&hostname_table, &reverse_table, &network_name, peer_ip)
+                .await;
             let ipv6 = derive_ipv6(&remote_id);
             dns::update_hostname(
                 &hostname_table,
@@ -4633,8 +4588,14 @@ fn spawn_coordinator_control_reader(
             if changed {
                 tracing::info!(peer = %remote_id.fmt_short(), hostname = %final_hostname, "peer hostname changed; propagating");
                 update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
-                let members: Vec<Member> =
-                    state.read().unwrap().members.all().into_iter().cloned().collect();
+                let members: Vec<Member> = state
+                    .read()
+                    .unwrap()
+                    .members
+                    .all()
+                    .into_iter()
+                    .cloned()
+                    .collect();
                 broadcast_member_sync(&peers, &members, None).await;
             }
         }

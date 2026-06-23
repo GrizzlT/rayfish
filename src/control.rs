@@ -80,12 +80,6 @@ pub enum ControlMsg {
     MemberSync {
         members: Vec<Member>,
     },
-    ReconnectRequest {
-        identity: EndpointId,
-        ip: Ipv4Addr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        device_cert: Option<DeviceCert>,
-    },
     MeshHello {
         identity: EndpointId,
         ip: Ipv4Addr,
@@ -93,18 +87,6 @@ pub enum ControlMsg {
         hostname: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_cert: Option<DeviceCert>,
-    },
-    MeshWelcome {
-        identity: EndpointId,
-        ip: Ipv4Addr,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        hostname: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        device_cert: Option<DeviceCert>,
-    },
-    AdvertiseServices {
-        ip: Ipv4Addr,
-        services: Vec<ServiceTag>,
     },
     MemberApproved {
         identity: EndpointId,
@@ -128,12 +110,6 @@ pub enum ControlMsg {
         mime_type: String,
         blob_hash: blake3::Hash,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServiceTag {
-    pub name: String,
-    pub port: u16,
 }
 
 pub fn encode_msg(msg: &ControlMsg) -> Vec<u8> {
@@ -279,18 +255,6 @@ mod tests {
                     device_cert: None,
                 },
             ],
-        };
-        let bytes = encode_msg(&msg);
-        let decoded = decode_msg(&bytes).unwrap();
-        assert_eq!(msg, decoded);
-    }
-
-    #[test]
-    fn test_roundtrip_reconnect_request() {
-        let msg = ControlMsg::ReconnectRequest {
-            identity: test_id(1),
-            ip: Ipv4Addr::new(100, 64, 7, 42),
-            device_cert: None,
         };
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();

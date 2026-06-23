@@ -7,7 +7,7 @@
 //! on the inbound side — see `forward::run_mesh` / `forward::evaluate_inbound`).
 //!
 //! The rayfish/iroh **control plane** (`Welcome`, `MemberSync`, `BlobUpdated`,
-//! `MeshHello`, `ReconnectRequest`, …) travels over QUIC *bidirectional streams*,
+//! `MeshHello`, …) travels over QUIC *bidirectional streams*,
 //! not datagrams, and the iroh transport itself runs on the host's real network
 //! interfaces — neither ever enters the TUN device. **The firewall therefore
 //! cannot block rayfish/iroh connections**, regardless of rules. Blocking the VPN
