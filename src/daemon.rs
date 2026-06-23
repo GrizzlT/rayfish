@@ -2020,8 +2020,14 @@ impl DaemonState {
         // coordinator-only stub.
         let mut member_list = MemberList::new();
         let mut approved_list = ApprovedList::new();
+        // `trusted` + `suggested_firewall` are authoritative in the signed blob;
+        // fall back to the persisted config only if the blob can't be fetched.
+        let mut trusted = net_config.map(|nc| nc.trusted).unwrap_or(false);
+        let mut suggested_firewall = SuggestedFirewall::default();
         match self.restore_roster_from_blob(net_public_key).await {
             Ok(data) => {
+                trusted = data.trusted;
+                suggested_firewall = data.suggested_firewall.clone();
                 for m in &data.members {
                     let _ = member_list.add(m.clone());
                 }
@@ -2085,8 +2091,8 @@ impl DaemonState {
             network_public_key: net_public_key,
             network_name: Some(name.to_string()),
             mode,
-            trusted: false,
-            suggested_firewall: SuggestedFirewall::default(),
+            trusted,
+            suggested_firewall,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         };
@@ -2150,9 +2156,12 @@ impl DaemonState {
                 network_secret_key: Some(net_secret_key.clone()),
                 network_public_key: Some(net_public_key),
                 transport: None,
-                trusted: false,
-                allow_trusted: false,
-                admins: vec![],
+                // Preserve the persisted consent flags + admin roster across a
+                // restart; only the roster (members/approved) is authoritative
+                // from the blob.
+                trusted,
+                allow_trusted: net_config.map(|nc| nc.allow_trusted).unwrap_or(false),
+                admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
             },
         );
         config::save(&app_config)?;
