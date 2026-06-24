@@ -297,7 +297,6 @@ pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
 /// An IP is considered free if no *different* identity holds it — a re-add of
 /// the same identity at its existing index is always accepted. Returns the
 /// `(ip, index)` pair that should be stored in `Member.ip` / `Member.collision_index`.
-#[allow(dead_code)] // public API; will be called from daemon admission once wired in
 pub fn assign_ip(members: &MemberList, identity: &EndpointId) -> (Ipv4Addr, u32) {
     let mut index = 0u32;
     loop {
@@ -530,14 +529,32 @@ pub fn validate_approved(entry: &ApprovedEntry) -> Result<()> {
 ///
 /// This enforces the roster invariant that every member has a unique IP.
 /// Call this at any trust boundary where a freshly-decoded roster is applied.
-// consumed by admission/reconverge tiebreak wiring
-#[allow(dead_code)]
 pub fn validate_no_duplicate_ips(members: &[Member]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for m in members {
         anyhow::ensure!(seen.insert(m.ip), "duplicate IP {} in roster", m.ip);
     }
     Ok(())
+}
+
+/// Resolve duplicate-IP rosters deterministically: for each clashing IP the
+/// lowest identity keeps it; others re-roll to their next free index.
+///
+/// Two coordinators can independently admit a fresh joiner at the same collision
+/// index, so a reconverged roster may carry duplicate IPs. Sorting by identity
+/// bytes and re-seating every member through [`assign_ip`] makes the resolution
+/// order independent of where the roster was assembled, so every node converges
+/// on the same address map.
+pub fn resolve_ip_tiebreak(mut members: Vec<Member>) -> Vec<Member> {
+    members.sort_by_key(|m| m.identity.as_bytes().to_owned());
+    let mut list = MemberList::new();
+    for mut m in members {
+        let (ip, idx) = assign_ip(&list, &m.identity);
+        m.ip = ip;
+        m.collision_index = idx;
+        let _ = list.add(m);
+    }
+    list.all().into_iter().cloned().collect()
 }
 
 fn ensure_in_cgnat_range(ip: Ipv4Addr) -> Result<()> {
@@ -1596,5 +1613,33 @@ mod tests {
             derive_ip_with_index(&b, idx_b),
             "assigned IP must equal derive_ip_with_index at that index"
         );
+    }
+
+    #[test]
+    fn tiebreak_keeps_lower_identity_rerolls_other() {
+        // Order two distinct identities by their canonical byte order so the
+        // assertion ("lower identity keeps the shared ip") is deterministic
+        // regardless of how the seeds map onto public keys.
+        let (lo, hi) = {
+            let (a, b) = (test_id(1), test_id(9));
+            if a.as_bytes() <= b.as_bytes() { (a, b) } else { (b, a) }
+        };
+        let ip = derive_ip(&lo); // both initially claim this ip at index 0
+        let mk = |id| Member {
+            identity: id,
+            ip,
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+            collision_index: 0,
+        };
+        let resolved = resolve_ip_tiebreak(vec![mk(hi), mk(lo)]);
+        // lower identity keeps `ip`; higher re-rolls to a free index.
+        let lo_m = resolved.iter().find(|m| m.identity == lo).unwrap();
+        let hi_m = resolved.iter().find(|m| m.identity == hi).unwrap();
+        assert_eq!(lo_m.ip, ip);
+        assert_ne!(hi_m.ip, ip);
+        assert!(validate_no_duplicate_ips(&resolved).is_ok());
     }
 }

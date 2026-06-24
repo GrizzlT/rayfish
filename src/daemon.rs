@@ -104,10 +104,15 @@ struct CoordinatorAcceptState {
 impl CoordinatorAcceptState {
     async fn handle_connection(&self, conn: Connection) {
         let remote_id = conn.remote_id();
-        let peer_ip = self.identity.derive_ip(&remote_id);
 
-        // Known member reconnecting
-        let is_member = self.state.read().unwrap().members.is_member(&remote_id);
+        // Known member reconnecting: reuse its roster IP (which carries any
+        // collision_index), not a fresh index-0 derivation.
+        let member_ip = {
+            let s = self.state.read().unwrap();
+            s.members.get(&remote_id).map(|m| m.ip)
+        };
+        let peer_ip = member_ip.unwrap_or_else(|| self.identity.derive_ip(&remote_id));
+        let is_member = member_ip.is_some();
         if is_member {
             tracing::info!(ip = %peer_ip, "known member reconnecting");
             crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
@@ -365,7 +370,7 @@ impl CoordinatorAcceptState {
         conn: Connection,
         mut send: iroh::endpoint::SendStream,
         remote_id: EndpointId,
-        peer_ip: Ipv4Addr,
+        _suggested_ip: Ipv4Addr,
         hostname: Option<String>,
         device_cert: Option<control::DeviceCert>,
         was_approved: bool,
@@ -374,6 +379,15 @@ impl CoordinatorAcceptState {
         // peer can claim another's name to take its suggested firewall rules.
         authoritative: bool,
     ) -> bool {
+        // Assign the IP authoritatively from the current roster: lowest free
+        // collision index whose derived IPv4 isn't already held by a *different*
+        // identity. This (not the peer-suggested address) is what we store and
+        // report back, so two coordinators that both admit at index 0 produce a
+        // roster the reconverge tiebreak can resolve deterministically.
+        let (peer_ip, collision_index) = {
+            let s = self.state.read().unwrap();
+            crate::membership::assign_ip(&s.members, &remote_id)
+        };
         // Resolve the hostname. An authoritative (invite-bound) name already bound
         // to a different identity is rejected. A joiner-chosen name keeps
         // collision resolution (`name` → `name-1` → …).
@@ -435,7 +449,7 @@ impl CoordinatorAcceptState {
                 hostname: final_hostname.clone(),
                 user_identity: user_id_opt,
                 device_cert: device_cert.clone(),
-                collision_index: 0,
+                collision_index,
             });
             s.refresh_snapshot();
             s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
@@ -621,21 +635,30 @@ impl MemberAcceptState {
             .await;
         }
         if is_approved {
-            let snap_bytes = {
+            let (snap_bytes, ip) = {
                 let mut s = self.state.write().unwrap();
-                s.approved.remove(&peer_identity);
+                let approved_entry = s.approved.remove(&peer_identity);
                 let user_id_opt = device_cert.as_ref().map(|c| c.user_identity);
+                // Trust the authoritative IP + collision index recorded when the
+                // peer was approved, not the peer-supplied MeshHello.ip.
+                let (member_ip, member_idx) = approved_entry
+                    .as_ref()
+                    .map(|e| (e.ip, e.collision_index))
+                    .unwrap_or((ip, 0));
                 let _ = s.members.add(Member {
                     identity: peer_identity,
-                    ip,
+                    ip: member_ip,
                     is_coordinator: false,
                     hostname: final_hostname.clone(),
                     user_identity: user_id_opt,
                     device_cert: device_cert.clone(),
-                    collision_index: 0,
+                    collision_index: member_idx,
                 });
                 s.refresh_snapshot();
-                s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone())
+                (
+                    s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone()),
+                    member_ip,
+                )
             };
             if let Some(bytes) = snap_bytes {
                 let _ = self.blob_store.blobs().add_slice(&bytes).await;
@@ -3694,15 +3717,17 @@ impl DaemonState {
             };
         };
 
-        let ip = self.identity.derive_ip(&identity);
         let user_id = pj.device_cert.as_ref().map(|c| c.user_identity);
-        {
+        let ip = {
             let Some(handle) = self.networks.get(network) else {
                 return IpcMessage::Error {
                     message: format!("network '{network}' not active"),
                 };
             };
             let mut s = handle.state.write().unwrap();
+            // Assign authoritatively from the current roster so two coordinators
+            // accepting concurrently can be reconciled by the reconverge tiebreak.
+            let (ip, collision_index) = crate::membership::assign_ip(&s.members, &identity);
             let members = s.members.clone();
             let _ = s.approved.approve(
                 ApprovedEntry {
@@ -3711,12 +3736,13 @@ impl DaemonState {
                     hostname: pj.hostname.clone(),
                     user_identity: user_id,
                     device_cert: pj.device_cert.clone(),
-                    collision_index: 0,
+                    collision_index,
                 },
                 &members,
             );
             s.refresh_snapshot();
-        }
+            ip
+        };
         self.store_and_publish_group(network).await;
         broadcast_control_msg(
             &self.peers,
@@ -5283,9 +5309,17 @@ async fn reconverge_and_apply(
         tracing::warn!(network = %network_name, "reconverge: could not fetch verified blob");
         return;
     };
+    // Two coordinators can independently admit a fresh joiner at the same
+    // collision index, producing a roster with duplicate IPs. Resolve it
+    // deterministically (lowest identity keeps the slot, others re-roll) before
+    // it reaches the PeerTable/DNS so every node converges on the same map.
+    let tiebroken = crate::membership::resolve_ip_tiebreak(data.members.clone());
+    if let Err(e) = crate::membership::validate_no_duplicate_ips(&tiebroken) {
+        tracing::warn!(network = %network_name, error = %e, "roster still has duplicate IPs after tiebreak; applying tiebroken version");
+    }
     let roster = {
         let mut s = state.write().unwrap();
-        s.members = MemberList::from_members(data.members.clone());
+        s.members = MemberList::from_members(tiebroken);
         s.approved = ApprovedList::from_entries(data.approved.clone());
         s.suggested_firewall = data.suggested_firewall.clone();
         s.refresh_snapshot();
