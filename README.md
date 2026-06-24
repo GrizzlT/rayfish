@@ -33,7 +33,7 @@ Each machine runs a small daemon (think Tailscale's `tailscaled`) that creates a
 
 ## Features
 
-- 🔒 **Closed-by-default networks** with one-time invites or live approval (`--open` for public ones)
+- 🔒 **Closed-by-default networks** with one-time invites, reusable fleet keys, or live approval (`--open` for public ones)
 - 🌐 **Magic DNS** — `name.network.ray`, updated live as peers join, leave, or rename
 - 🧱 **Per-device firewall** — directional, per-port, per-network rules with stateful return traffic
 - 🤝 **Coordinator firewall suggestions** — on any network the coordinator can *suggest* firewall rules that ride the signed network record (`*` targets all hosts); each node reviews them or opts into auto-install with `--auto-accept-firewall`
@@ -106,8 +106,9 @@ Run `ray --help` to discover the rest: `invite`, `requests`/`accept`/`deny`, `fi
 
 The **room id** (a network's public key) is a *discovery* key — it's published so peers can find the network, but on a closed network it is **not** an admission credential. Admission is always the coordinator's job:
 
-- **Closed (default)** — two ways in:
-  - **Invite code** — `ray invite <network>` mints a single-use, expiring code. The holder runs `ray join <code>`; the coordinator verifies and **burns** it. Ideal for unattended server provisioning. Manage with `ray invite <network> list` / `revoke <id>`.
+- **Closed (default)** — three ways in:
+  - **Invite code** — `ray invite <network>` mints a single-use, expiring code. The holder runs `ray join <code>`; the coordinator verifies and **burns** it. Manage with `ray invite <network> list` / `revoke <id>`.
+  - **Reusable key** — `ray invite <network> --reusable` mints a multi-use, expiring key for unattended fleets. Its hash rides the network's signed record, so it admits many machines and `revoke` propagates to every key-holder. A server joins non-interactively with `ray join <key> --hostname web --auto-accept-firewall`. The name isn't authoritative, so two servers asking for `web` become `web` and `web-1` — for stable per-host names give each a unique `--hostname` (e.g. a cloud instance id), and prefer the `*` wildcard subject for fleet firewall suggestions (a rule keyed to one hostname can retarget as servers come and go). **Key expiry ≠ member expiry:** expiry/revoke only blocks *new* joins; machines already admitted stay members.
   - **Live approval** — the holder of just the room id runs `ray join <room-id>` and lands in a queue. The coordinator runs `ray requests <network>`, then `ray accept <network> <id>` (or `ray deny`).
 - **Open** (`ray create --open`) — anyone with the room id joins directly. Good for public or community networks.
 

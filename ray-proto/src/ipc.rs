@@ -133,13 +133,18 @@ pub enum IpcMessage {
     SetOperator {
         uid: u32,
     },
-    /// Mint a one-time invite for a closed network (coordinator-only).
+    /// Mint an invite for a closed network (coordinator / network-key holder only).
     InviteCreate {
         network: String,
         expires_secs: u64,
-        /// Hostname the coordinator assigns on redemption (trusted networks).
+        /// Hostname the coordinator assigns authoritatively on redemption
+        /// (single-use only; rejected together with `reusable`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hostname: Option<String>,
+        /// Mint a reusable (multi-use, expiring) key that rides the signed blob,
+        /// so any network-key holder can admit. Hostname is not authoritative.
+        #[serde(default)]
+        reusable: bool,
     },
     /// List invites for a network (coordinator-only).
     InviteList {
@@ -272,9 +277,12 @@ pub struct InviteInfo {
     pub created: u64,
     pub expires: u64,
     pub redeemer: Option<String>,
-    /// Hostname assigned on redemption (trusted networks).
+    /// Hostname assigned authoritatively on redemption (single-use invites only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// True for a reusable (multi-use) key; false for a single-use invite.
+    #[serde(default)]
+    pub reusable: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -453,7 +461,7 @@ mod tests {
             hostname: None,
             transport: None,
         };
-        let bytes = rmp_serde::to_vec(&req).unwrap();
+        let bytes = rmp_serde::to_vec_named(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
             IpcMessage::Create { mode, .. } => {
@@ -518,7 +526,7 @@ mod tests {
             my_ip: Ipv4Addr::new(100, 64, 10, 5),
             my_ipv6: None,
         };
-        let bytes = rmp_serde::to_vec(&resp).unwrap();
+        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
             IpcMessage::Created {
@@ -558,17 +566,22 @@ mod tests {
             network: "gaming".to_string(),
             expires_secs: 604_800,
             hostname: None,
+            reusable: true,
         };
-        let bytes = rmp_serde::to_vec(&req).unwrap();
+        // The IPC codec uses `to_vec_named`; positional encoding can't survive a
+        // `skip_serializing_if` field followed by another field.
+        let bytes = rmp_serde::to_vec_named(&req).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
             IpcMessage::InviteCreate {
                 network,
                 expires_secs,
                 hostname: _,
+                reusable,
             } => {
                 assert_eq!(network, "gaming");
                 assert_eq!(expires_secs, 604_800);
+                assert!(reusable);
             }
             _ => panic!("wrong variant"),
         }
@@ -584,9 +597,10 @@ mod tests {
                 expires: 2000,
                 redeemer: None,
                 hostname: None,
+                reusable: false,
             }],
         };
-        let bytes = rmp_serde::to_vec(&resp).unwrap();
+        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
         let decoded: IpcMessage = rmp_serde::from_slice(&bytes).unwrap();
         match decoded {
             IpcMessage::InviteListResponse { invites } => {

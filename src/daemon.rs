@@ -35,7 +35,7 @@
 //!   that network's background tasks. Because cancellation is one-shot, every
 //!   `activate` mints *fresh* child tokens, so `up → down → up` cycles work.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -253,9 +253,36 @@ impl CoordinatorAcceptState {
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(peer = %remote_id.fmt_short(), error = %e, "invite rejected");
-                    self.deny(&conn, send, format!("invite rejected: {e}")).await;
+                Err(single_use_err) => {
+                    // Not a single-use invite — it may be a reusable key, which
+                    // lives in the signed blob and is redeemable by any network-key
+                    // holder (no burn). The blob is the verified source of truth.
+                    let reusable_id = {
+                        let s = self.state.read().unwrap();
+                        crate::membership::validate_reusable_key(
+                            &s.reusable_keys,
+                            &secret,
+                            now_secs(),
+                        )
+                        .map(|k| k.id.clone())
+                    };
+                    if let Some(key_id) = reusable_id {
+                        tracing::info!(
+                            peer = %remote_id.fmt_short(),
+                            key_id = %key_id,
+                            "reusable key redeemed"
+                        );
+                        // Reusable joins are non-authoritative: joiner-chosen name,
+                        // collision → suffix.
+                        self.admit_peer(
+                            conn, send, remote_id, peer_ip, hostname, device_cert, false, false,
+                        )
+                        .await;
+                    } else {
+                        tracing::warn!(peer = %remote_id.fmt_short(), error = %single_use_err, "invite rejected");
+                        self.deny(&conn, send, format!("invite rejected: {single_use_err}"))
+                            .await;
+                    }
                 }
             }
             return;
@@ -907,6 +934,12 @@ struct NetworkState {
     /// what it publishes; on a member it is what it last received and
     /// materializes rules from.
     suggested_firewall: SuggestedFirewall,
+    /// Reusable join keys carried in the signed blob (keyed by hex
+    /// `blake3(secret)`). On a network-key holder this is what it publishes and
+    /// validates redemptions against; on a plain member it is what it last
+    /// received. Reloaded from the verified blob on every reconverge so any admin
+    /// can admit and revocation propagates.
+    reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
     /// Materialized suggested rules awaiting manual `ray firewall accept` on a
     /// node that did not opt into `--auto-accept-firewall`. Empty when
     /// auto-accepting.
@@ -930,6 +963,7 @@ impl NetworkState {
             &self.approved,
             &self.suggested_firewall,
             self.network_name.as_deref(),
+            &self.reusable_keys,
         );
         let hash = blake3::hash(&bytes);
         self.snapshot = Some(GroupSnapshot {
@@ -1175,7 +1209,11 @@ impl DaemonState {
                 network,
                 expires_secs,
                 hostname,
-            } => self.invite_create(&network, expires_secs, hostname).await,
+                reusable,
+            } => {
+                self.invite_create(&network, expires_secs, hostname, reusable)
+                    .await
+            }
             IpcMessage::InviteList { network } => self.invite_list(&network).await,
             IpcMessage::InviteRevoke { network, id } => self.invite_revoke(&network, &id).await,
             IpcMessage::Requests { network } => self.list_requests(&network),
@@ -1281,6 +1319,7 @@ impl DaemonState {
             network_name: Some(name.clone()),
             mode,
             suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         };
@@ -1645,6 +1684,7 @@ impl DaemonState {
             self.reverse_table.clone(),
             invite,
             data.suggested_firewall.clone(),
+            data.reusable_keys.clone(),
             auto_accept_firewall,
             initial,
         )
@@ -1955,6 +1995,7 @@ impl DaemonState {
                 network_name: data.name.clone(),
                 mode: GroupMode::Restricted,
                 suggested_firewall: SuggestedFirewall::default(),
+                reusable_keys: data.reusable_keys.clone(),
                 pending_suggestions: Vec::new(),
                 pending: HashMap::new(),
             };
@@ -2100,9 +2141,12 @@ impl DaemonState {
         // `suggested_firewall` is authoritative in the signed blob; fall back to
         // an empty set only if the blob can't be fetched.
         let mut suggested_firewall = SuggestedFirewall::default();
+        // Reusable join keys are authoritative in the signed blob too.
+        let mut reusable_keys = BTreeMap::new();
         match self.restore_roster_from_blob(net_public_key).await {
             Ok(data) => {
                 suggested_firewall = data.suggested_firewall.clone();
+                reusable_keys = data.reusable_keys.clone();
                 for m in &data.members {
                     let _ = member_list.add(m.clone());
                 }
@@ -2167,6 +2211,7 @@ impl DaemonState {
             network_name: Some(name.to_string()),
             mode,
             suggested_firewall,
+            reusable_keys,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         };
@@ -2420,6 +2465,7 @@ impl DaemonState {
                 &ApprovedList::new(),
                 &SuggestedFirewall::default(),
                 None,
+                &BTreeMap::new(),
             );
             if let Err(e) = dht::publish_network(&client, &key, &empty_hash, &[]).await {
                 tracing::warn!(error = %e, "failed to publish empty network record on nuke");
@@ -3071,7 +3117,18 @@ impl DaemonState {
         Ok((handle.network_key, handle.invite_lock.clone()))
     }
 
-    async fn invite_create(&self, network: &str, expires_secs: u64, hostname: Option<String>) -> IpcMessage {
+    async fn invite_create(
+        &self,
+        network: &str,
+        expires_secs: u64,
+        hostname: Option<String>,
+        reusable: bool,
+    ) -> IpcMessage {
+        if reusable {
+            return self
+                .reusable_key_create(network, expires_secs, hostname)
+                .await;
+        }
         let (net_pubkey, lock) = match self.coordinator_handle(network) {
             Ok(v) => v,
             Err(e) => return e,
@@ -3099,40 +3156,156 @@ impl DaemonState {
         }
     }
 
-    async fn invite_list(&self, network: &str) -> IpcMessage {
-        let (_net_pubkey, lock) = match self.coordinator_handle(network) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let _guard = lock.lock().await;
-        let store = match crate::invite::InviteStore::load(network) {
-            Ok(s) => s,
-            Err(e) => {
+    /// Mint a reusable join key: insert its hash into the signed blob and
+    /// republish, so any network-key holder can admit. Authority is holding the
+    /// network secret key (like firewall suggestions), not the `is_coordinator`
+    /// flag. A reusable key cannot bind an authoritative hostname.
+    async fn reusable_key_create(
+        &self,
+        network: &str,
+        expires_secs: u64,
+        hostname: Option<String>,
+    ) -> IpcMessage {
+        if hostname.is_some() {
+            return IpcMessage::Error {
+                message: "a reusable key cannot bind a hostname (a multi-use key admits many \
+                          machines); drop --hostname or omit --reusable"
+                    .to_string(),
+            };
+        }
+        let (state, dht_notify, net_pubkey, has_key) = match self.networks.get(network) {
+            Some(h) => {
+                let has_key = h.state.read().unwrap().network_secret_key.is_some();
+                (h.state.clone(), h.dht_notify.clone(), h.network_key, has_key)
+            }
+            None => {
                 return IpcMessage::Error {
-                    message: format!("failed to read invites: {e:#}"),
+                    message: format!("network '{network}' not active"),
                 };
             }
         };
-        let invites = store
-            .list()
-            .into_iter()
-            .map(|v| ipc::InviteInfo {
-                id: v.id,
-                status: v.status,
-                created: v.created,
-                expires: v.expires,
-                redeemer: v.redeemer,
-                hostname: v.hostname,
-            })
-            .collect();
+        if !has_key {
+            return IpcMessage::Error {
+                message: "only a coordinator (network key holder) can mint a reusable key"
+                    .to_string(),
+            };
+        }
+        let secret = crate::invite::generate_secret();
+        let (hash, key) = crate::membership::ReusableKey::from_secret(&secret, now_secs(), expires_secs);
+        let id = key.id.clone();
+        {
+            let mut s = state.write().unwrap();
+            s.reusable_keys.insert(hash, key);
+        }
+        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+        let code = crate::invite::encode_invite_code(&net_pubkey, &self.endpoint.id(), &secret);
+        IpcMessage::InviteCreated {
+            code,
+            id,
+            expires_secs,
+        }
+    }
+
+    async fn invite_list(&self, network: &str) -> IpcMessage {
+        // Extract owned handles before any await (DashMap refs must not be held
+        // across `.await`).
+        let (lock, has_key, reusable) = {
+            let Some(handle) = self.networks.get(network) else {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not active"),
+                };
+            };
+            let s = handle.state.read().unwrap();
+            (
+                handle.invite_lock.clone(),
+                s.network_secret_key.is_some(),
+                s.reusable_keys.clone(),
+            )
+        };
+        if !has_key {
+            return IpcMessage::Error {
+                message: format!(
+                    "only a coordinator (network key holder) can list invites for '{network}'"
+                ),
+            };
+        }
+        let mut invites: Vec<ipc::InviteInfo> = Vec::new();
+        // Single-use invites from the local ledger (present on the minting node;
+        // a co-coordinator's ledger is simply empty).
+        {
+            let _guard = lock.lock().await;
+            if let Ok(store) = crate::invite::InviteStore::load(network) {
+                for v in store.list() {
+                    invites.push(ipc::InviteInfo {
+                        id: v.id,
+                        status: v.status,
+                        created: v.created,
+                        expires: v.expires,
+                        redeemer: v.redeemer,
+                        hostname: v.hostname,
+                        reusable: false,
+                    });
+                }
+            }
+        }
+        // Reusable keys from the signed blob — known to every network-key holder.
+        let now = now_secs();
+        for k in reusable.values() {
+            let status = if k.revoked {
+                "revoked"
+            } else if now >= k.expires {
+                "expired"
+            } else {
+                "active"
+            };
+            invites.push(ipc::InviteInfo {
+                id: k.id.clone(),
+                status: status.to_string(),
+                created: k.created,
+                expires: k.expires,
+                redeemer: None,
+                hostname: None,
+                reusable: true,
+            });
+        }
         IpcMessage::InviteListResponse { invites }
     }
 
     async fn invite_revoke(&self, network: &str, id: &str) -> IpcMessage {
-        let (_net_pubkey, lock) = match self.coordinator_handle(network) {
-            Ok(v) => v,
-            Err(e) => return e,
+        let (state, dht_notify, lock, has_key) = {
+            let Some(handle) = self.networks.get(network) else {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not active"),
+                };
+            };
+            let has_key = handle.state.read().unwrap().network_secret_key.is_some();
+            (
+                handle.state.clone(),
+                handle.dht_notify.clone(),
+                handle.invite_lock.clone(),
+                has_key,
+            )
         };
+        if !has_key {
+            return IpcMessage::Error {
+                message: format!(
+                    "only a coordinator (network key holder) can revoke invites for '{network}'"
+                ),
+            };
+        }
+        // A reusable key lives in the signed blob: revoke it there and republish
+        // so the revocation propagates to every admin.
+        let revoked_reusable = {
+            let mut s = state.write().unwrap();
+            crate::membership::revoke_reusable(&mut s.reusable_keys, id).is_ok()
+        };
+        if revoked_reusable {
+            update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+            return IpcMessage::Ok {
+                message: format!("revoked reusable key '{id}' (propagating to all admins)"),
+            };
+        }
+        // Fall back to the local single-use invite ledger.
         let result = {
             let _guard = lock.lock().await;
             match crate::invite::InviteStore::load(network) {
@@ -4471,6 +4644,7 @@ fn spawn_network_publisher(
                             &s.approved,
                             &s.suggested_firewall,
                             s.network_name.as_deref(),
+                            &s.reusable_keys,
                         )
                     })
             };
@@ -4528,6 +4702,7 @@ fn spawn_lazy_publisher(
                             &s.approved,
                             &s.suggested_firewall,
                             s.network_name.as_deref(),
+                            &s.reusable_keys,
                         )
                     })
             };
@@ -5068,6 +5243,15 @@ async fn apply_roster_to_dns(
     }
 }
 
+/// Current Unix time in seconds. Reusable-key expiry uses wall-clock time (the
+/// same convention as the single-use invite ledger).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 async fn update_snapshot_and_publish(
     state: &Arc<std::sync::RwLock<NetworkState>>,
     blob_store: &FsStore,
@@ -5125,6 +5309,9 @@ async fn join_mesh_shared(
     // From the fetched blob: the current coordinator-suggested firewall rules.
     // Persisted so a member inherits them.
     suggested_firewall: SuggestedFirewall,
+    // From the fetched blob: reusable join keys, so this node can validate
+    // redemptions if it later holds the network key (HA admission).
+    reusable_keys: BTreeMap<String, crate::membership::ReusableKey>,
     // Consent: auto-install suggested rules without a manual review queue.
     auto_accept_firewall: bool,
     initial: bool,
@@ -5361,6 +5548,7 @@ async fn join_mesh_shared(
             network_name: Some(network_name.to_string()),
             mode: GroupMode::Restricted,
             suggested_firewall,
+            reusable_keys,
             pending_suggestions: Vec::new(),
             pending: HashMap::new(),
         };

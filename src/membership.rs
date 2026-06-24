@@ -3,7 +3,7 @@
 //! Virtual IPs are deterministically derived from [`EndpointId`] via FNV-1a hashing
 //! into the 100.64.0.0/10 CGNAT range (22-bit host space, ~4M addresses).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -321,9 +321,25 @@ impl IdentityProvider for IrohIdentityProvider {
 // Canonical membership serialization + hashing
 // ---------------------------------------------------------------------------
 
+/// A reusable, expiring join key (Tailscale auth-key analog). Only the
+/// `blake3(secret)` hash is published — the raw secret lives solely in the code
+/// handed to a joiner. Because it rides the signed `GroupBlob`, *any* network-key
+/// holder can verify-and-admit and revocation propagates to every admin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReusableKey {
+    /// Short human id: the first 8 hex chars of the secret hash.
+    pub id: String,
+    /// Unix seconds when minted.
+    pub created: u64,
+    /// Unix seconds after which the key is no longer redeemable.
+    pub expires: u64,
+    /// Set by `ray invite revoke`; a revoked key admits no one.
+    pub revoked: bool,
+}
+
 /// The single authoritative blob for a network, published by the coordinator.
-/// Contains all state a joiner needs: members, the approved list, and the
-/// coordinator-suggested firewall rules.
+/// Contains all state a joiner needs: members, the approved list, the
+/// coordinator-suggested firewall rules, and any reusable join keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupBlob {
     pub members: Vec<Member>,
@@ -336,6 +352,75 @@ pub struct GroupBlob {
     pub suggested_firewall: SuggestedFirewall,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Reusable join keys, keyed by hex `blake3(secret)`. `BTreeMap` keeps the
+    /// encoding canonical; the secret hash commits to the signed hash, so adding
+    /// or revoking a key changes the blob hash and triggers reconvergence.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reusable_keys: BTreeMap<String, ReusableKey>,
+}
+
+impl ReusableKey {
+    /// Build a reusable key from a freshly generated secret. Returns the map key
+    /// (hex `blake3(secret)`) and the entry. `created`/`ttl_secs` are Unix seconds;
+    /// the raw secret is the caller's to encode into the join code and discard.
+    pub fn from_secret(secret: &[u8], created: u64, ttl_secs: u64) -> (String, ReusableKey) {
+        let hash = blake3::hash(secret).to_hex().to_string();
+        let id = hash[..8].to_string();
+        (
+            hash,
+            ReusableKey {
+                id,
+                created,
+                expires: created.saturating_add(ttl_secs),
+                revoked: false,
+            },
+        )
+    }
+}
+
+/// Revoke a reusable key by id (exact match, or unambiguous prefix), setting its
+/// `revoked` flag. A revoked key stays in the blob (so the revocation is part of
+/// the signed content and propagates) but admits no one.
+pub fn revoke_reusable(keys: &mut BTreeMap<String, ReusableKey>, id: &str) -> Result<()> {
+    let matches: Vec<String> = keys
+        .iter()
+        .filter(|(_, k)| k.id == id || k.id.starts_with(id))
+        .map(|(hash, _)| hash.clone())
+        .collect();
+    let hash = match matches.as_slice() {
+        [] => bail!("no reusable key matching '{id}'"),
+        [h] => h.clone(),
+        _ => bail!("ambiguous reusable key id '{id}'"),
+    };
+    keys.get_mut(&hash)
+        .expect("hash came from this map")
+        .revoked = true;
+    Ok(())
+}
+
+/// Verify a presented reusable-key secret against a key set. Returns the key iff
+/// it is present, not revoked, and not expired (`now` is Unix seconds). This is
+/// the (pure) admission decision for a reusable join — usable by any network-key
+/// holder, since the key set comes from the network-key-signed blob.
+pub fn validate_reusable_key<'a>(
+    keys: &'a BTreeMap<String, ReusableKey>,
+    secret: &[u8],
+    now: u64,
+) -> Option<&'a ReusableKey> {
+    let hash = blake3::hash(secret).to_hex().to_string();
+    let key = keys.get(&hash)?;
+    if key.revoked || now >= key.expires {
+        return None;
+    }
+    Some(key)
+}
+
+impl GroupBlob {
+    /// Convenience wrapper over [`validate_reusable_key`] for a decoded blob.
+    #[allow(dead_code)] // used in tests; the daemon calls the free function on NetworkState
+    pub fn validate_reusable(&self, secret: &[u8], now: u64) -> Option<&ReusableKey> {
+        validate_reusable_key(&self.reusable_keys, secret, now)
+    }
 }
 
 /// Produces a deterministic msgpack encoding of a group blob.
@@ -347,6 +432,7 @@ pub fn canonical_group_bytes(
     approved: &ApprovedList,
     suggested_firewall: &SuggestedFirewall,
     name: Option<&str>,
+    reusable_keys: &BTreeMap<String, ReusableKey>,
 ) -> Vec<u8> {
     let mut sorted_members: Vec<Member> = members.all().into_iter().cloned().collect();
     sorted_members.sort_by_key(|m| m.identity.to_string());
@@ -359,6 +445,7 @@ pub fn canonical_group_bytes(
         approved: sorted_approved,
         suggested_firewall: suggested_firewall.clone(),
         name: name.map(|s| s.to_string()),
+        reusable_keys: reusable_keys.clone(),
     };
     rmp_serde::to_vec_named(&data).expect("msgpack serialize")
 }
@@ -368,8 +455,9 @@ pub fn group_blob_hash(
     approved: &ApprovedList,
     suggested_firewall: &SuggestedFirewall,
     name: Option<&str>,
+    reusable_keys: &BTreeMap<String, ReusableKey>,
 ) -> blake3::Hash {
-    let bytes = canonical_group_bytes(members, approved, suggested_firewall, name);
+    let bytes = canonical_group_bytes(members, approved, suggested_firewall, name, reusable_keys);
     blake3::hash(&bytes)
 }
 
@@ -469,6 +557,7 @@ pub fn trusted_reconverge_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn test_id(seed: u8) -> EndpointId {
         let mut key_bytes = [0u8; 32];
@@ -901,8 +990,8 @@ mod tests {
     fn test_canonical_bytes_deterministic() {
         let members = make_member_list(&[1, 2, 3]);
         let approved = ApprovedList::new();
-        let a = canonical_group_bytes(&members, &approved, &ray_proto::SuggestedFirewall::default(), None);
-        let b = canonical_group_bytes(&members, &approved, &ray_proto::SuggestedFirewall::default(), None);
+        let a = canonical_group_bytes(&members, &approved, &ray_proto::SuggestedFirewall::default(), None, &BTreeMap::new());
+        let b = canonical_group_bytes(&members, &approved, &ray_proto::SuggestedFirewall::default(), None, &BTreeMap::new());
         assert_eq!(a, b);
     }
 
@@ -912,8 +1001,8 @@ mod tests {
         let m2 = make_member_list(&[3, 1, 2]);
         let approved = ApprovedList::new();
         assert_eq!(
-            canonical_group_bytes(&m1, &approved, &ray_proto::SuggestedFirewall::default(), None),
-            canonical_group_bytes(&m2, &approved, &ray_proto::SuggestedFirewall::default(), None),
+            canonical_group_bytes(&m1, &approved, &ray_proto::SuggestedFirewall::default(), None, &BTreeMap::new()),
+            canonical_group_bytes(&m2, &approved, &ray_proto::SuggestedFirewall::default(), None, &BTreeMap::new()),
         );
     }
 
@@ -921,9 +1010,9 @@ mod tests {
     fn test_group_blob_hash_changes_on_mutation() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let h1 = group_blob_hash(&members, &approved, &ray_proto::SuggestedFirewall::default(), None);
+        let h1 = group_blob_hash(&members, &approved, &ray_proto::SuggestedFirewall::default(), None, &BTreeMap::new());
         let members2 = make_member_list(&[1, 2, 3]);
-        let h2 = group_blob_hash(&members2, &approved, &ray_proto::SuggestedFirewall::default(), None);
+        let h2 = group_blob_hash(&members2, &approved, &ray_proto::SuggestedFirewall::default(), None, &BTreeMap::new());
         assert_ne!(h1, h2);
     }
 
@@ -945,7 +1034,7 @@ mod tests {
             )
             .unwrap();
 
-        let bytes = canonical_group_bytes(&members, &approved, &ray_proto::SuggestedFirewall::default(), None);
+        let bytes = canonical_group_bytes(&members, &approved, &ray_proto::SuggestedFirewall::default(), None, &BTreeMap::new());
         let data = decode_group_blob(&bytes).unwrap();
         assert_eq!(data.members.len(), 2);
         assert_eq!(data.approved.len(), 1);
@@ -955,8 +1044,8 @@ mod tests {
     fn test_verify_group_blob_ok() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let bytes = canonical_group_bytes(&members, &approved, &ray_proto::SuggestedFirewall::default(), None);
-        let hash = group_blob_hash(&members, &approved, &ray_proto::SuggestedFirewall::default(), None);
+        let bytes = canonical_group_bytes(&members, &approved, &ray_proto::SuggestedFirewall::default(), None, &BTreeMap::new());
+        let hash = group_blob_hash(&members, &approved, &ray_proto::SuggestedFirewall::default(), None, &BTreeMap::new());
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members.len(), 2);
     }
@@ -986,7 +1075,7 @@ mod tests {
     fn test_verify_group_blob_bad_hash() {
         let members = make_member_list(&[1, 2]);
         let approved = ApprovedList::new();
-        let bytes = canonical_group_bytes(&members, &approved, &ray_proto::SuggestedFirewall::default(), None);
+        let bytes = canonical_group_bytes(&members, &approved, &ray_proto::SuggestedFirewall::default(), None, &BTreeMap::new());
         let bad_hash = blake3::hash(b"wrong data");
         let result = verify_group_blob(&bytes, &bad_hash);
         assert!(result.is_err());
@@ -1005,13 +1094,13 @@ mod tests {
         sf.insert("subject".to_string(), hs);
 
         // Deterministic: BTreeMap keys canonicalize regardless of insert order.
-        let a = canonical_group_bytes(&members, &approved, &sf, None);
-        let b = canonical_group_bytes(&members, &approved, &sf, None);
+        let a = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new());
+        let b = canonical_group_bytes(&members, &approved, &sf, None, &BTreeMap::new());
         assert_eq!(a, b);
 
         // Suggestions are part of the signed content, so they change the hash.
-        let h_empty = group_blob_hash(&members, &approved, &SuggestedFirewall::new(), None);
-        let h_sf = group_blob_hash(&members, &approved, &sf, None);
+        let h_empty = group_blob_hash(&members, &approved, &SuggestedFirewall::new(), None, &BTreeMap::new());
+        let h_sf = group_blob_hash(&members, &approved, &sf, None, &BTreeMap::new());
         assert_ne!(h_empty, h_sf);
     }
 
@@ -1035,6 +1124,132 @@ mod tests {
         let blob = decode_group_blob(&bytes).unwrap();
         assert_eq!(blob.members.len(), 2);
         assert!(blob.suggested_firewall.is_empty());
+        // A pre-reusable-keys blob decodes with an empty reusable_keys map.
+        assert!(blob.reusable_keys.is_empty());
+    }
+
+    // -- reusable keys --------------------------------------------------------
+
+    fn reusable_key_for(secret: &[u8], expires: u64, revoked: bool) -> (String, ReusableKey) {
+        let hash = blake3::hash(secret).to_hex().to_string();
+        let id = hash[..8].to_string();
+        (
+            hash,
+            ReusableKey {
+                id,
+                created: 0,
+                expires,
+                revoked,
+            },
+        )
+    }
+
+    #[test]
+    fn reusable_key_blob_roundtrips() {
+        let members = make_member_list(&[1, 2]);
+        let approved = ApprovedList::new();
+        let secret = [7u8; 16];
+        let (hash, key) = reusable_key_for(&secret, 9_999_999_999, false);
+        let mut keys = BTreeMap::new();
+        keys.insert(hash, key);
+
+        let bytes =
+            canonical_group_bytes(&members, &approved, &SuggestedFirewall::default(), None, &keys);
+        let blob = decode_group_blob(&bytes).unwrap();
+        assert_eq!(blob.reusable_keys.len(), 1);
+        // The decoded blob validates the secret it was built with.
+        assert!(blob.validate_reusable(&secret, 1000).is_some());
+    }
+
+    #[test]
+    fn reusable_key_changes_hash_when_added_or_revoked() {
+        let members = make_member_list(&[1]);
+        let approved = ApprovedList::new();
+        let empty = BTreeMap::new();
+        let h0 = group_blob_hash(&members, &approved, &SuggestedFirewall::default(), None, &empty);
+
+        let secret = [3u8; 16];
+        let (hash, key) = reusable_key_for(&secret, 9_999_999_999, false);
+        let mut keys = BTreeMap::new();
+        keys.insert(hash.clone(), key);
+        let h1 = group_blob_hash(&members, &approved, &SuggestedFirewall::default(), None, &keys);
+        assert_ne!(h0, h1, "adding a reusable key must change the signed hash");
+
+        // Revoking is a content change → the hash must change again so peers reconverge.
+        keys.get_mut(&hash).unwrap().revoked = true;
+        let h2 = group_blob_hash(&members, &approved, &SuggestedFirewall::default(), None, &keys);
+        assert_ne!(h1, h2, "revoking a reusable key must change the signed hash");
+    }
+
+    #[test]
+    fn reusable_key_from_secret_sets_id_and_expiry() {
+        let secret = [5u8; 16];
+        let (hash, key) = ReusableKey::from_secret(&secret, 100, 50);
+        assert_eq!(hash, blake3::hash(&secret).to_hex().to_string());
+        assert_eq!(key.id, hash[..8]);
+        assert_eq!(key.created, 100);
+        assert_eq!(key.expires, 150);
+        assert!(!key.revoked);
+    }
+
+    #[test]
+    fn revoke_reusable_by_full_id_and_prefix() {
+        let secret = [6u8; 16];
+        let (hash, key) = ReusableKey::from_secret(&secret, 0, 100);
+        let mut keys = BTreeMap::new();
+        keys.insert(hash.clone(), key.clone());
+        // Full id.
+        revoke_reusable(&mut keys, &key.id).unwrap();
+        assert!(keys[&hash].revoked);
+        // Unambiguous prefix.
+        keys.get_mut(&hash).unwrap().revoked = false;
+        revoke_reusable(&mut keys, &key.id[..4]).unwrap();
+        assert!(keys[&hash].revoked);
+    }
+
+    #[test]
+    fn revoke_reusable_unknown_and_ambiguous_error() {
+        let mut empty: BTreeMap<String, ReusableKey> = BTreeMap::new();
+        assert!(revoke_reusable(&mut empty, "deadbeef").is_err());
+
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            "h1".to_string(),
+            ReusableKey { id: "abcd0000".to_string(), created: 0, expires: 100, revoked: false },
+        );
+        keys.insert(
+            "h2".to_string(),
+            ReusableKey { id: "abcd1111".to_string(), created: 0, expires: 100, revoked: false },
+        );
+        assert!(
+            revoke_reusable(&mut keys, "abcd").is_err(),
+            "prefix matching two ids is ambiguous"
+        );
+    }
+
+    #[test]
+    fn validate_reusable_accepts_live_rejects_expired_revoked_unknown() {
+        let secret = [9u8; 16];
+        let mk = |expires, revoked| {
+            let (hash, key) = reusable_key_for(&secret, expires, revoked);
+            let mut keys = BTreeMap::new();
+            keys.insert(hash, key);
+            GroupBlob {
+                members: vec![],
+                approved: vec![],
+                suggested_firewall: SuggestedFirewall::default(),
+                name: None,
+                reusable_keys: keys,
+            }
+        };
+        // Live key: present, not revoked, now < expires.
+        assert!(mk(100, false).validate_reusable(&secret, 50).is_some());
+        // Expired: now >= expires.
+        assert!(mk(100, false).validate_reusable(&secret, 100).is_none());
+        // Revoked.
+        assert!(mk(100, true).validate_reusable(&secret, 50).is_none());
+        // Unknown secret.
+        assert!(mk(100, false).validate_reusable(&[0u8; 16], 50).is_none());
     }
 
     // -- validate_member / validate_approved ---------------------------------
@@ -1161,6 +1376,7 @@ mod tests {
             approved: vec![],
             suggested_firewall: Default::default(),
             name: None,
+            reusable_keys: BTreeMap::new(),
         };
         let bytes = rmp_serde::to_vec_named(&blob).unwrap();
         let err = decode_group_blob(&bytes).unwrap_err().to_string();
@@ -1183,6 +1399,7 @@ mod tests {
             approved: vec![],
             suggested_firewall: Default::default(),
             name: None,
+            reusable_keys: BTreeMap::new(),
         };
         let bytes = rmp_serde::to_vec_named(&blob).unwrap();
         assert!(decode_group_blob(&bytes).is_err());

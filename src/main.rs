@@ -260,15 +260,23 @@ enum Command {
 
 #[derive(Subcommand)]
 enum InviteAction {
-    /// Mint a new one-time invite code (default action)
+    /// Mint a new invite code (default action). Single-use by default; `--reusable`
+    /// mints a multi-use key for unattended fleets.
     Create {
-        /// How long the invite stays valid, e.g. 24h, 7d, 30m (default 7d)
-        #[arg(long, default_value = "7d")]
-        expires: String,
-        /// Hostname the coordinator assigns on redemption (trusted networks).
-        /// The holder joins with no `--hostname`.
+        /// How long the invite stays valid, e.g. 24h, 7d, 30m (default 7d;
+        /// 30d for `--reusable`).
         #[arg(long)]
+        expires: Option<String>,
+        /// Hostname the coordinator assigns authoritatively on redemption
+        /// (single-use only). The holder joins with no `--hostname`.
+        #[arg(long, conflicts_with = "reusable")]
         hostname: Option<String>,
+        /// Mint a reusable (multi-use, expiring) key that rides the signed blob,
+        /// so any network-key holder can admit. Ideal for `ray join <key>
+        /// --hostname <h> --auto-accept-firewall` in deploy scripts. Revoke with
+        /// `ray invite <net> revoke <id>`.
+        #[arg(long)]
+        reusable: bool,
     },
     /// List issued invites and their status
     List,
@@ -1219,19 +1227,32 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
 
 async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
     let action = action.unwrap_or(InviteAction::Create {
-        expires: "7d".to_string(),
+        expires: None,
         hostname: None,
+        reusable: false,
     });
     let hostname_opt = match &action {
         InviteAction::Create { hostname, .. } => hostname.clone(),
         _ => None,
     };
+    let reusable_requested = matches!(&action, InviteAction::Create { reusable: true, .. });
     let req = match action {
-        InviteAction::Create { expires, hostname } => ipc::IpcMessage::InviteCreate {
-            network: network.to_string(),
-            expires_secs: parse_duration_secs(&expires)?,
+        InviteAction::Create {
+            expires,
             hostname,
-        },
+            reusable,
+        } => {
+            // Reusable keys default to a longer 30d TTL; single-use to 7d.
+            let ttl = expires.unwrap_or_else(|| {
+                if reusable { "30d".to_string() } else { "7d".to_string() }
+            });
+            ipc::IpcMessage::InviteCreate {
+                network: network.to_string(),
+                expires_secs: parse_duration_secs(&ttl)?,
+                hostname,
+                reusable,
+            }
+        }
         InviteAction::List => ipc::IpcMessage::InviteList {
             network: network.to_string(),
         },
@@ -1267,7 +1288,15 @@ async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
             } else {
                 format!("{}m", expires_secs / 60)
             };
-            println!("  single-use, expires in {ttl}");
+            if reusable_requested {
+                println!("  reusable (multi-use), expires in {ttl}");
+                println!(
+                    "  servers join unattended with: {}",
+                    style::faint(&format!("ray join {code} --hostname <h> --auto-accept-firewall"))
+                );
+            } else {
+                println!("  single-use, expires in {ttl}");
+            }
             if let Some(h) = &hostname_opt {
                 println!("  binds hostname: {}", style::bold(h));
             }
@@ -1283,7 +1312,15 @@ async fn ipc_invite(network: &str, action: Option<InviteAction>) -> Result<()> {
                         .as_deref()
                         .map(|h| format!("  host={h}"))
                         .unwrap_or_default();
-                    println!("  {}  {}{}{}", style::rose(&inv.id), inv.status, who, host);
+                    let kind = if inv.reusable { "  (reusable)" } else { "" };
+                    println!(
+                        "  {}  {}{}{}{}",
+                        style::rose(&inv.id),
+                        inv.status,
+                        who,
+                        host,
+                        style::faint(kind)
+                    );
                 }
             }
         }
@@ -1728,6 +1765,7 @@ async fn ipc_invite_mint(network: &str, hostname: Option<String>) -> Result<Stri
             network: network.to_string(),
             expires_secs: 7 * 24 * 3600,
             hostname,
+            reusable: false,
         },
     )
     .await?;
