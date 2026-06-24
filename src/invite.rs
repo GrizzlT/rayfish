@@ -87,7 +87,9 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn hash_secret(secret: &[u8]) -> String {
+/// Hex blake3 of a secret — the canonical `secret_hash` form the ledger stores
+/// and the form gossiped to co-coordinators (as UTF-8 bytes on the wire).
+pub(crate) fn hash_secret(secret: &[u8]) -> String {
     blake3::hash(secret).to_hex().to_string()
 }
 
@@ -284,8 +286,6 @@ impl InviteStore {
     /// The `secret_hash` is the full hex blake3 of the secret (same format as
     /// `mint` stores internally). This lets a co-coordinator redeem an invite it
     /// did not mint, when the originating coordinator shares the hash out-of-band.
-    #[allow(dead_code)]
-    // consumed by the invite-gossip task (InviteShare/InviteUsed wiring); allow until then
     pub fn record_shared(&mut self, id: String, secret_hash: String, expires: u64) -> Result<()> {
         if self.invites.iter().any(|i| i.id == id) {
             return Ok(());
@@ -305,8 +305,6 @@ impl InviteStore {
     /// Returns `true` if state changed (was `Pending`), `false` if already
     /// `Redeemed`/`Revoked` or absent. Used by a co-coordinator that learns the
     /// invite was consumed by another coordinator in the same network.
-    #[allow(dead_code)]
-    // consumed by the invite-gossip task (InviteShare/InviteUsed wiring); allow until then
     pub fn burn_by_hash(&mut self, secret_hash: &str) -> Result<bool> {
         let mut changed = false;
         for inv in self.invites.iter_mut() {

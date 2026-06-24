@@ -134,6 +134,7 @@ impl CoordinatorAcceptState {
             let dht_notify_ctrl = self.dht_notify.clone();
             let token_ctrl = token.clone();
             let network_ctrl = network.clone();
+            let invite_lock_ctrl = self.invite_lock.clone();
             tokio::spawn(async move {
                 send_member_sync(&conn).await;
                 spawn_coordinator_control_reader(
@@ -149,6 +150,7 @@ impl CoordinatorAcceptState {
                     blob_store_ctrl,
                     dht_notify_ctrl,
                     token_ctrl,
+                    invite_lock_ctrl,
                 );
                 forward::spawn_peer_reader(
                     conn,
@@ -252,6 +254,29 @@ impl CoordinatorAcceptState {
                         if let Ok(mut store) = crate::invite::InviteStore::load(&self.network_name) {
                             let _ = store.restore(&secret);
                         }
+                    } else {
+                        // Tell the other coordinators this single-use invite is
+                        // spent so their ledgers burn it too. Hash only, no secret.
+                        let secret_hash = crate::invite::hash_secret(&secret);
+                        let members: Vec<crate::membership::Member> = self
+                            .state
+                            .read()
+                            .unwrap()
+                            .members
+                            .all()
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                        gossip_to_coordinators(
+                            &self.peers,
+                            &self.network_name,
+                            &members,
+                            self.identity.local_identity(),
+                            &ControlMsg::InviteUsed {
+                                secret_hash: secret_hash.into_bytes(),
+                            },
+                        )
+                        .await;
                     }
                 }
                 Err(single_use_err) => {
@@ -488,6 +513,7 @@ impl CoordinatorAcceptState {
             self.blob_store.clone(),
             self.dht_notify.clone(),
             self.token.clone(),
+            self.invite_lock.clone(),
         );
         forward::spawn_peer_reader(
             conn,
@@ -1745,6 +1771,12 @@ impl DaemonState {
         // JoinDenied / unreachable → advance to the next coordinator.
         // For reconnects/restores (initial=false) the coordinator speaks first,
         // so we keep the existing single-coordinator path.
+        // One invite-ledger lock for this network, shared between the join's
+        // control listener (which may handle InviteShare/InviteUsed once this
+        // node is promoted to co-coordinator) and the coordinator handler we may
+        // register below — so all ledger access stays serialized.
+        let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
+
         let (state, cancel, disconnect_tx, tasks) = if initial {
             let my_id = self.identity.local_identity();
             // When there is no invite, use my own id as the nominal minter;
@@ -1824,6 +1856,7 @@ impl DaemonState {
                     auto_accept_firewall,
                     true,
                     self.promote_tx.clone(),
+                    invite_lock.clone(),
                 )
                 .await
                 {
@@ -1918,6 +1951,7 @@ impl DaemonState {
                 auto_accept_firewall,
                 false,
                 self.promote_tx.clone(),
+                invite_lock.clone(),
             )
             .await?
             {
@@ -1943,11 +1977,10 @@ impl DaemonState {
         match role {
             NetworkRole::Coordinator => {
                 let net_public_key = state.read().unwrap().network_public_key;
-                let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
                 self.register_coordinator_handler(
                     display_name,
                     state.clone(),
-                    invite_lock,
+                    invite_lock.clone(),
                     None,
                     net_public_key,
                     disconnect_tx.clone(),
@@ -2028,7 +2061,7 @@ impl DaemonState {
             dht_notify: None,
             cancel,
             tasks,
-            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+            invite_lock,
             disconnect_tx,
         };
         self.networks.insert(display_name.to_string(), handle);
@@ -3393,6 +3426,37 @@ impl DaemonState {
             Ok((secret, id)) => {
                 let code =
                     crate::invite::encode_invite_code(&net_pubkey, &self.endpoint.id(), &secret);
+                // Gossip the new invite (hash only, never the secret) to other
+                // coordinators so any of them can later redeem it. The wire field
+                // carries the hex hash's UTF-8 bytes; receivers decode back to the
+                // ledger's hex `String`.
+                let secret_hash = crate::invite::hash_secret(&secret);
+                let expires = now_secs().saturating_add(expires_secs);
+                if let Some(handle) = self.networks.get(network) {
+                    let members: Vec<crate::membership::Member> = handle
+                        .state
+                        .read()
+                        .unwrap()
+                        .members
+                        .all()
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                    let me = self.endpoint.id();
+                    drop(handle);
+                    gossip_to_coordinators(
+                        &self.peers,
+                        network,
+                        &members,
+                        me,
+                        &ControlMsg::InviteShare {
+                            id: id.clone(),
+                            secret_hash: secret_hash.into_bytes(),
+                            expires,
+                        },
+                    )
+                    .await;
+                }
                 IpcMessage::InviteCreated {
                     code,
                     id,
@@ -5251,6 +5315,59 @@ fn coordinator_dial_order(
     order
 }
 
+/// Pick the peers to gossip single-use invite state to: every other
+/// `is_coordinator` member, excluding ourselves. Only coordinators (network-key
+/// holders) can admit, so only they need the shared invite ledger; a
+/// non-coordinator is never a target.
+fn gossip_targets(members: &[Member], me: EndpointId) -> Vec<EndpointId> {
+    members
+        .iter()
+        .filter(|m| m.is_coordinator && m.identity != me)
+        .map(|m| m.identity)
+        .collect()
+}
+
+/// Whether `peer` is a coordinator in our verified roster. Invite-gossip arms
+/// (`InviteShare`/`InviteUsed`) act only on messages from a coordinator peer, so
+/// a non-coordinator member can't inject or burn invite state.
+fn sender_is_coordinator(
+    state: &Arc<std::sync::RwLock<NetworkState>>,
+    peer: EndpointId,
+) -> bool {
+    state
+        .read()
+        .unwrap()
+        .members
+        .all()
+        .iter()
+        .any(|m| m.identity == peer && m.is_coordinator)
+}
+
+/// Send `msg` to each coordinator peer (per [`gossip_targets`]) that has a live
+/// connection on `network`. Best-effort: a target without a live connection is
+/// skipped (it will reconverge invite state from a future share/redeem or, for
+/// reusable keys, the signed blob). Never carries the raw secret — only its hash.
+async fn gossip_to_coordinators(
+    peers: &PeerTable,
+    network: &str,
+    members: &[Member],
+    me: EndpointId,
+    msg: &ControlMsg,
+) {
+    let targets = gossip_targets(members, me);
+    if targets.is_empty() {
+        return;
+    }
+    for (eid, _ip, conn) in peers.peers_for_network_with_conn(network) {
+        if !targets.contains(&eid) {
+            continue;
+        }
+        if let Ok((mut send, _)) = conn.open_bi().await {
+            let _ = control::send_msg(&mut send, msg).await;
+        }
+    }
+}
+
 /// Outcome of a single coordinator dial attempt during the join fallback loop.
 /// Used as a unit-testable specification of the loop termination policy.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -5502,6 +5619,8 @@ fn spawn_coordinator_control_reader(
     blob_store: FsStore,
     dht_notify: Option<Arc<tokio::sync::Notify>>,
     token: CancellationToken,
+    // Serializes single-use invite ledger access for the invite-gossip arms.
+    invite_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -5517,6 +5636,42 @@ fn spawn_coordinator_control_reader(
                 Ok(m) => m,
                 Err(_) => continue,
             };
+            // Invite gossip from another coordinator: a co-coordinator that minted
+            // or redeemed an invite tells us so our ledger stays in sync. Honor it
+            // only from a coordinator peer in our verified roster.
+            match msg {
+                ControlMsg::InviteShare { id, secret_hash, expires } => {
+                    if !sender_is_coordinator(&state, remote_id) {
+                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare from non-coordinator");
+                        continue;
+                    }
+                    let Ok(hash) = String::from_utf8(secret_hash) else {
+                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare with non-utf8 hash");
+                        continue;
+                    };
+                    let _guard = invite_lock.lock().await;
+                    if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
+                        let _ = store.record_shared(id, hash, expires);
+                    }
+                    continue;
+                }
+                ControlMsg::InviteUsed { secret_hash } => {
+                    if !sender_is_coordinator(&state, remote_id) {
+                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed from non-coordinator");
+                        continue;
+                    }
+                    let Ok(hash) = String::from_utf8(secret_hash) else {
+                        tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed with non-utf8 hash");
+                        continue;
+                    };
+                    let _guard = invite_lock.lock().await;
+                    if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
+                        let _ = store.burn_by_hash(&hash);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             let ControlMsg::MeshHello {
                 hostname,
                 device_cert,
@@ -5708,6 +5863,10 @@ async fn join_mesh_shared(
     // here after persisting an `AdminGrant` key, so the daemon loop can swap in
     // the coordinator accept handler (see `DaemonState::promote_to_coordinator`).
     promote_tx: mpsc::Sender<String>,
+    // Guards the single-use invite ledger. Shared with the NetworkHandle so the
+    // control listener's `InviteShare`/`InviteUsed` handling (a co-coordinator
+    // learning of invites it didn't mint) is serialized with mint/redeem.
+    invite_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<JoinResult> {
     let my_identity = identity.local_identity();
     let my_ip = identity.local_ip();
@@ -5971,6 +6130,7 @@ async fn join_mesh_shared(
         let my_identity_c = my_identity;
         let net_pubkey_c = net_pubkey;
         let promote_tx = promote_tx.clone();
+        let invite_lock = invite_lock.clone();
         async move {
             loop {
                 tokio::select! {
@@ -6058,6 +6218,41 @@ async fn join_mesh_shared(
                                         // does not. Best-effort: a closed channel
                                         // only means the daemon is shutting down.
                                         let _ = promote_tx.send(network_name.clone()).await;
+                                    }
+                                    Ok(ControlMsg::InviteShare { id, secret_hash, expires }) => {
+                                        // Another coordinator minted a single-use
+                                        // invite; record its hash so we can redeem
+                                        // it too. Only honor it from a peer that is
+                                        // a coordinator in our verified roster.
+                                        if !sender_is_coordinator(&live_state, remote_id) {
+                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare from non-coordinator");
+                                            continue;
+                                        }
+                                        let Ok(hash) = String::from_utf8(secret_hash) else {
+                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteShare with non-utf8 hash");
+                                            continue;
+                                        };
+                                        let _guard = invite_lock.lock().await;
+                                        if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
+                                            let _ = store.record_shared(id, hash, expires);
+                                        }
+                                    }
+                                    Ok(ControlMsg::InviteUsed { secret_hash }) => {
+                                        // Another coordinator redeemed a single-use
+                                        // invite; burn it locally so it can't be
+                                        // reused here. Coordinator-only.
+                                        if !sender_is_coordinator(&live_state, remote_id) {
+                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed from non-coordinator");
+                                            continue;
+                                        }
+                                        let Ok(hash) = String::from_utf8(secret_hash) else {
+                                            tracing::warn!(peer = %remote_id.fmt_short(), "ignoring InviteUsed with non-utf8 hash");
+                                            continue;
+                                        };
+                                        let _guard = invite_lock.lock().await;
+                                        if let Ok(mut store) = crate::invite::InviteStore::load(&network_name) {
+                                            let _ = store.burn_by_hash(&hash);
+                                        }
                                     }
                                     Ok(_) => {}
                                     Err(_) => {}
@@ -6387,6 +6582,23 @@ mod coordinator_dial_order_tests {
         let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
         // minter = b: b first, then the other coordinator a, never c (not coord), never me.
         assert_eq!(super::coordinator_dial_order(b, &members, me), vec![b, a]);
+    }
+
+    #[test]
+    fn gossip_targets_are_coordinator_peers_only() {
+        let (a, b, c) = (test_id(1), test_id(2), test_id(3));
+        let mk = |id, coord| Member {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: coord,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        };
+        let members = vec![mk(a, true), mk(b, false), mk(c, true)];
+        let me = a;
+        // gossip to other coordinators only: c (not b, not me).
+        assert_eq!(super::gossip_targets(&members, me), vec![c]);
     }
 }
 
