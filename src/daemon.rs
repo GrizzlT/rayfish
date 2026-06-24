@@ -109,15 +109,6 @@ impl CoordinatorAcceptState {
         let is_member = self.state.read().unwrap().members.is_member(&remote_id);
         if is_member {
             tracing::info!(ip = %peer_ip, "known member reconnecting");
-            let members: Vec<Member> = self
-                .state
-                .read()
-                .unwrap()
-                .members
-                .all()
-                .into_iter()
-                .cloned()
-                .collect();
             crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
             let peer_ipv6 = derive_ipv6(&remote_id);
             self.peers.add(
@@ -143,7 +134,7 @@ impl CoordinatorAcceptState {
             let token_ctrl = token.clone();
             let network_ctrl = network.clone();
             tokio::spawn(async move {
-                send_member_sync(&conn, &members).await;
+                send_member_sync(&conn).await;
                 spawn_coordinator_control_reader(
                     conn.clone(),
                     remote_id,
@@ -423,7 +414,7 @@ impl CoordinatorAcceptState {
         if let Some(notify) = &self.dht_notify {
             notify.notify_one();
         }
-        broadcast_member_sync(&self.peers, &members, Some(peer_ip)).await;
+        broadcast_member_sync(&self.peers, Some(peer_ip)).await;
 
         let peer_ipv6 = derive_ipv6(&remote_id);
         crate::spawn_path_logger(conn.clone(), remote_id.fmt_short().to_string());
@@ -611,7 +602,7 @@ impl MemberAcceptState {
                 self.stats.clone(),
                 self.device_user_map.clone(),
             );
-            broadcast_member_sync(&self.peers, &members, Some(ip)).await;
+            broadcast_member_sync(&self.peers, Some(ip)).await;
         } else if is_member {
             if final_hostname.is_some() {
                 let mut s = self.state.write().unwrap();
@@ -3000,15 +2991,7 @@ impl DaemonState {
             // Authoritative: republish the group blob and push the new roster to
             // every peer immediately.
             update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
-            let members: Vec<Member> = state
-                .read()
-                .unwrap()
-                .members
-                .all()
-                .into_iter()
-                .cloned()
-                .collect();
-            broadcast_member_sync(&self.peers, &members, None).await;
+            broadcast_member_sync(&self.peers, None).await;
         } else {
             // Notify the coordinator via MeshHello (sent to all connected peers;
             // only the coordinator's continuous control reader acts on it). It
@@ -4148,6 +4131,14 @@ async fn build_daemon(
         .filter_map(|net| net.network_public_key.as_ref().map(transport::network_alpn))
         .collect();
     alpns.push(iroh_blobs::protocol::ALPN.to_vec());
+    // Always advertise the file-transfer and pairing ALPNs from boot. They are
+    // network-independent, so a freshly-started daemon with no active network
+    // must still accept `ray pair` / `ray send` connections — otherwise the
+    // initial handshake fails with "peer doesn't support any known protocol"
+    // until the first create/join triggers `refresh_alpns()`. Mirrors
+    // `ProtocolRouter::alpns()`.
+    alpns.push(transport::FILES_ALPN.to_vec());
+    alpns.push(PAIR_ALPN.to_vec());
     let use_tor = app_config
         .networks
         .iter()
@@ -4573,6 +4564,122 @@ fn apply_suggested_firewall(
     }
 }
 
+/// Resolve the network's *signed* group-blob hash (and seed peers) from the
+/// pkarr record. This is the sole authority for the roster/firewall.
+async fn resolve_signed(
+    endpoint: &Endpoint,
+    net_pubkey: EndpointId,
+) -> Option<(blake3::Hash, Vec<EndpointId>)> {
+    let client = dht::create_pkarr_client(endpoint).ok()?;
+    dht::resolve_network(&client, net_pubkey).await.ok()
+}
+
+/// Fetch the group blob for `signed` from any connected peer or seed, and verify
+/// its bytes against `signed`. Returns the verified blob, or `None` if no source
+/// could serve a blob matching the signed hash. The blob is content-addressed by
+/// `signed`, so a peer can only ever serve the authentic blob — never a forgery.
+async fn fetch_verified_blob(
+    endpoint: &Endpoint,
+    blob_store: &FsStore,
+    peers: &PeerTable,
+    signed: blake3::Hash,
+    network_name: &str,
+    seeds: &[EndpointId],
+) -> Option<crate::membership::GroupBlob> {
+    let blob_hash = iroh_blobs::Hash::from_bytes(*signed.as_bytes());
+    let mut peer_ids: Vec<EndpointId> = peers
+        .peers_for_network(network_name)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    peer_ids.extend_from_slice(seeds);
+    peer_ids.sort_by_key(|id| id.to_string());
+    peer_ids.dedup();
+    for pid in &peer_ids {
+        if let Ok(conn) =
+            transport::connect_to_peer_with_alpn(endpoint, *pid, iroh_blobs::protocol::ALPN).await
+            && blob_store
+                .remote()
+                .fetch(conn, HashAndFormat::raw(blob_hash))
+                .await
+                .is_ok()
+            && let Ok(bytes) = blob_store.blobs().get_bytes(blob_hash).await
+            && let Ok(data) = crate::membership::verify_group_blob(&bytes, &signed)
+        {
+            return Some(data);
+        }
+    }
+    None
+}
+
+/// Reconverge the live network state from the signed pkarr record and apply it
+/// (roster + DNS + suggested firewall). Invoked when a peer sends a `MemberSync`
+/// or `BlobUpdated` *hint* — the hint is only a trigger; the roster/firewall come
+/// exclusively from the network-key-signed record, never from the peer message.
+#[allow(clippy::too_many_arguments)]
+async fn reconverge_and_apply(
+    endpoint: &Endpoint,
+    blob_store: &FsStore,
+    peers: &PeerTable,
+    net_pubkey: EndpointId,
+    network_name: &str,
+    state: &Arc<std::sync::RwLock<NetworkState>>,
+    my_identity: EndpointId,
+    hostname_table: &dns::HostnameTable,
+    reverse_table: &dns::ReverseLookupTable,
+    firewall: &SharedFirewall,
+) {
+    let current = state.read().unwrap().snapshot.as_ref().map(|s| s.hash);
+    let Some((signed, seeds)) = resolve_signed(endpoint, net_pubkey).await else {
+        tracing::debug!(network = %network_name, "reconverge: signed record unavailable");
+        return;
+    };
+    if crate::membership::trusted_reconverge_hash(current, signed).is_none() {
+        return; // already converged on the signed hash
+    }
+    let Some(data) =
+        fetch_verified_blob(endpoint, blob_store, peers, signed, network_name, &seeds).await
+    else {
+        tracing::warn!(network = %network_name, "reconverge: could not fetch verified blob");
+        return;
+    };
+    let roster = {
+        let mut s = state.write().unwrap();
+        s.members = MemberList::from_members(data.members.clone());
+        s.approved = ApprovedList::from_entries(data.approved.clone());
+        s.trusted = data.trusted;
+        s.suggested_firewall = data.suggested_firewall.clone();
+        s.refresh_snapshot();
+        s.members.all().into_iter().cloned().collect::<Vec<Member>>()
+    };
+    apply_roster_to_dns(&roster, network_name, my_identity, hostname_table, reverse_table).await;
+    apply_suggested_firewall(firewall, my_identity, network_name, state);
+    tracing::info!(network = %network_name, "reconverged from signed record");
+}
+
+/// Last-known roster from persisted config. Used only as a fallback when the
+/// signed pkarr record is briefly unreachable during a reconnect — never trusts
+/// peer-supplied membership.
+fn persisted_roster(network_name: &str) -> Vec<Member> {
+    config::load()
+        .ok()
+        .and_then(|c| c.networks.into_iter().find(|n| n.name == network_name))
+        .map(|n| {
+            n.members
+                .into_iter()
+                .map(|m| Member {
+                    identity: m.identity,
+                    ip: m.ip,
+                    is_coordinator: m.is_coordinator,
+                    hostname: m.hostname,
+                    user_identity: None,
+                    device_cert: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_group_poller(
     client: PkarrRelayClient,
@@ -4736,11 +4843,7 @@ fn spawn_peer_cleanup(
                             // authoritative, so members pass `coordinator = None`.
                             if ev.intentional && let Some(c) = &coordinator {
                                 let member_id = c.device_user_map.resolve(&ev.endpoint_id);
-                                let new_members: Vec<Member> = {
-                                    let mut s = c.state.write().unwrap();
-                                    s.members.remove(&member_id);
-                                    s.members.all().into_iter().cloned().collect()
-                                };
+                                c.state.write().unwrap().members.remove(&member_id);
                                 dns::remove_hostname_by_ip(
                                     &c.hostname_table,
                                     &c.reverse_table,
@@ -4749,7 +4852,7 @@ fn spawn_peer_cleanup(
                                 )
                                 .await;
                                 update_snapshot_and_publish(&c.state, &c.blob_store, &c.dht_notify).await;
-                                broadcast_member_sync(&peers, &new_members, None).await;
+                                broadcast_member_sync(&peers, None).await;
                                 tracing::info!(peer = %member_id.fmt_short(), "pruned member after leave");
                             }
                         }
@@ -4872,15 +4975,7 @@ fn spawn_coordinator_control_reader(
             if changed {
                 tracing::info!(peer = %remote_id.fmt_short(), hostname = %final_hostname, "peer hostname changed; propagating");
                 update_snapshot_and_publish(&state, &blob_store, &dht_notify).await;
-                let members: Vec<Member> = state
-                    .read()
-                    .unwrap()
-                    .members
-                    .all()
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                broadcast_member_sync(&peers, &members, None).await;
+                broadcast_member_sync(&peers, None).await;
             }
         }
     });
@@ -5049,9 +5144,21 @@ async fn join_mesh_shared(
                 tracing::info!(ip = %your_ip, network = %network_name, "joined network (legacy)");
                 (members, vec![])
             }
-            ControlMsg::MemberSync { members } => {
-                tracing::info!(network = %network_name, "reconnected via peer");
-                (members, vec![])
+            ControlMsg::MemberSync => {
+                // Reconnected via a peer. The message is only a trigger — fetch
+                // the authoritative roster from the network-key-signed pkarr
+                // record. If it's briefly unreachable, fall back to our last
+                // persisted roster rather than trusting peer-supplied membership.
+                tracing::info!(network = %network_name, "reconnected via peer; reconverging from signed record");
+                match resolve_signed(ep, net_pubkey).await {
+                    Some((signed, seeds)) => {
+                        match fetch_verified_blob(ep, &blob_store, &peers, signed, network_name, &seeds).await {
+                            Some(data) => (data.members, data.approved),
+                            None => (persisted_roster(network_name), vec![]),
+                        }
+                    }
+                    None => (persisted_roster(network_name), vec![]),
+                }
             }
             ControlMsg::JoinDenied { reason } => {
                 anyhow::bail!("join denied: {reason}");
@@ -5247,62 +5354,25 @@ async fn join_mesh_shared(
                                         let members = s.members.clone();
                                         let _ = s.approved.approve(entry, &members);
                                     }
-                                    Ok(ControlMsg::MemberSync { members }) => {
-                                        tracing::info!(count = members.len(), "member list updated");
-                                        let (snap_bytes, roster) = {
-                                            let mut s = live_state.write().unwrap();
-                                            s.members = MemberList::from_members(members);
-                                            s.refresh_snapshot();
-                                            let roster: Vec<Member> = s.members.all().into_iter().cloned().collect();
-                                            (s.snapshot.as_ref().map(|snap| snap.msgpack_bytes.clone()), roster)
-                                        };
-                                        if let Some(bytes) = snap_bytes {
-                                            let _ = blob_store.blobs().add_slice(&bytes).await;
-                                        }
-                                        apply_roster_to_dns(&roster, &network_name, my_identity_c, &hostname_table_c, &reverse_table_c).await;
-                                        // Roster change ⇒ peer-hostname→identity bindings may
-                                        // have shifted, so re-materialize suggested rules.
-                                        apply_suggested_firewall(&firewall_c, my_identity_c, &network_name, &live_state);
+                                    Ok(ControlMsg::MemberSync) => {
+                                        // Trigger only. The roster/firewall come exclusively
+                                        // from the network-key-signed pkarr record, never from
+                                        // peer-supplied membership.
+                                        reconverge_and_apply(
+                                            &endpoint_c, &blob_store, &peers_c, net_pubkey_c,
+                                            &network_name, &live_state, my_identity_c,
+                                            &hostname_table_c, &reverse_table_c, &firewall_c,
+                                        ).await;
                                     }
-                                    Ok(ControlMsg::BlobUpdated { hash }) => {
-                                        tracing::info!(hash = %hash, "received blob update");
-                                        let blob_hash = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
-                                        let peer_ids: Vec<EndpointId> = peers_c.peers_for_network(&network_name)
-                                            .into_iter().map(|(id, _)| id).collect();
-                                        let mut fetched = false;
-                                        for pid in &peer_ids {
-                                            if let Ok(conn) = transport::connect_to_peer_with_alpn(
-                                                &endpoint_c, *pid, iroh_blobs::protocol::ALPN,
-                                            ).await
-                                                && blob_store.remote().fetch(
-                                                    conn, HashAndFormat::raw(blob_hash),
-                                                ).await.is_ok()
-                                            {
-                                                fetched = true;
-                                                break;
-                                            }
-                                        }
-                                        if fetched
-                                            && let Ok(bytes) = blob_store.blobs().get_bytes(blob_hash).await
-                                        {
-                                            match crate::membership::verify_group_blob(&bytes, &hash) {
-                                                Ok(data) => {
-                                                    let roster = {
-                                                        let mut s = live_state.write().unwrap();
-                                                        s.members = MemberList::from_members(data.members.clone());
-                                                        s.approved = ApprovedList::from_entries(data.approved.clone());
-                                                        s.trusted = data.trusted;
-                                                        s.suggested_firewall = data.suggested_firewall.clone();
-                                                        s.refresh_snapshot();
-                                                        s.members.all().into_iter().cloned().collect::<Vec<Member>>()
-                                                    };
-                                                    apply_roster_to_dns(&roster, &network_name, my_identity_c, &hostname_table_c, &reverse_table_c).await;
-                                                    apply_suggested_firewall(&firewall_c, my_identity_c, &network_name, &live_state);
-                                                    tracing::info!("group blob updated");
-                                                }
-                                                Err(e) => tracing::warn!(error = %e, "group blob verification failed"),
-                                            }
-                                        }
+                                    Ok(ControlMsg::BlobUpdated) => {
+                                        // Trigger only. Reconverge from the network-key-signed
+                                        // pkarr record — a malicious member can't inject a
+                                        // forged roster/firewall blob via this message.
+                                        reconverge_and_apply(
+                                            &endpoint_c, &blob_store, &peers_c, net_pubkey_c,
+                                            &network_name, &live_state, my_identity_c,
+                                            &hostname_table_c, &reverse_table_c, &firewall_c,
+                                        ).await;
                                     }
                                     Ok(ControlMsg::AdminGrant { network_pubkey, secret_key }) => {
                                         // Coordinator granted us the per-network key.
@@ -5492,26 +5562,14 @@ fn spawn_reconnect_loop(
 // Broadcast helpers (same as main.rs but local to daemon)
 // ---------------------------------------------------------------------------
 
-async fn send_member_sync(conn: &Connection, members: &[Member]) {
+async fn send_member_sync(conn: &Connection) {
     if let Ok((mut send, _)) = conn.open_bi().await {
-        let _ = control::send_msg(
-            &mut send,
-            &ControlMsg::MemberSync {
-                members: members.to_vec(),
-            },
-        )
-        .await;
+        let _ = control::send_msg(&mut send, &ControlMsg::MemberSync).await;
     }
 }
 
-async fn broadcast_member_sync(
-    peers: &PeerTable,
-    members: &[Member],
-    exclude_ip: Option<Ipv4Addr>,
-) {
-    let msg = ControlMsg::MemberSync {
-        members: members.to_vec(),
-    };
+async fn broadcast_member_sync(peers: &PeerTable, exclude_ip: Option<Ipv4Addr>) {
+    let msg = ControlMsg::MemberSync;
     for (ip, conn) in peers.all_connections() {
         if Some(ip) == exclude_ip {
             continue;

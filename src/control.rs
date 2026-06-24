@@ -77,9 +77,10 @@ pub enum ControlMsg {
     JoinDenied {
         reason: String,
     },
-    MemberSync {
-        members: Vec<Member>,
-    },
+    /// Notify connected members that the roster/blob changed. Payload-free: it
+    /// is a *trigger only*. Receivers reconverge from the network-key-signed
+    /// pkarr record, never from any peer-supplied membership data.
+    MemberSync,
     MeshHello {
         identity: EndpointId,
         ip: Ipv4Addr,
@@ -100,9 +101,10 @@ pub enum ControlMsg {
         members: Vec<Member>,
         approved: Vec<ApprovedEntry>,
     },
-    BlobUpdated {
-        hash: blake3::Hash,
-    },
+    /// Notify connected members that the signed group blob changed. Payload-free:
+    /// a *trigger only*. Receivers reconverge from the network-key-signed pkarr
+    /// record, never from any peer-supplied hash.
+    BlobUpdated,
     /// Coordinator grants the per-network secret key to another member, making it
     /// a co-coordinator (can publish the signed blob / suggest firewall rules).
     /// Sent over the network's authenticated mesh ALPN, so only the targeted peer
@@ -245,26 +247,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_member_sync() {
-        let msg = ControlMsg::MemberSync {
-            members: vec![
-                Member {
-                    identity: test_id(1),
-                    ip: Ipv4Addr::new(100, 64, 0, 2),
-                    is_coordinator: true,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                },
-                Member {
-                    identity: test_id(2),
-                    ip: Ipv4Addr::new(100, 64, 0, 3),
-                    is_coordinator: false,
-                    hostname: None,
-                    user_identity: None,
-                    device_cert: None,
-                },
-            ],
-        };
+        let msg = ControlMsg::MemberSync;
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
         assert_eq!(msg, decoded);
@@ -324,9 +307,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_blob_updated() {
-        let msg = ControlMsg::BlobUpdated {
-            hash: blake3::hash(b"test blob"),
-        };
+        let msg = ControlMsg::BlobUpdated;
         let bytes = encode_msg(&msg);
         let decoded = decode_msg(&bytes).unwrap();
         assert_eq!(msg, decoded);

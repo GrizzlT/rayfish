@@ -452,6 +452,24 @@ pub fn verify_group_blob(bytes: &[u8], expected_hash: &blake3::Hash) -> Result<G
     decode_group_blob(bytes)
 }
 
+/// Decides whether to reconverge the local group state, and to which hash.
+///
+/// The network-key-signed pkarr record is the *sole* authority: `signed` is the
+/// hash it commits to. Peer control messages (`MemberSync`, `BlobUpdated`) are
+/// payload-free triggers — they carry no hash — so there is never any
+/// peer-supplied value that could be fetched or applied. Returns `Some(signed)`
+/// when it differs from what we already hold (`current`), else `None`.
+pub fn trusted_reconverge_hash(
+    current: Option<blake3::Hash>,
+    signed: blake3::Hash,
+) -> Option<blake3::Hash> {
+    if current == Some(signed) {
+        None
+    } else {
+        Some(signed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -945,6 +963,27 @@ mod tests {
         let hash = group_blob_hash(&members, &approved, false, &ray_proto::SuggestedFirewall::default(), None);
         let data = verify_group_blob(&bytes, &hash).unwrap();
         assert_eq!(data.members.len(), 2);
+    }
+
+    #[test]
+    fn no_reconverge_when_already_on_signed_hash() {
+        // We already hold the authoritative (signed) blob — no work to do.
+        let signed = blake3::hash(b"authoritative blob");
+        assert_eq!(trusted_reconverge_hash(Some(signed), signed), None);
+    }
+
+    #[test]
+    fn reconverge_targets_signed_hash_on_change() {
+        // The signed record changed. We reconverge to the SIGNED hash.
+        let current = blake3::hash(b"old blob");
+        let signed = blake3::hash(b"new authoritative blob");
+        assert_eq!(trusted_reconverge_hash(Some(current), signed), Some(signed));
+    }
+
+    #[test]
+    fn reconverge_applies_signed_hash_when_no_current() {
+        let signed = blake3::hash(b"authoritative blob");
+        assert_eq!(trusted_reconverge_hash(None, signed), Some(signed));
     }
 
     #[test]
