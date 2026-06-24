@@ -11,8 +11,9 @@ so no invite handshake is needed.
 
 ## Prerequisites
 
-Same as `tests/e2e`: an authenticated `scw` CLI, your SSH key registered in the
-Scaleway account, Docker running (for `cross`), plus `jq` and `just`.
+Same as `tests/e2e/device-cert`: an authenticated `scw` CLI, your SSH key
+registered in the Scaleway account, Docker running (for `cross`), plus `jq` and
+`just`. Shared SSH/deploy plumbing lives in `tests/lib/`.
 
 ## Usage
 

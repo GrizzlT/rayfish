@@ -19,62 +19,29 @@ set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/../.." && pwd)"
 SERVERS="$DIR/.servers"
-KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 DURATION="${DURATION:-10}"      # iperf3 seconds per run
 ITERATIONS="${ITERATIONS:-3}"   # repeats per measurement; reported value is the mean
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
-          -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes)
+# shellcheck source=../lib/common.sh
+source "$ROOT/tests/lib/common.sh"
 
-[[ -f "$SERVERS" ]] || { echo "No $SERVERS — run tests/bench/provision.sh first"; exit 1; }
+[[ -f "$SERVERS" ]] || { echo "No $SERVERS — run $DIR/provision.sh first"; exit 1; }
 
-A=""; B=""; A_PUB=""; B_PUB=""
-while read -r id ip label zone; do
-  case "${label:-}" in
-    srv-a) A="$ip"; A_PUB="$ip" ;;
-    srv-b) B="$ip"; B_PUB="$ip" ;;
-  esac
-done < "$SERVERS"
+A="$(server_ip "$SERVERS" srv-a || true)"; A_PUB="$A"
+B="$(server_ip "$SERVERS" srv-b || true)"; B_PUB="$B"
 [[ -n "$A" && -n "$B" ]] || { echo "missing srv-a/srv-b in $SERVERS"; exit 1; }
-
-pass(){ printf '  \033[32mPASS\033[0m %s\n' "$*"; }
-fail(){ printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
-step(){ printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
-on(){ local ip="$1"; shift; ssh -n "${SSH_OPTS[@]}" -i "$KEY" "root@$ip" "$*"; }
-strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
 
 # ---------------------------------------------------------------------------
 step "0. wait for SSH on both hosts"
-wait_ssh(){ local ip="$1"; for _ in $(seq 1 60); do on "$ip" true 2>/dev/null && return 0; sleep 5; done; return 1; }
-for pair in "srv-a $A" "srv-b $B"; do
-  set -- $pair
-  if wait_ssh "$2"; then pass "ssh $1 ($2)"; else fail "ssh $1 ($2) unreachable"; exit 1; fi
-done
-for h in "$A" "$B"; do ssh-keyscan -T 10 "$h" >> ~/.ssh/known_hosts 2>/dev/null || true; done
-
-# ---------------------------------------------------------------------------
-if [[ "${KEEP_STATE:-0}" != "1" ]]; then
-  step "0b. reset rayfish state on both hosts (KEEP_STATE=1 to skip)"
-  for h in "$A" "$B"; do
-    on "$h" 'systemctl stop rayfish 2>/dev/null; rm -rf /root/.config/rayfish' && echo "   reset $h"
-  done
-fi
-
-# ---------------------------------------------------------------------------
-step "1. deploy ray + install iperf3 on both hosts"
-for pair in "srv-a $A" "srv-b $B"; do
-  set -- $pair
-  echo ">> just deploy $2 ($1)"
-  if ( cd "$ROOT" && just deploy "$2" ); then pass "deploy $1"; else fail "deploy $1"; exit 1; fi
-done
+wait_all_ssh "$A" "$B"
+seed_known_hosts "$A" "$B"
+reset_state "$A" "$B"
+deploy_all "$ROOT" "$A" "$B"
+step "1b. install iperf3 on both hosts"
 for h in "$A" "$B"; do
   on "$h" 'command -v iperf3 >/dev/null || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 >/dev/null)' \
     && echo "   iperf3 ready on $h"
 done
-sleep 5
-for pair in "srv-a $A" "srv-b $B"; do
-  set -- $pair
-  if on "$2" 'ray status' >/dev/null 2>&1; then pass "daemon up on $1"; else fail "daemon not responding on $1"; fi
-done
+wait_daemons "$A" "$B"
 
 # ---------------------------------------------------------------------------
 step "2. create OPEN network on srv-a, srv-b joins"
@@ -103,7 +70,7 @@ echo "---- srv-a status ----"; echo "$SA" | sed 's/^/   a| /'
 echo "---- srv-b status ----"; echo "$SB" | sed 's/^/   b| /'
 [[ "$converged" == 1 ]] && pass "roster converged (srv-a sees srv-b)" || fail "roster did not converge"
 
-own_ip(){ echo "$1" | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+# own_ip comes from common.sh.
 A_VPN="$(own_ip "$SA")"; B_VPN="$(own_ip "$SB")"
 echo "   A_VPN=$A_VPN  B_VPN=$B_VPN"
 [[ -n "$A_VPN" && -n "$B_VPN" ]] || { fail "could not resolve both VPN IPs"; exit 1; }
