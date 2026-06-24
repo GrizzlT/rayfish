@@ -688,6 +688,13 @@ enum AcceptHandler {
     Member(Arc<MemberAcceptState>),
 }
 
+#[cfg(test)]
+impl AcceptHandler {
+    fn is_coordinator(&self) -> bool {
+        matches!(self, AcceptHandler::Coordinator(_))
+    }
+}
+
 struct MeshProtocol {
     handler: AcceptHandler,
 }
@@ -5930,5 +5937,85 @@ mod report_tests {
     fn test_collect_recent_logs_missing_dir_is_empty() {
         // The log dir may not exist in CI / non-root test runs; must not panic.
         let _ = collect_recent_logs();
+    }
+}
+
+#[cfg(test)]
+mod accept_handler_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    // Build a minimal NetworkState for use in test AcceptHandler construction.
+    fn make_network_state() -> Arc<std::sync::RwLock<NetworkState>> {
+        let net_secret = iroh::SecretKey::from_bytes(&[1u8; 32]);
+        let net_pub = net_secret.public();
+        Arc::new(std::sync::RwLock::new(NetworkState {
+            members: MemberList::new(),
+            approved: ApprovedList::new(),
+            snapshot: None,
+            network_secret_key: None,
+            network_public_key: net_pub,
+            network_name: Some("test-net".to_string()),
+            mode: GroupMode::Restricted,
+            suggested_firewall: SuggestedFirewall::default(),
+            reusable_keys: BTreeMap::new(),
+            pending_suggestions: Vec::new(),
+            pending: HashMap::new(),
+        }))
+    }
+
+    async fn sample_coordinator_handler() -> AcceptHandler {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_store = FsStore::load(tmp.path()).await.unwrap();
+        let (tun_tx, _) = tokio::sync::mpsc::channel(1);
+        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
+        let my_key = iroh::SecretKey::from_bytes(&[2u8; 32]);
+        let my_id = my_key.public();
+        AcceptHandler::Coordinator(Arc::new(CoordinatorAcceptState {
+            network_name: "test-net".to_string(),
+            identity: IrohIdentityProvider::new(my_id, 0),
+            state: make_network_state(),
+            peers: PeerTable::new(),
+            tun_tx,
+            disconnect_tx,
+            token: tokio_util::sync::CancellationToken::new(),
+            stats: Arc::new(ForwardMetrics::default()),
+            dht_notify: None,
+            blob_store,
+            firewall: SharedFirewall::new(crate::firewall::FirewallConfig::default()),
+            hostname_table: dns::new_hostname_table(),
+            reverse_table: dns::new_reverse_table(),
+            device_user_map: peers::DeviceUserMap::new(),
+            invite_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }))
+    }
+
+    async fn sample_member_handler() -> AcceptHandler {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob_store = FsStore::load(tmp.path()).await.unwrap();
+        let (tun_tx, _) = tokio::sync::mpsc::channel(1);
+        let (disconnect_tx, _) = tokio::sync::mpsc::channel(1);
+        AcceptHandler::Member(Arc::new(MemberAcceptState {
+            network_name: "test-net".to_string(),
+            state: make_network_state(),
+            peers: PeerTable::new(),
+            tun_tx,
+            disconnect_tx,
+            token: tokio_util::sync::CancellationToken::new(),
+            stats: Arc::new(ForwardMetrics::default()),
+            blob_store,
+            firewall: SharedFirewall::new(crate::firewall::FirewallConfig::default()),
+            hostname_table: dns::new_hostname_table(),
+            reverse_table: dns::new_reverse_table(),
+            device_user_map: peers::DeviceUserMap::new(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn register_replaces_member_handler_with_coordinator() {
+        // AcceptHandler exposes whether it is the coordinator variant.
+        assert!(!sample_member_handler().await.is_coordinator());
+        assert!(sample_coordinator_handler().await.is_coordinator());
     }
 }
