@@ -5106,6 +5106,33 @@ async fn reconverge_and_apply(
     tracing::info!(network = %network_name, "reconverged from signed record");
 }
 
+/// Compute the order in which a joiner should dial coordinators.
+/// Returns the minter first (if present and not `me`), then every other
+/// `is_coordinator` member except `me`, de-duplicated, preserving order.
+/// Consumed by the join dial-fallback task.
+#[allow(dead_code)]
+fn coordinator_dial_order(
+    minter: EndpointId,
+    members: &[Member],
+    me: EndpointId,
+) -> Vec<EndpointId> {
+    let mut order = Vec::new();
+    let is_coord = |id: EndpointId| {
+        members
+            .iter()
+            .any(|m| m.identity == id && m.is_coordinator)
+    };
+    if minter != me && is_coord(minter) {
+        order.push(minter);
+    }
+    for m in members {
+        if m.is_coordinator && m.identity != me && !order.contains(&m.identity) {
+            order.push(m.identity);
+        }
+    }
+    order
+}
+
 /// Last-known roster from persisted config. Used only as a fallback when the
 /// signed pkarr record is briefly unreachable during a reconnect — never trusts
 /// peer-supplied membership.
@@ -6190,5 +6217,34 @@ mod accept_handler_tests {
         // Re-registering an already-coordinator network is a no-op decision.
         assert!(should_promote(NetworkRole::Member));
         assert!(!should_promote(NetworkRole::Coordinator));
+    }
+}
+
+#[cfg(test)]
+mod coordinator_dial_order_tests {
+    use super::*;
+    use crate::membership::{derive_ip, Member};
+
+    fn test_id(seed: u8) -> EndpointId {
+        let mut key_bytes = [0u8; 32];
+        key_bytes[0] = seed;
+        let key = iroh::SecretKey::from(key_bytes);
+        key.public()
+    }
+
+    #[test]
+    fn dial_order_puts_minter_first_then_other_coordinators() {
+        let (a, b, c, me) = (test_id(1), test_id(2), test_id(3), test_id(9));
+        let mk = |id, coord| Member {
+            identity: id,
+            ip: derive_ip(&id),
+            is_coordinator: coord,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        };
+        let members = vec![mk(a, true), mk(b, true), mk(c, false), mk(me, true)];
+        // minter = b: b first, then the other coordinator a, never c (not coord), never me.
+        assert_eq!(super::coordinator_dial_order(b, &members, me), vec![b, a]);
     }
 }
