@@ -2,7 +2,7 @@
 
 End-to-end test for the **direct 2-peer connection** flow (`ray connect`) over two
 real Scaleway hosts and the public pkarr DHT. Companion to the 3-peer device-cert
-test in `tests/e2e/`.
+test in `tests/e2e/device-cert/`; shared plumbing lives in `tests/lib/`.
 
 ## Topology
 

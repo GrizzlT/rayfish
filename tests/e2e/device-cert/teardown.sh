@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Destroy the `ray connect` e2e instances listed in .servers and remove the file.
+# Destroy the device-cert e2e instances listed in .servers and remove the file.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"

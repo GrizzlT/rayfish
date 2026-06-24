@@ -18,64 +18,26 @@ set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/../../.." && pwd)"
 SERVERS="$DIR/.servers"
-KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null \
-          -o ConnectTimeout=10 -o LogLevel=ERROR -o BatchMode=yes)
+# shellcheck source=../../lib/common.sh
+source "$ROOT/tests/lib/common.sh"
+SR_PREFIX=/tmp/c   # temp-file prefix for send_recv
 
-[[ -f "$SERVERS" ]] || { echo "No $SERVERS — run tests/e2e/connect/provision.sh first"; exit 1; }
+[[ -f "$SERVERS" ]] || { echo "No $SERVERS — run $DIR/provision.sh first"; exit 1; }
 
-A=""; B=""
-while read -r id ip label zone; do
-  case "${label:-}" in
-    srv-a) A="$ip" ;;
-    srv-b) B="$ip" ;;
-  esac
-done < "$SERVERS"
+A="$(server_ip "$SERVERS" srv-a || true)"
+B="$(server_ip "$SERVERS" srv-b || true)"
 [[ -n "$A" && -n "$B" ]] || { echo "missing srv-a/srv-b in $SERVERS"; exit 1; }
-
-FAILS=0
-pass(){ printf '  \033[32mPASS\033[0m %s\n' "$*"; }
-fail(){ printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAILS=$((FAILS+1)); }
-step(){ printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
-
-# on <ip> <command-string> : run a shell command on a host as root.
-# -n: never read stdin, so calling `on` inside a `while read` loop can't eat it.
-on(){ local ip="$1"; shift; ssh -n "${SSH_OPTS[@]}" -i "$KEY" "root@$ip" "$*"; }
-strip(){ sed -r 's/\x1B\[[0-9;]*[mGKH]//g'; }
-own_ip(){ echo "$1" | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
 
 # ---------------------------------------------------------------------------
 step "0. wait for SSH on both hosts"
-wait_ssh(){ local ip="$1"; for _ in $(seq 1 60); do on "$ip" true 2>/dev/null && return 0; sleep 5; done; return 1; }
-for pair in "srv-a $A" "srv-b $B"; do
-  set -- $pair
-  if wait_ssh "$2"; then pass "ssh $1 ($2)"; else fail "ssh $1 ($2) unreachable"; echo "aborting"; exit 1; fi
-done
-for h in "$A" "$B"; do ssh-keyscan -T 10 "$h" >> ~/.ssh/known_hosts 2>/dev/null || true; done
-
-# ---------------------------------------------------------------------------
-if [[ "${KEEP_STATE:-0}" != "1" ]]; then
-  step "0b. reset rayfish state on both hosts (KEEP_STATE=1 to skip)"
-  for h in "$A" "$B"; do
-    on "$h" 'systemctl stop rayfish 2>/dev/null; rm -rf /root/.config/rayfish' && echo "   reset $h"
-  done
-fi
-
-# ---------------------------------------------------------------------------
-step "1. deploy ray to both hosts (cross build + rsync + ray up)"
-for pair in "srv-a $A" "srv-b $B"; do
-  set -- $pair
-  echo ">> just deploy $2 ($1)"
-  if ( cd "$ROOT" && just deploy "$2" ); then pass "deploy $1"; else fail "deploy $1"; echo "aborting"; exit 1; fi
-done
+wait_all_ssh "$A" "$B"
+seed_known_hosts "$A" "$B"
+reset_state "$A" "$B"
+deploy_all "$ROOT" "$A" "$B"
 # Ensure the VPN is active on both (TUN up + contact publisher running). After a
 # `systemctl restart` the daemon boots inactive, so activate explicitly.
 for h in "$A" "$B"; do on "$h" 'ray up' >/dev/null 2>&1 || true; done
-sleep 5
-for pair in "srv-a $A" "srv-b $B"; do
-  set -- $pair
-  if on "$2" 'ray status' >/dev/null 2>&1; then pass "daemon up on $1"; else fail "daemon not responding on $1"; fi
-done
+wait_daemons "$A" "$B"
 
 # ---------------------------------------------------------------------------
 step "2. read contact ids"
@@ -156,11 +118,7 @@ if [[ -n "$A_IP" && -n "$B_IP" && "$A_IP" != "$B_IP" ]]; then
 else
   fail "expected two distinct VPN IPs (srv-a=$A_IP srv-b=$B_IP)"
 fi
-ping_loss(){ on "$1" "ping -c 3 -W 2 $2" 2>&1 | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+'; }
-png(){ # png <from-ip> <target-ip> <label>
-  local loss; loss="$(ping_loss "$1" "$2")"
-  if [[ "${loss:-100}" == "0" ]]; then pass "ping $3"; else fail "ping $3 (loss=${loss:-?}%)"; fi
-}
+# ping_loss / png come from common.sh.
 [[ -n "$A_IP" && -n "$B_IP" ]] && png "$A" "$B_IP" "srv-a -> srv-b ($B_IP)"
 [[ -n "$A_IP" && -n "$B_IP" ]] && png "$B" "$A_IP" "srv-b -> srv-a ($A_IP)"
 
@@ -168,38 +126,11 @@ png(){ # png <from-ip> <target-ip> <label>
 step "7. data transfer — ray send / ray files accept (both directions)"
 # `ray send` resolves the destination by hostname (or short id), not by IP.
 # Each side's peer row (● / ○) carries the *other* node's `<host>.<net>.ray`
-# name; take its first label as the peer hostname.
-peer_host(){ echo "$1" | grep -E '●|○' | grep -oE '[a-z0-9-]+\.[a-z0-9-]+\.ray' | head -1 | cut -d. -f1; }
+# name; peer_host (common.sh) takes its first label as the peer hostname.
 PEER_OF_A="$(peer_host "$SA")"   # srv-b's hostname, as seen from srv-a
 PEER_OF_B="$(peer_host "$SB")"   # srv-a's hostname, as seen from srv-b
 echo "   peer-of-a=$PEER_OF_A  peer-of-b=$PEER_OF_B"
-send_recv(){ # send_recv <from-ip> <to-ip> <to-peer-hostname> <label>
-  local from="$1" to="$2" peer="$3" label="$4"
-  on "$from" "head -c 1048576 /dev/urandom > /tmp/c_src.bin; sha256sum /tmp/c_src.bin | cut -d' ' -f1 > /tmp/c_src.sha"
-  local src_sha; src_sha="$(on "$from" 'cat /tmp/c_src.sha')"
-  on "$from" "ray send /tmp/c_src.bin $peer" 2>&1 | strip | sed 's/^/      send| /'
-  # `ray files` rows are `<id> <from> <size> <file> …` with a numeric id; the
-  # header row's first column is the literal "id", so match a numeric id.
-  local fid=""
-  for _ in $(seq 1 12); do
-    fid="$(on "$to" 'ray files' 2>/dev/null | strip | awk '$1 ~ /^[0-9]+$/ {print $1; exit}')"
-    [[ -n "$fid" ]] && break
-    sleep 3
-  done
-  if [[ -z "$fid" ]]; then fail "$label: no incoming file offer on receiver"; return; fi
-  on "$to" "rm -rf /tmp/c_recv && mkdir -p /tmp/c_recv && ray files accept $fid --output /tmp/c_recv" 2>&1 | strip | sed 's/^/      recv| /'
-  local dst_sha=""
-  for _ in $(seq 1 10); do
-    dst_sha="$(on "$to" 'f=$(find /tmp/c_recv -type f | head -1); [ -n "$f" ] && sha256sum "$f" | cut -d" " -f1')"
-    [[ -n "$dst_sha" ]] && break
-    sleep 2
-  done
-  if [[ -n "$dst_sha" && "$dst_sha" == "$src_sha" ]]; then
-    pass "$label (sha ${src_sha:0:12}… verified)"
-  else
-    fail "$label (sent ${src_sha:0:12}… got ${dst_sha:0:12}…)"
-  fi
-}
+# send_recv comes from common.sh (SR_PREFIX=/tmp/c set above).
 [[ -n "$PEER_OF_A" ]] && send_recv "$A" "$B" "$PEER_OF_A" "ray send srv-a -> srv-b" || fail "could not resolve srv-b hostname"
 [[ -n "$PEER_OF_B" ]] && send_recv "$B" "$A" "$PEER_OF_B" "ray send srv-b -> srv-a (reverse)" || fail "could not resolve srv-a hostname"
 
@@ -242,9 +173,4 @@ fi
 on "$B" 'ray up' >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------------------
-step "summary"
-if [[ "$FAILS" -eq 0 ]]; then
-  printf '\033[32mALL CHECKS PASSED\033[0m\n'; exit 0
-else
-  printf '\033[31m%d CHECK(S) FAILED\033[0m\n' "$FAILS"; exit 1
-fi
+summary

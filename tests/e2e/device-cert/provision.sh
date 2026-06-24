@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Provision 2 Scaleway instances for the `ray connect` (direct 2-peer) e2e test.
+# Provision 3 Scaleway instances for the device-cert e2e test.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVERS="$DIR/.servers"
-NAMES=(rayfish-connect-a rayfish-connect-b)
-LABELS=(srv-a srv-b)
-NEXT="tests/e2e/connect/run.sh"
+NAMES=(rayfish-e2e-a rayfish-e2e-b rayfish-e2e-c)
+LABELS=(srv-a srv-b srv-c)
+NEXT="tests/e2e/device-cert/run.sh"
 
 # shellcheck source=../../lib/provision.sh
 source "$DIR/../../lib/provision.sh"
