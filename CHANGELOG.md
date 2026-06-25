@@ -55,6 +55,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Accepted firewall suggestions no longer pile up duplicates.** Any change to a
+  network's signed blob (a join, a rename, a new reusable key) re-materialized the
+  whole suggested-firewall set and re-queued it for review, even the rules this
+  node had already accepted. Accepting one of those repeats via the picker then
+  appended a second identical rule. Already-installed suggestions are now kept out
+  of the pending queue, and the picker merges by selector (newest wins), so a
+  re-suggested rule replaces its predecessor instead of stacking.
 - **`ray update` no longer bricks the system service.** After swapping its own
   binary, `ray update` rewrote the service unit using the path of the running
   executable, which Linux reports with a trailing `" (deleted)"` once the old

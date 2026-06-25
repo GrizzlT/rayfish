@@ -128,6 +128,21 @@ pub fn same_selector(a: &FirewallRule, b: &FirewallRule) -> bool {
         && a.network == b.network
 }
 
+/// Collapse rules that share a selector, keeping the *last* occurrence of each
+/// (newest wins) while preserving relative order. Used when merging freshly
+/// accepted suggestions into a network's installed set so re-accepting an
+/// already-installed selector replaces it rather than stacking a duplicate.
+pub fn dedup_by_selector(rules: Vec<FirewallRule>) -> Vec<FirewallRule> {
+    let mut deduped: Vec<FirewallRule> = Vec::with_capacity(rules.len());
+    for rule in rules.into_iter().rev() {
+        if !deduped.iter().any(|r| same_selector(r, &rule)) {
+            deduped.push(rule);
+        }
+    }
+    deduped.reverse();
+    deduped
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirewallRule {
     pub direction: Direction,
@@ -1029,6 +1044,41 @@ mod tests {
             ..FirewallConfig::default()
         });
         assert_eq!(fw.evaluate(Direction::In, 1, 0, &test_id(1)), Action::Deny);
+    }
+
+    #[test]
+    fn dedup_by_selector_keeps_newest_and_collapses_duplicates() {
+        // Reproduces the duplicate-suggestion bug: an already-installed
+        // `allow tcp:22` plus a re-accepted copy (and a re-accepted action flip)
+        // must collapse to one rule per selector, the newest winning.
+        let installed_22 = FirewallRule {
+            direction: Direction::In,
+            action: Action::Allow,
+            protocol: Protocol::Tcp,
+            port: Some(PortRange { start: 22, end: 22 }),
+            peer: PeerFilter::Any,
+            network: Some("homelab".into()),
+            origin: RuleOrigin::Network("homelab".into()),
+        };
+        let installed_80 = FirewallRule {
+            port: Some(PortRange { start: 80, end: 443 }),
+            ..installed_22.clone()
+        };
+        // Same selector as installed_22 but flipped to deny (a re-suggested change).
+        let reaccepted_22 = FirewallRule {
+            action: Action::Deny,
+            ..installed_22.clone()
+        };
+        let out = dedup_by_selector(vec![
+            installed_80.clone(),
+            installed_22.clone(),
+            reaccepted_22.clone(),
+        ]);
+        assert_eq!(out.len(), 2, "one rule per selector");
+        // tcp:80-443 retained, tcp:22 collapsed to the newest (deny).
+        assert!(out.iter().any(|r| r == &installed_80));
+        assert!(out.iter().any(|r| r == &reaccepted_22));
+        assert!(!out.iter().any(|r| r == &installed_22));
     }
 
     #[test]

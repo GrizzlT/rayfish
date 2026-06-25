@@ -5032,7 +5032,11 @@ impl DaemonState {
                 .cloned()
                 .collect();
             existing.extend(accepted_rules);
-            let config = self.firewall.replace_network_rules(network, existing);
+            // Dedup by selector, newest (accepted) wins, so accepting a rule
+            // whose selector is already installed replaces it instead of stacking
+            // a duplicate (and a re-suggested action flip supersedes the old one).
+            let deduped = firewall::dedup_by_selector(existing);
+            let config = self.firewall.replace_network_rules(network, deduped);
             if let Err(e) = firewall::save_firewall(&config) {
                 tracing::warn!(error = %e, "failed to persist firewall config");
             }
@@ -6118,8 +6122,24 @@ fn apply_suggested_firewall(
             "auto-accepted suggested firewall rules"
         );
     } else {
-        let count = rules.len();
-        state.write().unwrap().pending_suggestions = rules;
+        // Don't re-queue suggestions this node already installed: an accepted
+        // rule is re-materialized on every blob reconverge, so without this it
+        // reappears in the pending queue indefinitely and re-accepting it stacks
+        // a duplicate. Compare the full rule (selector + action) so a coordinator
+        // flipping a rule's action still surfaces for review.
+        let installed: Vec<firewall::FirewallRule> = firewall
+            .get_config()
+            .rules
+            .iter()
+            .filter(|r| matches!(&r.origin, firewall::RuleOrigin::Network(n) if n == network_name))
+            .cloned()
+            .collect();
+        let fresh: Vec<firewall::FirewallRule> = rules
+            .into_iter()
+            .filter(|r| !installed.iter().any(|i| i == r))
+            .collect();
+        let count = fresh.len();
+        state.write().unwrap().pending_suggestions = fresh;
         tracing::info!(
             network = network_name,
             count,
