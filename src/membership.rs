@@ -304,6 +304,12 @@ pub fn derive_ip_with_index(identity: &EndpointId, index: u32) -> Ipv4Addr {
     Ipv4Addr::from(base | host_bits)
 }
 
+/// True if `ip` is reserved and must never be assigned to a member
+/// (currently the Magic DNS resolver address).
+fn is_reserved_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    ip == crate::dns::MAGIC_DNS_V4
+}
+
 /// Finds the lowest collision index whose derived IPv4 is free in `members`.
 ///
 /// An IP is considered free if no *different* identity holds it — a re-add of
@@ -313,6 +319,10 @@ pub fn assign_ip(members: &MemberList, identity: &EndpointId) -> (Ipv4Addr, u32)
     let mut index = 0u32;
     loop {
         let ip = derive_ip_with_index(identity, index);
+        if is_reserved_ipv4(ip) {
+            index += 1;
+            continue;
+        }
         match members.get_by_ip(ip) {
             Some(existing) if existing.identity != *identity => index += 1,
             _ => return (ip, index),
@@ -521,6 +531,11 @@ pub fn validate_member(member: &Member) -> Result<()> {
         "member ip {} does not match identity-derived ip {}",
         member.ip,
         expected,
+    );
+    anyhow::ensure!(
+        !is_reserved_ipv4(member.ip),
+        "member IP {} is the reserved Magic DNS address",
+        member.ip
     );
     ensure_in_cgnat_range(member.ip)
 }
@@ -1762,5 +1777,31 @@ mod tests {
         assert_eq!(lo_m.ip, ip);
         assert_ne!(hi_m.ip, ip);
         assert!(validate_no_duplicate_ips(&resolved).is_ok());
+    }
+
+    #[test]
+    fn is_reserved_ipv4_covers_magic_dns() {
+        // The predicate test isolates the guard: it fails if anyone removes the
+        // magic DNS IP from the reserved set, independent of IP-derivation.
+        assert!(is_reserved_ipv4(crate::dns::MAGIC_DNS_V4));
+        assert!(!is_reserved_ipv4(Ipv4Addr::new(100, 64, 0, 7)));
+    }
+
+    #[test]
+    fn validate_member_rejects_magic_dns_ip() {
+        // Behavioral guard; the predicate test above is the one that isolates it.
+        let mut kb = [0u8; 32];
+        kb[0] = 9;
+        let id = iroh::SecretKey::from(kb).public();
+        let m = Member {
+            identity: id,
+            ip: crate::dns::MAGIC_DNS_V4,
+            collision_index: 0,
+            is_coordinator: false,
+            hostname: None,
+            user_identity: None,
+            device_cert: None,
+        };
+        assert!(validate_member(&m).is_err());
     }
 }

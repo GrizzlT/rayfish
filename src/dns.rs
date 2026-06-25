@@ -20,6 +20,14 @@ use simple_dns::{
 
 use crate::DNS_DOMAIN;
 
+/// Reserved virtual IPv4 for the in-daemon Magic DNS resolver. It lives in the
+/// `100.64.0.0/10` peer range (so the existing TUN route delivers packets to it)
+/// but is NEVER assigned to a member and NEVER bound as a local interface
+/// address — it is reachable only by being routed into the TUN, which is what
+/// lets us answer DNS without competing for the host's port 53. Distinct from
+/// Tailscale's 100.100.100.100 so both can coexist.
+pub const MAGIC_DNS_V4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 100, 100, 53);
+
 /// Per-network hostname → (IPv4, IPv6) mapping.
 pub type HostnameEntry = (Ipv4Addr, Ipv6Addr);
 pub type HostnameTable = Arc<RwLock<HashMap<String, HashMap<String, HostnameEntry>>>>;
