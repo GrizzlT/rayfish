@@ -6,6 +6,71 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Release notes on `ray update`** — before swapping the binary (and in
+  `ray update --check` when behind), print what the update brings: the stable
+  channel walks every release in `(current, latest]` newest-first, while
+  `--nightly`/`--version` show the resolved release's notes. Best-effort, so a
+  fetch failure never blocks the update.
+- **Standby control plane (`ray up`/`down`)** — `ray down` now takes only the
+  data plane offline (TUN, routes, Magic DNS, inbound forward gate) while staying
+  connected to peers, so the node keeps receiving roster/blob/firewall updates and
+  `ray up` is near-instant with no re-dial. `sudo ray start`/`stop` remain the
+  fully-offline switch.
+- **Fail-fast firewall REJECT mode** — `ray firewall reject on|off` (opt-in,
+  default off): a denied packet gets a TCP RST / ICMP-unreachable reply in both
+  directions so the initiator fails immediately ("connection refused") instead of
+  hanging. Off keeps the stealthy silent-drop posture.
+- **`ray start` / `ray stop`** service commands to bring the whole daemon online
+  or fully offline.
+- **Comma-list firewall ports + short CLI aliases** — `--port`/`-P` takes a
+  single port, a `start-end` range, or a comma list (`80,443`, `22,8000-9000`)
+  expanded to one rule per item.
+- **Control-plane abuse defense** — per-connection token-bucket rate limiting that
+  closes sustained flooders, with a per-network debounced reconverge worker so a
+  trigger burst coalesces into a single pkarr resolve + reconverge.
+
+### Changed
+
+- **Additive firewall suggestions** — each suggested token becomes one allow/deny
+  rule with no synthesized catch-all (allow-list relies on the node's own inbound
+  default-deny; denies-only = blacklist). `ray status` ends with a `pending`
+  summary of things awaiting the user.
+
+### Fixed
+
+- Publish the contact record regardless of data-plane state, so `ray connect`
+  resolves a peer that is on standby (`ray down`).
+
+## [0.1.2]
+
+### Changed
+
+- **Magic DNS reworked to TUN interception** — `.ray` queries are intercepted in
+  the TUN read loop and answered in-daemon via the magic IP `100.100.100.53`, so
+  the resolver never binds the host's port 53. Non-`.ray` queries forward to the
+  captured upstreams.
+- **Direct-mode DNS takeover (Tailscale-style)** — on hosts without split-DNS,
+  take over `/etc/resolv.conf` with an inotify re-assert loop that repairs it in
+  ~ms when NetworkManager/dhclient overwrites it, plus a `dns=none` NM drop-in so
+  NM stops regenerating it. Both are marker-guarded and crash-safe (panic hook +
+  next-start cleanup restore the host's DNS).
+- **Sharded, atomic per-network config** — globals in `settings.toml`, each
+  network in `networks/<name>.toml`, all written via temp-file + atomic rename.
+  Replaces the single `networks.toml` whose non-atomic rewrites raced and silently
+  dropped networks; legacy files auto-migrate on first load.
+- Retain only the 7 most recent daily log files.
+- Authenticate GitHub API calls in `ray update` with a `gh` token (lifts the
+  anonymous rate limit).
+
+### Fixed
+
+- Scope suggested firewall rules to non-joined networks correctly, and default a
+  suggestion's peer to "any" so rules propagate instantly.
+- Point systemd-resolved (`SetLinkDNS`) at the magic IP; fix the NetworkManager
+  mode read on Linux.
+
 ## [0.1.1]
 
 ### Added
@@ -118,6 +183,7 @@ First public release.
 - **Optional transports / export** — `--features tor` (Tor transport) and
   `--features otel` (OTLP span export).
 
-[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/rayfish/rayfish/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/rayfish/rayfish/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/rayfish/rayfish/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/rayfish/rayfish/releases/tag/v0.1.0

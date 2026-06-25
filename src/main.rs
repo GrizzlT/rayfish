@@ -3329,7 +3329,10 @@ async fn print_pending_changelog(
     // Stable: fetch the recent releases and keep the stable ones strictly newer
     // than what we run, up to and including the target.
     let api = format!("https://api.github.com/repos/{REPO_SLUG}/releases?per_page=100");
-    let releases: Vec<GhRelease> = match authed(client.get(&api), token).send().await {
+    // Bound the whole request so a slow/unreachable API can't freeze the update;
+    // on timeout (or any error) we just skip the notes.
+    let req = authed(client.get(&api), token).timeout(std::time::Duration::from_secs(5));
+    let releases: Vec<GhRelease> = match req.send().await {
         Ok(resp) => match resp.error_for_status() {
             Ok(resp) => resp.json().await.unwrap_or_default(),
             Err(_) => return,
