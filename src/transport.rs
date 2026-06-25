@@ -140,16 +140,34 @@ pub async fn connect_to_peer_with_alpn(
     alpn: &[u8],
 ) -> Result<Connection> {
     let addr: EndpointAddr = id.into();
-    let conn = ep
-        .connect(addr, alpn)
-        .await
-        .context("failed to connect to peer")?;
+    let conn = match ep.connect(addr, alpn).await {
+        Ok(conn) => conn,
+        // An ALPN mismatch fails the QUIC/TLS handshake opaquely. Map that one
+        // case to an actionable hint (it's a heuristic — a peer that isn't
+        // running rayfish at all looks similar — hence "may be").
+        Err(e) if is_alpn_mismatch(&e.to_string()) => {
+            return Err(e).context(
+                "no shared protocol with peer — it may be running an incompatible \
+                 rayfish version (run `ray update`)",
+            );
+        }
+        Err(e) => return Err(e).context("failed to connect to peer"),
+    };
     tracing::info!(
         peer = %conn.remote_id().fmt_short(),
         alpn = %String::from_utf8_lossy(alpn),
         "connected to peer"
     );
     Ok(conn)
+}
+
+/// Heuristic: does a connect error look like an ALPN mismatch (no protocol the
+/// two peers share)? iroh/quinn surfaces this as "peer doesn't support any known
+/// protocol" / a TLS `no_application_protocol` alert. Matching the message keeps
+/// us robust across iroh patch releases without depending on exact error enums.
+pub(crate) fn is_alpn_mismatch(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("known protocol") || e.contains("application protocol")
 }
 
 #[cfg(test)]
@@ -164,5 +182,19 @@ mod tests {
         let key_str = key.to_string();
         let expected = format!("rayfish/net/{MESH_PROTOCOL_VERSION}/{}", &key_str[..16]);
         assert_eq!(alpn, expected.as_bytes());
+    }
+
+    #[test]
+    fn alpn_mismatch_classifier() {
+        // iroh/quinn phrasings for "no shared ALPN".
+        assert!(is_alpn_mismatch(
+            "connection closed: peer doesn't support any known protocol"
+        ));
+        assert!(is_alpn_mismatch(
+            "the cryptographic handshake failed: no application protocol"
+        ));
+        // Unrelated failures must not be misclassified as version mismatches.
+        assert!(!is_alpn_mismatch("connection timed out"));
+        assert!(!is_alpn_mismatch("connection refused"));
     }
 }

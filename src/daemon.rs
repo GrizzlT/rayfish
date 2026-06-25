@@ -1906,9 +1906,27 @@ impl DaemonState {
 
         // Resolve single pkarr record → (blob_hash, seed_peers)
         let pkarr_client = dht::create_pkarr_client(&self.endpoint)?;
-        let (expected_hash, peer_ids) = dht::resolve_network(&pkarr_client, net_pubkey)
+        let record = dht::resolve_network_packet(&pkarr_client, net_pubkey)
             .await
             .context("failed to resolve network record")?;
+
+        // Pre-dial mesh-protocol compatibility check. The versioned ALPN is the
+        // hard gate, but it fails opaquely ("couldn't connect"). The record is
+        // network-key-signed and fetched before dialing, so comparing the
+        // coordinator's advertised mesh version here lets us surface a precise,
+        // actionable error instead. Absent version (older record) ⇒ skip and let
+        // the ALPN gate decide.
+        if let Some(net_ver) = dht::mesh_version_from_record(&record) {
+            let mine = transport::MESH_PROTOCOL_VERSION;
+            anyhow::ensure!(
+                net_ver == mine,
+                "incompatible mesh protocol: this network runs v{net_ver}, this build speaks v{mine} \
+                 — run `ray update` so both sides match"
+            );
+        }
+
+        let (expected_hash, peer_ids) =
+            dht::decode_network_record(&record).context("invalid network record")?;
 
         if peer_ids.is_empty() {
             anyhow::bail!("no peers found in network record");

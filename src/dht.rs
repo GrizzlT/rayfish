@@ -41,18 +41,38 @@ pub fn create_pkarr_client(ep: &Endpoint) -> Result<PkarrRelayClient> {
 
 /// Encodes a network record into a signed pkarr packet.
 ///
-/// The record contains the group blob hash and a list of seed peers.
+/// The record contains the group blob hash, a list of seed peers, and the
+/// publishing coordinator's mesh protocol version (`m,<v>` =
+/// [`transport::MESH_PROTOCOL_VERSION`]). The version lets a joiner detect an
+/// incompatible mesh protocol *before* dialing (where the versioned ALPN would
+/// otherwise reject it opaquely), so it can surface a precise "run ray update"
+/// error. The record is network-key-signed, so the version can't be spoofed.
 pub fn encode_network_record(
     key: &SecretKey,
     blob_hash: &blake3::Hash,
     seed_peers: &[EndpointId],
 ) -> Result<SignedPacket> {
-    let mut values = vec![RECORD_VERSION.to_string(), format!("h,{blob_hash}")];
+    let mut values = vec![
+        RECORD_VERSION.to_string(),
+        format!("h,{blob_hash}"),
+        format!("m,{}", crate::transport::MESH_PROTOCOL_VERSION),
+    ];
     for peer in seed_peers {
         values.push(format!("p,{peer}"));
     }
     SignedPacket::from_txt_strings(key, RECORD_NAME, values, RECORD_TTL)
         .map_err(|e| anyhow::anyhow!("failed to build network record: {e}"))
+}
+
+/// Extracts the coordinator's advertised mesh protocol version (`m,<v>`) from a
+/// network record, if present. Returns `None` for older records published before
+/// the version was added — callers treat that as "unknown, fall through to the
+/// ALPN gate" rather than blocking.
+pub fn mesh_version_from_record(packet: &SignedPacket) -> Option<u32> {
+    packet
+        .txt_records(RECORD_NAME)
+        .iter()
+        .find_map(|r| r.strip_prefix("m,").and_then(|v| v.parse::<u32>().ok()))
 }
 
 pub fn decode_network_record(packet: &SignedPacket) -> Result<(blake3::Hash, Vec<EndpointId>)> {
@@ -138,14 +158,25 @@ pub async fn publish_network(
         .map_err(|e| anyhow::anyhow!("failed to publish network record: {e}"))
 }
 
+/// Resolves the raw signed network record packet. Use this when you need fields
+/// beyond `(blob_hash, seed_peers)` — e.g. [`mesh_version_from_record`] for the
+/// pre-dial compatibility check. Decode the standard fields with
+/// [`decode_network_record`].
+pub async fn resolve_network_packet(
+    client: &PkarrRelayClient,
+    network_pubkey: EndpointId,
+) -> Result<SignedPacket> {
+    client
+        .resolve(network_pubkey)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve network record: {e}"))
+}
+
 pub async fn resolve_network(
     client: &PkarrRelayClient,
     network_pubkey: EndpointId,
 ) -> Result<(blake3::Hash, Vec<EndpointId>)> {
-    let packet = client
-        .resolve(network_pubkey)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to resolve network record: {e}"))?;
+    let packet = resolve_network_packet(client, network_pubkey).await?;
     decode_network_record(&packet)
 }
 
@@ -205,6 +236,31 @@ mod tests {
         let (decoded_hash, decoded_peers) = decode_network_record(&packet).unwrap();
         assert_eq!(decoded_hash, hash);
         assert!(decoded_peers.is_empty());
+    }
+
+    #[test]
+    fn network_record_carries_mesh_version() {
+        let key = SecretKey::generate();
+        let hash = blake3::hash(b"test");
+        let packet = encode_network_record(&key, &hash, &[]).unwrap();
+        // A fresh record advertises this build's mesh protocol version, and the
+        // standard hash/peers decode is unaffected by the added field.
+        assert_eq!(
+            mesh_version_from_record(&packet),
+            Some(crate::transport::MESH_PROTOCOL_VERSION)
+        );
+        assert_eq!(decode_network_record(&packet).unwrap().0, hash);
+    }
+
+    #[test]
+    fn mesh_version_absent_on_older_record() {
+        // A record published before the `m,` field existed (only version + hash).
+        let key = SecretKey::generate();
+        let hash = blake3::hash(b"test");
+        let values = vec![RECORD_VERSION.to_string(), format!("h,{hash}")];
+        let packet =
+            SignedPacket::from_txt_strings(&key, RECORD_NAME, values, RECORD_TTL).unwrap();
+        assert_eq!(mesh_version_from_record(&packet), None);
     }
 
     #[test]
