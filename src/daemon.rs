@@ -3045,6 +3045,10 @@ impl DaemonState {
             warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
         }
 
+        if let Err(e) = tun::route_magic_dns(&self.tun_name).await {
+            tracing::warn!(error = %e, "failed to route magic DNS IP into TUN");
+        }
+
         // Loop our own addresses back through lo0 so self-traffic (e.g. pinging
         // our own hostname) is answered locally instead of leaving via the TUN,
         // where the forwarding loop would drop it as "no peer for dst". No-op on
