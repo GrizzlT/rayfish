@@ -19,6 +19,12 @@ pub trait DnsConfigurator: Send + Sync {
     async fn apply(&self) -> Result<()>;
     async fn revert(&self) -> Result<()>;
     fn name(&self) -> &'static str;
+    /// Return the upstream DNS servers captured from the system before rayfish
+    /// overwrote resolv.conf. Used by the resolver forwarder (Task 11).
+    /// Default: empty (all other configurators use split-DNS and don't capture).
+    fn captured_upstreams(&self) -> Vec<std::net::Ipv4Addr> {
+        Vec::new()
+    }
 }
 
 /// Revert a DNS configuration.
@@ -53,7 +59,7 @@ pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigura
             c.apply().await?;
             return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
         }
-        let c = DirectResolvConf;
+        let c = DirectResolvConf::new().await;
         c.apply().await?;
         return Ok(Box::new(c) as Box<dyn DnsConfigurator>);
     }
@@ -774,9 +780,34 @@ impl DnsConfigurator for Resolvconf {
 // Linux fallback: direct /etc/resolv.conf
 // ---------------------------------------------------------------------------
 
+// Pure helpers — NOT cfg-gated so their unit tests run on macOS (the dev host).
+
+/// Extract IPv4 `nameserver` entries from resolv.conf contents, excluding our
+/// own magic IP (so we never capture ourselves as an upstream → no forward loop).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_resolv_nameservers(contents: &str) -> Vec<std::net::Ipv4Addr> {
+    contents
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("nameserver "))
+        .filter_map(|s| s.trim().parse::<std::net::Ipv4Addr>().ok())
+        .filter(|ip| *ip != crate::dns::MAGIC_DNS_V4)
+        .collect()
+}
+
+/// Render a direct-mode resolv.conf that points only at the magic resolver IP.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn render_direct_resolv_conf(search: &[String]) -> String {
+    let mut s = String::from(HEADER_COMMENT);
+    s.push_str(&format!("nameserver {RESOLVER_IP}\n"));
+    if !search.is_empty() {
+        s.push_str(&format!("search {}\n", search.join(" ")));
+    }
+    s
+}
+
 #[cfg(target_os = "linux")]
 const BACKUP_SUFFIX: &str = ".before-rayfish";
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const HEADER_COMMENT: &str = "# Added by rayfish - do not edit\n";
 
 #[cfg(target_os = "linux")]
@@ -812,7 +843,35 @@ async fn restore_file(path: &std::path::Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-struct DirectResolvConf;
+struct DirectResolvConf {
+    captured_upstreams: Vec<std::net::Ipv4Addr>,
+    search: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl DirectResolvConf {
+    /// Read the current resolv.conf to capture upstreams + existing search
+    /// domains BEFORE we overwrite it. Call this in detect_and_configure
+    /// before apply().
+    async fn new() -> Self {
+        let contents = tokio::fs::read_to_string("/etc/resolv.conf")
+            .await
+            .unwrap_or_default();
+        let search = contents
+            .lines()
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix("search ")
+                    .or_else(|| l.trim().strip_prefix("domain "))
+            })
+            .flat_map(|s| s.split_whitespace().map(|x| x.to_string()))
+            .collect();
+        Self {
+            captured_upstreams: parse_resolv_nameservers(&contents),
+            search,
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[async_trait]
@@ -821,12 +880,14 @@ impl DnsConfigurator for DirectResolvConf {
         use std::path::Path;
         let path = Path::new("/etc/resolv.conf");
         backup_file(path).await?;
-        let existing = tokio::fs::read_to_string(path).await.unwrap_or_default();
-        let new_content = format!("{HEADER_COMMENT}nameserver {RESOLVER_IP}\n{existing}");
+        let new_content = render_direct_resolv_conf(&self.search);
         tokio::fs::write(path, new_content)
             .await
             .context("writing /etc/resolv.conf")?;
-        tracing::info!("configured /etc/resolv.conf directly (fallback)");
+        tracing::info!(
+            upstreams = ?self.captured_upstreams,
+            "configured /etc/resolv.conf directly (fallback); captured upstream resolvers"
+        );
         Ok(())
     }
 
@@ -841,11 +902,15 @@ impl DnsConfigurator for DirectResolvConf {
     fn name(&self) -> &'static str {
         "direct-resolv.conf"
     }
+
+    fn captured_upstreams(&self) -> Vec<std::net::Ipv4Addr> {
+        self.captured_upstreams.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::RESOLVER_IP;
+    use super::{RESOLVER_IP, parse_resolv_nameservers, render_direct_resolv_conf};
 
     #[test]
     fn resolver_ip_matches_magic_dns_constant() {
@@ -853,6 +918,33 @@ mod tests {
             RESOLVER_IP.parse::<std::net::Ipv4Addr>().unwrap(),
             crate::dns::MAGIC_DNS_V4
         );
+    }
+
+    #[test]
+    fn parse_resolv_nameservers_extracts_ipv4_excluding_magic() {
+        let c = "# Generated by NetworkManager\nsearch home\nnameserver 192.168.1.1\nnameserver 8.8.8.8\nnameserver 100.100.100.53\n";
+        assert_eq!(
+            parse_resolv_nameservers(c),
+            vec![
+                "192.168.1.1".parse::<std::net::Ipv4Addr>().unwrap(),
+                "8.8.8.8".parse::<std::net::Ipv4Addr>().unwrap()
+            ]
+        ); // 100.100.100.53 (magic) excluded
+    }
+
+    #[test]
+    fn render_direct_resolv_conf_points_at_magic_ip() {
+        let out = render_direct_resolv_conf(&["homelab.ray".to_string(), "ray".to_string()]);
+        assert!(out.starts_with("# Added by rayfish"));
+        assert!(out.contains("nameserver 100.100.100.53"));
+        assert!(out.contains("search homelab.ray ray"));
+    }
+
+    #[test]
+    fn render_direct_resolv_conf_no_search_line_when_empty() {
+        let out = render_direct_resolv_conf(&[]);
+        assert!(out.contains("nameserver 100.100.100.53"));
+        assert!(!out.contains("search "));
     }
 
     #[cfg(target_os = "linux")]
