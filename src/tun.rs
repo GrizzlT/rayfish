@@ -243,6 +243,45 @@ pub async fn route_peer_range(tun_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Install host routes for our *own* dual-stack addresses via the loopback
+/// interface so traffic to ourselves (e.g. `ping dario.field.ray` resolving to
+/// our own IP) is short-circuited locally instead of being sent out the TUN —
+/// where the forwarding loop would drop it as "no peer for dst".
+///
+/// On a normal broadcast interface macOS auto-installs a `<own-ip> -> lo0` route
+/// for exactly this. A point-to-point `utun` does not get one (the local address
+/// only exists as the source end of the `addr --> gateway` pair), so we add it
+/// explicitly, mirroring what Tailscale does. Delete-then-add keeps it
+/// idempotent across `up`/`down` cycles. Must run after the address is assigned.
+///
+/// On Linux this is a no-op: assigning an address makes the kernel add a
+/// `local` route in the `local` table that already delivers self-traffic via
+/// loopback, so pinging your own TUN address works out of the box.
+#[cfg(target_os = "macos")]
+pub async fn route_self_loopback(v4: Ipv4Addr, v6: Ipv6Addr) -> Result<()> {
+    for (family, addr) in [("-inet", v4.to_string()), ("-inet6", v6.to_string())] {
+        let _ = std::process::Command::new("route")
+            .args(["-n", "delete", family, "-host", &addr, "-interface", "lo0"])
+            .status();
+        let status = std::process::Command::new("route")
+            .args(["-n", "add", family, "-host", &addr, "-interface", "lo0"])
+            .status()
+            .context("run route add (loopback self-route)")?;
+        anyhow::ensure!(
+            status.success(),
+            "route add {family} -host {addr} via lo0 failed with {status}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn route_self_loopback(_v4: Ipv4Addr, _v6: Ipv6Addr) -> Result<()> {
+    // Linux installs the loopback `local` route automatically on address
+    // assignment; self-traffic already works without an explicit route.
+    Ok(())
+}
+
 /// Bring the TUN interface administratively up (used when activating the VPN).
 pub fn set_link_up(tun_name: &str) -> Result<()> {
     set_link_state(tun_name, true)

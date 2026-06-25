@@ -3023,6 +3023,17 @@ impl DaemonState {
             warnings.push(format!("failed to route IPv6 peer range into TUN: {e}"));
         }
 
+        // Loop our own addresses back through lo0 so self-traffic (e.g. pinging
+        // our own hostname) is answered locally instead of leaving via the TUN,
+        // where the forwarding loop would drop it as "no peer for dst". No-op on
+        // Linux (kernel installs the `local` route automatically).
+        let my_v4 = self.identity.local_ip();
+        let my_v6 = derive_ipv6(&self.identity.local_identity());
+        if let Err(e) = tun::route_self_loopback(my_v4, my_v6).await {
+            tracing::warn!(error = %e, "failed to install loopback self-route");
+            warnings.push(format!("failed to install loopback self-route: {e}"));
+        }
+
         // Configure system DNS to route .ray queries to our local resolver.
         dns_config::restore_stale_backups();
         match dns_config::detect_and_configure(&self.tun_name).await {
