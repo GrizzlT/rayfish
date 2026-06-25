@@ -5425,8 +5425,9 @@ async fn build_daemon(
     });
     let shared_firewall = SharedFirewall::new(fw_config);
     shared_firewall.clone().spawn_evictor(token.clone());
+    let active = Arc::new(AtomicBool::new(false));
     let (tun_tx, tun_rx) = mpsc::channel::<Bytes>(256);
-    forward::spawn_tun_writer(tun_writer, tun_rx);
+    forward::spawn_tun_writer(tun_writer, tun_rx, active.clone());
     let device_user_map = peers::DeviceUserMap::new();
 
     // --- Magic DNS resolver + optional mDNS local discovery ---
@@ -5483,7 +5484,7 @@ async fn build_daemon(
         device_cert,
         device_user_map,
         contact_public,
-        active: Arc::new(AtomicBool::new(false)),
+        active: active.clone(),
         dns_configurator: Arc::new(std::sync::Mutex::new(None)),
         resolver: dns_resolver.clone(),
         dns_reassert_token: std::sync::Mutex::new(None),
