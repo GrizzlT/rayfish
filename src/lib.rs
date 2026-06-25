@@ -56,6 +56,7 @@ pub mod daemon;
 pub mod dht;
 pub mod dns;
 pub mod dns_config;
+pub mod dns_packet;
 pub mod firewall;
 pub mod forward;
 pub mod hostname;
