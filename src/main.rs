@@ -1156,15 +1156,21 @@ async fn ipc_status() -> Result<()> {
                         .my_hostname
                         .as_ref()
                         .map(|h| format!("{}.{}.{}", h, net.name, DNS_DOMAIN));
+                    // member count (self excluded) belongs on the network header row
+                    let online = net.peers.iter().filter(|p| p.connection.is_some()).count();
                     println!();
                     print!("  {}  {}", style::bold(&net.name), style::marker(&role));
                     if let Some(ref dns) = dns_name {
                         print!("   {}", style::value(dns));
                     }
-                    println!("   {}", style::faint(&net.my_ip.to_string()));
+                    print!("   {}", style::faint(&net.my_ip.to_string()));
+                    println!(
+                        "   {} {}",
+                        style::label("members"),
+                        style::value(&format!("{online}/{}", net.peers.len())),
+                    );
 
                     // Peer rows as aligned columns: glyph · host · ipv4 · via · rtt · traffic
-                    let online = net.peers.iter().filter(|p| p.connection.is_some()).count();
                     let mut rows: Vec<Vec<layout::Cell>> = Vec::new();
                     for peer in &net.peers {
                         let host = peer
@@ -1225,20 +1231,13 @@ async fn ipc_status() -> Result<()> {
                         print!("{}", indent(&layout::columns(&rows, 3), 4));
                     }
 
-                    // join code + members (self excluded from the count). Direct
-                    // (`ray connect`) networks have no shareable room id, so the
-                    // join code is suppressed for them.
-                    print!("    ");
+                    // join code. Direct (`ray connect`) networks have no shareable
+                    // room id, so the join code is suppressed for them.
                     if let Some(ref key) = net.network_key
                         && !net.role.is_direct()
                     {
-                        print!("{} {}    ", style::label("join"), style::rose(key));
+                        println!("    {} {}", style::label("join"), style::rose(key));
                     }
-                    println!(
-                        "{} {}",
-                        style::label("members"),
-                        style::value(&format!("{online}/{}", net.peers.len())),
-                    );
                 }
             }
 
