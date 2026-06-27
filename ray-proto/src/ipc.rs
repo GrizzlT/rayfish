@@ -123,6 +123,22 @@ pub enum IpcMessage {
         accept: Vec<FirewallRuleView>,
         deny: Vec<FirewallRuleView>,
     },
+    /// Toggle the embedded mesh SSH server (`ray firewall ssh on|off`). When on,
+    /// the daemon listens on each mesh IP's port 22 and admits peers authorized
+    /// per-network; off stops the listeners and removes the tcp:22 passthrough.
+    FirewallSshSet {
+        enabled: bool,
+    },
+    /// Add (`allow=true`) or remove (`allow=false`) a peer from a network's SSH
+    /// allow list. `peer` is a resolved peer EndpointId (hex) or `"*"` (any peer
+    /// on the network). `ray firewall ssh allow|deny <network> <peer>`.
+    FirewallSshAllow {
+        network: String,
+        peer: String,
+        allow: bool,
+    },
+    /// Read the SSH server state + per-network allow lists (open read).
+    FirewallSshShow,
     SetHostname {
         network: String,
         hostname: String,
@@ -328,6 +344,13 @@ pub enum IpcMessage {
         network: String,
         rules: Vec<FirewallRuleView>,
     },
+    /// Embedded mesh SSH state (reply to `FirewallSshShow`): whether the server
+    /// is enabled, and each network's allow list (`*` or peer short-ids/hex).
+    FirewallSshState {
+        enabled: bool,
+        /// `(network, allow-entries)`; entries are `"*"` or peer identities.
+        networks: Vec<(String, Vec<String>)>,
+    },
     FileList {
         files: Vec<PendingFileInfo>,
     },
@@ -494,7 +517,6 @@ pub enum ConnType {
     Tor,
     Unknown,
 }
-
 
 /// Maximum IPC frame size (body). Matches the previous hand-rolled guard;
 /// `LengthDelimitedCodec` rejects anything larger so a malformed/hostile peer

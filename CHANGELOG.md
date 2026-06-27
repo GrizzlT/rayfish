@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Mesh SSH (`ray firewall ssh`)** — Tailscale-style SSH with no SSH keys to
+  manage. `ray firewall ssh on` runs an embedded SSH server on this node's mesh
+  IPs (port 22); `ray firewall ssh allow <network> <peer>` authorizes a peer
+  (hostname, mesh IP, short id, or `*` for any peer on the network) to log in.
+  Connect with a stock client: `ssh user@host.ray`. The connecting peer is
+  identified by its mesh identity (already proven by the encrypted mesh link), so
+  there are no `authorized_keys` to distribute. For now an authorized peer may log
+  in as any local user, including root. `ray firewall ssh deny` revokes an entry;
+  `ray firewall ssh show` lists state and per-network allow lists. As a security
+  prerequisite, inbound mesh packets whose source IP is not the sending peer's
+  assigned mesh address are now dropped (ingress anti-spoofing), so no peer can
+  forge another's mesh IP.
 - **`ray ping <peer>`** — active mesh diagnostics: sends live echo probes to a
   peer (by hostname, mesh IP, or short id) and reports per-probe round-trip
   latency, packet loss, and whether the path is direct or relayed. `-c/--count`

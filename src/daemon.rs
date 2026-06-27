@@ -1226,6 +1226,13 @@ pub struct DaemonState {
     resolver: std::sync::Arc<crate::dns_resolver::Resolver>,
     /// Cancellation token for the `run_resolv_reassert` task (Linux direct mode).
     dns_reassert_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    /// Live per-network SSH allow lists for the embedded mesh SSH server. Swapped
+    /// atomically on `ray firewall ssh allow/deny`, so a running listener picks up
+    /// changes without restart. See [`crate::ssh`].
+    ssh_authz: crate::ssh::SshAuthz,
+    /// Cancellation token for the running SSH listeners (`None` when off / on
+    /// standby). Set by [`DaemonState::start_ssh`], cleared by `stop_ssh`.
+    ssh_token: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
     /// Promotion signal: a co-coordinator's per-peer control reader sends the
     /// network name here after persisting an `AdminGrant` key, and the main
     /// daemon loop ([`serve_ipc`]) drains it into
@@ -1379,6 +1386,7 @@ impl DaemonState {
                 | IpcMessage::FirewallShow
                 | IpcMessage::FirewallSuggestions { .. }
                 | IpcMessage::FirewallPending { .. }
+                | IpcMessage::FirewallSshShow
                 | IpcMessage::ListFiles
                 | IpcMessage::Connections
                 | IpcMessage::ContactId
@@ -1520,6 +1528,13 @@ impl DaemonState {
             IpcMessage::FirewallAutoAccept { network, enabled } => {
                 self.firewall_auto_accept(&network, enabled)
             }
+            IpcMessage::FirewallSshSet { enabled } => self.firewall_ssh_set(enabled),
+            IpcMessage::FirewallSshAllow {
+                network,
+                peer,
+                allow,
+            } => self.firewall_ssh_allow(&network, &peer, allow).await,
+            IpcMessage::FirewallSshShow => self.firewall_ssh_show(),
             IpcMessage::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await
             }
@@ -1758,6 +1773,7 @@ impl DaemonState {
             auto_accept_firewall: false,
             admins: vec![],
             direct,
+            ssh_allow: vec![],
         })?;
 
         let cancel = self.shutdown_token.child_token();
@@ -2825,6 +2841,9 @@ impl DaemonState {
                 .unwrap_or(false),
             admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
             direct: net_config.map(|nc| nc.direct).unwrap_or(false),
+            ssh_allow: net_config
+                .map(|nc| nc.ssh_allow.clone())
+                .unwrap_or_default(),
         })?;
 
         let cancel = self.shutdown_token.child_token();
@@ -3105,6 +3124,53 @@ impl DaemonState {
     /// Activate the VPN: bring the TUN interface up, configure system DNS.
     /// Idempotent — a no-op if already active. Runs entirely inside the
     /// (root) daemon, so the IPC client needs no privileges.
+    /// Rebuild the live per-network SSH allow-list snapshot from persisted
+    /// config, so a running listener authorizes against current rules. Cheap and
+    /// only called on SSH config changes / activation (not the hot path).
+    fn rebuild_ssh_authz(&self) {
+        let mut map = std::collections::HashMap::new();
+        if let Ok(cfg) = config::load() {
+            for n in &cfg.networks {
+                if !n.ssh_allow.is_empty() {
+                    map.insert(n.name.clone(), n.ssh_allow.clone());
+                }
+            }
+        }
+        self.ssh_authz.store(std::sync::Arc::new(map));
+    }
+
+    /// Start the embedded mesh SSH listeners on this node's mesh addresses, if
+    /// not already running. Idempotent. Bound to the data plane: called from
+    /// `activate` when `ssh_enabled`, and from the `ssh on` IPC while active.
+    fn start_ssh(self: &Arc<Self>) {
+        let mut guard = self.ssh_token.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let token = tokio_util::sync::CancellationToken::new();
+        *guard = Some(token.clone());
+        drop(guard);
+        self.rebuild_ssh_authz();
+        let my_v4 = self.identity.local_ip();
+        let my_v6 = derive_ipv6(&self.identity.local_identity());
+        let server = crate::ssh::SshServer::new(
+            self.peers.clone(),
+            self.device_user_map.clone(),
+            self.ssh_authz.clone(),
+        );
+        server.spawn(
+            vec![std::net::IpAddr::V4(my_v4), std::net::IpAddr::V6(my_v6)],
+            token,
+        );
+    }
+
+    /// Stop the SSH listeners if running. Idempotent.
+    fn stop_ssh(&self) {
+        if let Some(t) = self.ssh_token.lock().unwrap().take() {
+            t.cancel();
+        }
+    }
+
     async fn activate(self: &Arc<Self>, hostname: Option<String>) -> IpcMessage {
         // Persist the personal default hostname first (before the already-active
         // short-circuit) so `ray up --hostname X` records the new default even
@@ -3204,6 +3270,12 @@ impl DaemonState {
             }
         }
 
+        // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
+        // port 22, so it follows the data plane (mesh addresses must be up).
+        if config::load().map(|c| c.ssh_enabled).unwrap_or(false) {
+            self.start_ssh();
+        }
+
         tracing::info!("data plane activated");
         if warnings.is_empty() {
             IpcMessage::Ok {
@@ -3234,6 +3306,9 @@ impl DaemonState {
         if let Some(rt) = self.dns_reassert_token.lock().unwrap().take() {
             rt.cancel();
         }
+
+        // The SSH listeners bind the mesh IPs, which go down with the data plane.
+        self.stop_ssh();
 
         // Revert system DNS (extract the configurator before reverting so the
         // mutex guard isn't held across the call).
@@ -3638,9 +3713,7 @@ impl DaemonState {
             Some(r) => r,
             None => {
                 return IpcMessage::Error {
-                    message: format!(
-                        "{display} is not connected (no live mesh link to {ip})"
-                    ),
+                    message: format!("{display} is not connected (no live mesh link to {ip})"),
                 };
             }
         };
@@ -5162,11 +5235,123 @@ impl DaemonState {
             tracing::warn!(error = %e, "failed to persist firewall config");
         }
         IpcMessage::Ok {
+            message: format!("fail-fast reject {}", if enabled { "on" } else { "off" }),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Mesh SSH (`ray firewall ssh ...`)
+    // -----------------------------------------------------------------------
+
+    /// Toggle the embedded mesh SSH server. Persists `ssh_enabled`, seeds/removes
+    /// the `allow in tcp:22` passthrough so SSH packets reach the listener under
+    /// the deny-inbound default, and starts/stops the listeners if the data plane
+    /// is active.
+    fn firewall_ssh_set(self: &Arc<Self>, enabled: bool) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to load config: {e}"),
+                };
+            }
+        };
+        app_config.ssh_enabled = enabled;
+        if let Err(e) = config::save_settings(&app_config) {
+            return IpcMessage::Error {
+                message: format!("failed to persist ssh setting: {e}"),
+            };
+        }
+        // Open/close port 22 at the packet layer; SSH-layer authz is the real gate.
+        let fw = self.firewall.set_ssh_passthrough(enabled);
+        if let Err(e) = firewall::save_firewall(&fw) {
+            tracing::warn!(error = %e, "failed to persist firewall config");
+        }
+        // Reflect immediately if the data plane is up (else activate() starts it).
+        if self.active.load(Ordering::SeqCst) {
+            if enabled {
+                self.start_ssh();
+            } else {
+                self.stop_ssh();
+            }
+        }
+        IpcMessage::Ok {
+            message: format!("mesh SSH {}", if enabled { "on" } else { "off" }),
+        }
+    }
+
+    /// Add or remove a peer from a network's SSH allow list. `peer` is `*` (any
+    /// peer on the network) or a name/ip/short-id resolved to a user identity.
+    async fn firewall_ssh_allow(&self, network: &str, peer: &str, allow: bool) -> IpcMessage {
+        let mut app_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                return IpcMessage::Error {
+                    message: format!("failed to load config: {e}"),
+                };
+            }
+        };
+        if !app_config.networks.iter().any(|n| n.name == network) {
+            return IpcMessage::Error {
+                message: format!("no such network: {network}"),
+            };
+        }
+        // Resolve the peer to a stored allow-entry: `*` stays literal, otherwise
+        // resolve to the peer's user-identity hex (what the SSH server matches).
+        let entry = if peer == "*" {
+            "*".to_string()
+        } else {
+            match self.resolve_peer_name(peer).await {
+                Some(id) => id.to_string(),
+                None => {
+                    return IpcMessage::Error {
+                        message: format!("could not resolve peer: {peer}"),
+                    };
+                }
+            }
+        };
+        let net = app_config
+            .networks
+            .iter_mut()
+            .find(|n| n.name == network)
+            .expect("network presence checked above");
+        if allow {
+            if !net.ssh_allow.contains(&entry) {
+                net.ssh_allow.push(entry.clone());
+            }
+        } else {
+            net.ssh_allow.retain(|e| e != &entry);
+        }
+        let net = net.clone();
+        if let Err(e) = config::save_network(&net) {
+            return IpcMessage::Error {
+                message: format!("failed to persist network config: {e}"),
+            };
+        }
+        // Push the change to any live listener.
+        self.rebuild_ssh_authz();
+        IpcMessage::Ok {
             message: format!(
-                "fail-fast reject {}",
-                if enabled { "on" } else { "off" }
+                "ssh {} {peer} on {network}",
+                if allow { "allow" } else { "deny" }
             ),
         }
+    }
+
+    /// Report the SSH server state + per-network allow lists.
+    fn firewall_ssh_show(&self) -> IpcMessage {
+        let (enabled, networks) = match config::load() {
+            Ok(c) => (
+                c.ssh_enabled,
+                c.networks
+                    .into_iter()
+                    .filter(|n| !n.ssh_allow.is_empty())
+                    .map(|n| (n.name, n.ssh_allow))
+                    .collect(),
+            ),
+            Err(_) => (false, Vec::new()),
+        };
+        IpcMessage::FirewallSshState { enabled, networks }
     }
 
     // -----------------------------------------------------------------------
@@ -5746,6 +5931,8 @@ async fn build_daemon(
         dns_configurator: Arc::new(std::sync::Mutex::new(None)),
         resolver: dns_resolver.clone(),
         dns_reassert_token: std::sync::Mutex::new(None),
+        ssh_authz: crate::ssh::new_authz(),
+        ssh_token: std::sync::Mutex::new(None),
         promote_tx,
     });
 
@@ -5754,11 +5941,7 @@ async fn build_daemon(
 
     // --- Contact record publisher (ray connect) ---
     if let Ok(pkarr_client) = dht::create_pkarr_client(&daemon.endpoint) {
-        spawn_contact_publisher(
-            pkarr_client,
-            daemon.endpoint.id(),
-            token.clone(),
-        );
+        spawn_contact_publisher(pkarr_client, daemon.endpoint.id(), token.clone());
     }
     let metrics_server =
         spawn_metrics_server(stats, daemon.peers.clone(), &daemon.endpoint, token).await;
@@ -7234,6 +7417,7 @@ async fn join_mesh_shared(
         auto_accept_firewall,
         admins: vec![],
         direct,
+        ssh_allow: vec![],
     })?;
 
     // On reconnect/restore the coordinator hasn't seen our hostname this session,
@@ -7407,11 +7591,21 @@ async fn join_mesh_shared(
                     _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
                 }
                 reconverge_and_apply(
-                    &endpoint_w, &blob_store, &peers_w, net_pubkey_w,
-                    &network_name, &live_state, my_identity_w,
-                    &hostname_table_w, &reverse_table_w, &firewall_w,
-                    &alpn_w, my_ip_w, &device_cert_w,
-                ).await;
+                    &endpoint_w,
+                    &blob_store,
+                    &peers_w,
+                    net_pubkey_w,
+                    &network_name,
+                    &live_state,
+                    my_identity_w,
+                    &hostname_table_w,
+                    &reverse_table_w,
+                    &firewall_w,
+                    &alpn_w,
+                    my_ip_w,
+                    &device_cert_w,
+                )
+                .await;
             }
         }
     });

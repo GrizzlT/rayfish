@@ -41,6 +41,10 @@ pub(crate) enum InboundDecision {
     DropFirewall(firewall::PacketInfo),
     /// Dropped: too large or not a parseable IP packet.
     DropMalformed,
+    /// Dropped: the packet's source IP is not the sending peer's assigned mesh
+    /// address. A peer may only source packets from its own mesh IP, so this
+    /// blocks one peer from impersonating another's IP (ingress anti-spoofing).
+    DropSpoof,
 }
 
 /// Pure evaluation of an inbound peer datagram against the firewall and basic
@@ -52,6 +56,8 @@ pub(crate) fn evaluate_inbound(
     packet: &[u8],
     firewall: &SharedFirewall,
     peer_id: &EndpointId,
+    peer_ip: Ipv4Addr,
+    peer_ipv6: std::net::Ipv6Addr,
     network: &str,
 ) -> InboundDecision {
     if packet.len() > MAX_PEER_DATAGRAM {
@@ -60,6 +66,17 @@ pub(crate) fn evaluate_inbound(
     let Some(info) = firewall::parse_packet_info(packet) else {
         return InboundDecision::DropMalformed;
     };
+    // Ingress anti-spoofing: a peer may only inject packets sourced from its own
+    // assigned mesh address. Anything else (e.g. one peer forging another's mesh
+    // IP) is dropped before the firewall or any in-daemon listener sees it, so
+    // identity-from-source-IP (used by mesh SSH) stays trustworthy.
+    let src_ok = match info.src_ip {
+        IpAddr::V4(v4) => v4 == peer_ip,
+        IpAddr::V6(v6) => v6 == peer_ipv6,
+    };
+    if !src_ok {
+        return InboundDecision::DropSpoof;
+    }
     if firewall
         .evaluate_packet(Direction::In, &info, peer_id, Some(network))
         .is_deny()
@@ -242,7 +259,9 @@ pub fn spawn_peer_reader(
             };
 
             let peer_user = device_user_map.resolve(&peer_id);
-            match evaluate_inbound(&datagram, &firewall, &peer_user, &network) {
+            match evaluate_inbound(
+                &datagram, &firewall, &peer_user, peer_ip, peer_ipv6, &network,
+            ) {
                 InboundDecision::Accept => {
                     stats.record_rx(datagram.len());
                     if tun_tx.send(datagram).await.is_err() {
@@ -264,6 +283,13 @@ pub fn spawn_peer_reader(
                     }
                 }
                 InboundDecision::DropMalformed => stats.record_drop(DropReason::Malformed),
+                InboundDecision::DropSpoof => {
+                    stats.record_drop(DropReason::Spoof);
+                    tracing::debug!(
+                        peer = %peer_id.fmt_short(),
+                        "dropped inbound packet with spoofed source IP"
+                    );
+                }
             }
         }
     };
@@ -331,10 +357,17 @@ mod tests {
         assert!(info.dst_ip.is_ipv6());
     }
 
+    /// Mesh address the test packets are sourced from; passed to
+    /// `evaluate_inbound` as the sending peer's assigned IP so the ingress
+    /// anti-spoof check passes.
+    const TEST_V4: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
+    const TEST_V6: std::net::Ipv6Addr = std::net::Ipv6Addr::UNSPECIFIED;
+
     fn make_tcp_packet(dst_port: u16) -> Vec<u8> {
         let mut p = vec![0u8; 24];
         p[0] = 0x45; // IPv4, IHL=5
         p[9] = 6; // TCP
+        p[12..16].copy_from_slice(&[100, 64, 0, 5]); // src ip (TEST_V4)
         p[16..20].copy_from_slice(&[100, 64, 0, 3]); // dst ip
         p[20] = 0;
         p[21] = 80; // src port 80
@@ -358,7 +391,7 @@ mod tests {
         let peer = iroh::SecretKey::generate().public();
         let huge = vec![0u8; MAX_PEER_DATAGRAM + 1];
         assert!(matches!(
-            evaluate_inbound(&huge, &fw, &peer, "test-net"),
+            evaluate_inbound(&huge, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropMalformed
         ));
     }
@@ -371,7 +404,7 @@ mod tests {
         pkt[0] = 0x60; // IPv6
         pkt[6] = 6; // TCP
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &peer, "test-net"),
+            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
     }
@@ -394,11 +427,11 @@ mod tests {
         let blocked = make_tcp_packet(22);
         let allowed = make_tcp_packet(80);
         assert!(matches!(
-            evaluate_inbound(&blocked, &fw, &peer, "test-net"),
+            evaluate_inbound(&blocked, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
         assert!(matches!(
-            evaluate_inbound(&allowed, &fw, &peer, "test-net"),
+            evaluate_inbound(&allowed, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::Accept
         ));
     }
@@ -411,7 +444,7 @@ mod tests {
         let fw = SharedFirewall::new(firewall::FirewallConfig::default());
         let pkt = make_tcp_packet(443);
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &peer, "test-net"),
+            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::DropFirewall(_)
         ));
     }
@@ -425,9 +458,37 @@ mod tests {
         let mut pkt = vec![0u8; 28];
         pkt[0] = 0x45; // IPv4, IHL=5
         pkt[9] = 1; // ICMP
+        pkt[12..16].copy_from_slice(&[100, 64, 0, 5]); // src ip (TEST_V4)
         pkt[16..20].copy_from_slice(&[100, 64, 0, 3]); // dst ip
         assert!(matches!(
-            evaluate_inbound(&pkt, &fw, &peer, "test-net"),
+            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
+            InboundDecision::Accept
+        ));
+    }
+
+    #[test]
+    fn inbound_spoofed_source_ip_dropped() {
+        // A packet whose source IP isn't the sending peer's assigned mesh IP is
+        // dropped as spoofed, before the firewall or any in-daemon listener sees
+        // it — even when the firewall would otherwise allow it.
+        let peer = iroh::SecretKey::generate().public();
+        let fw = inbound_fw(Action::Allow, vec![]);
+        let pkt = make_tcp_packet(80); // sourced from TEST_V4 (100.64.0.5)
+        // Same packet, but the peer is supposedly assigned a different IP.
+        assert!(matches!(
+            evaluate_inbound(
+                &pkt,
+                &fw,
+                &peer,
+                Ipv4Addr::new(100, 64, 0, 9),
+                TEST_V6,
+                "test-net"
+            ),
+            InboundDecision::DropSpoof
+        ));
+        // With the matching peer IP it passes.
+        assert!(matches!(
+            evaluate_inbound(&pkt, &fw, &peer, TEST_V4, TEST_V6, "test-net"),
             InboundDecision::Accept
         ));
     }
@@ -475,12 +536,26 @@ mod tests {
             }],
         );
         assert!(matches!(
-            evaluate_inbound(&make_tcp_packet(8080), &fw, &peer, "test-net"),
+            evaluate_inbound(
+                &make_tcp_packet(8080),
+                &fw,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
             InboundDecision::Accept
         ));
         // A different port stays denied.
         assert!(matches!(
-            evaluate_inbound(&make_tcp_packet(9090), &fw, &peer, "test-net"),
+            evaluate_inbound(
+                &make_tcp_packet(9090),
+                &fw,
+                &peer,
+                TEST_V4,
+                TEST_V6,
+                "test-net"
+            ),
             InboundDecision::DropFirewall(_)
         ));
     }

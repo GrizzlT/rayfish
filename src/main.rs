@@ -518,6 +518,45 @@ enum FirewallAction {
         /// `on` or `off`
         state: String,
     },
+    /// Embedded mesh SSH server (Tailscale-style): SSH into this node by mesh
+    /// identity, no SSH keys. `ssh on` starts the server; `ssh allow <net> <peer>`
+    /// authorizes a peer to log in. Connect with a stock client: `ssh user@host.ray`.
+    Ssh {
+        #[command(subcommand)]
+        action: SshAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SshAction {
+    /// Start the embedded mesh SSH server on this node (listens on the mesh IPs'
+    /// port 22; opens tcp:22 in the local firewall).
+    On,
+    /// Stop the mesh SSH server (removes the tcp:22 passthrough).
+    Off,
+    /// Authorize a peer to SSH into this node over a network. `peer` is a
+    /// hostname, mesh IP, short id, or `*` (any peer on the network).
+    #[command(visible_alias = "ok")]
+    Allow {
+        /// Network name
+        network: String,
+        /// Peer (hostname / mesh IP / short id) or `*`
+        peer: String,
+    },
+    /// Revoke a peer's SSH authorization on a network.
+    #[command(visible_aliases = ["rm", "del"])]
+    Deny {
+        /// Network name
+        network: String,
+        /// Peer (hostname / mesh IP / short id) or `*`
+        peer: String,
+    },
+    /// Show the mesh SSH server state and per-network allow lists.
+    #[command(visible_aliases = ["ls", "list"])]
+    Show {
+        /// Optional network to filter to
+        network: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -923,7 +962,11 @@ fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
                 }
             }
         }
-        ConfigAction::Set { key, value, replace } => {
+        ConfigAction::Set {
+            key,
+            value,
+            replace,
+        } => {
             let mut cfg = config::load()?;
             config::config_set(&mut cfg, &key, &value, replace)?;
             config::save_settings(&cfg)?;
@@ -2213,6 +2256,9 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
     if let FirewallAction::Pending { network } = action {
         return ipc_firewall_pending(&network).await;
     }
+    if let FirewallAction::Ssh { action } = action {
+        return ipc_firewall_ssh(action).await;
+    }
     let mut stream = ipc::connect().await?;
     let req = match action {
         FirewallAction::Add {
@@ -2254,7 +2300,9 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
             ipc::IpcMessage::FirewallAutoAccept { network, enabled }
         }
         // Handled above by early return (need extra round trips / interaction).
-        FirewallAction::Suggest { .. } | FirewallAction::Pending { .. } => unreachable!(),
+        FirewallAction::Suggest { .. }
+        | FirewallAction::Pending { .. }
+        | FirewallAction::Ssh { .. } => unreachable!(),
     };
     ipc::send(&mut stream, req).await?;
     let resp = ipc::recv(&mut stream).await?;
@@ -2276,7 +2324,11 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
             } else {
                 print!(
                     "{}",
-                    render_firewall_rules(Some((default_inbound, default_outbound)), reject, &rules)
+                    render_firewall_rules(
+                        Some((default_inbound, default_outbound)),
+                        reject,
+                        &rules
+                    )
                 );
             }
         }
@@ -2284,6 +2336,79 @@ async fn ipc_firewall(action: FirewallAction) -> Result<()> {
         other => eprintln!("Unexpected response: {:?}", other),
     }
     Ok(())
+}
+
+/// `ray firewall ssh ...`: toggle the embedded mesh SSH server and manage
+/// per-network allow lists.
+async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
+    let mut filter: Option<String> = None;
+    let req = match action {
+        SshAction::On => ipc::IpcMessage::FirewallSshSet { enabled: true },
+        SshAction::Off => ipc::IpcMessage::FirewallSshSet { enabled: false },
+        SshAction::Allow { network, peer } => ipc::IpcMessage::FirewallSshAllow {
+            network,
+            peer,
+            allow: true,
+        },
+        SshAction::Deny { network, peer } => ipc::IpcMessage::FirewallSshAllow {
+            network,
+            peer,
+            allow: false,
+        },
+        SshAction::Show { network } => {
+            filter = network;
+            ipc::IpcMessage::FirewallSshShow
+        }
+    };
+    let mut stream = ipc::connect().await?;
+    ipc::send(&mut stream, req).await?;
+    let resp = ipc::recv(&mut stream).await?;
+    match resp {
+        ipc::IpcMessage::Ok { message } => println!("{message}"),
+        ipc::IpcMessage::FirewallSshState { enabled, networks } => {
+            render_ssh_state(enabled, networks, filter.as_deref())
+        }
+        ipc::IpcMessage::Error { message } => print_error("firewall ssh", &message, None),
+        other => eprintln!("Unexpected response: {other:?}"),
+    }
+    Ok(())
+}
+
+/// Render `ray firewall ssh show` output (or JSON), optionally filtered to one
+/// network.
+fn render_ssh_state(enabled: bool, networks: Vec<(String, Vec<String>)>, filter: Option<&str>) {
+    let networks: Vec<(String, Vec<String>)> = networks
+        .into_iter()
+        .filter(|(n, _)| filter.is_none_or(|f| f == n))
+        .collect();
+    if json_enabled() {
+        print_json(&serde_json::json!({
+            "enabled": enabled,
+            "networks": networks.iter().map(|(n, a)| serde_json::json!({
+                "network": n,
+                "allow": a,
+            })).collect::<Vec<_>>(),
+        }));
+        return;
+    }
+    println!("mesh SSH: {}", if enabled { "on" } else { "off" });
+    if networks.is_empty() {
+        println!("  (no SSH allow rules)");
+        return;
+    }
+    for (net, allow) in &networks {
+        let entries: Vec<String> = allow
+            .iter()
+            .map(|e| {
+                if e == "*" || e.len() <= 12 {
+                    e.clone()
+                } else {
+                    format!("{}…", &e[..12])
+                }
+            })
+            .collect();
+        println!("  {net}: {}", entries.join(", "));
+    }
 }
 
 /// Print a JSON value as one compact line to stdout (jq-friendly).
@@ -3529,7 +3654,13 @@ async fn print_pending_changelog(
     // surface its body. (A semver walk doesn't apply: nightlies share a version,
     // and a pinned target may be a downgrade.)
     if nightly || pinned {
-        if release.body.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        if release
+            .body
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
             return;
         }
         println!("\nRelease notes for {}:", release.tag_name);
@@ -3725,7 +3856,10 @@ async fn cmd_update(
     let latest = normalize_version(&tag);
     // Human label for messages: nightly carries its commit in the release name.
     let remote_label = if nightly {
-        release.name.clone().unwrap_or_else(|| "nightly".to_string())
+        release
+            .name
+            .clone()
+            .unwrap_or_else(|| "nightly".to_string())
     } else {
         format!("v{latest}")
     };
@@ -4192,8 +4326,11 @@ mod tests {
     #[test]
     fn empty_firewall_says_no_rules() {
         style::set_plain(true);
-        let out =
-            render_firewall_rules(Some((firewall::Action::Deny, firewall::Action::Allow)), false, &[]);
+        let out = render_firewall_rules(
+            Some((firewall::Action::Deny, firewall::Action::Allow)),
+            false,
+            &[],
+        );
         assert!(out.contains("default in   deny"));
         assert!(out.contains("default out  allow"));
         assert!(out.contains("(no rules)"));
