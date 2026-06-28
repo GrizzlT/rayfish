@@ -32,10 +32,20 @@ use tracing::{debug, info, warn};
 
 use crate::peers::{DeviceUserMap, PeerTable};
 
-/// Port the embedded SSH server listens on. Fixed at 22 so a stock `ssh` client
-/// needs no `-p`. Bound only on the mesh IPs, so a host sshd on other interfaces
-/// is untouched (and SO_REUSEADDR/PORT lets the two coexist on the common case).
-const SSH_PORT: u16 = 22;
+/// The port a stock `ssh` client targets (`ssh user@host.ray`). We can't bind it
+/// directly: when a host sshd already holds `0.0.0.0:22`, the kernel rejects a
+/// more-specific `<mesh-ip>:22` bind over the wildcard listener (EADDRINUSE,
+/// regardless of SO_REUSEADDR/REUSEPORT). So the daemon binds [`SSH_LISTEN_PORT`]
+/// and rewrites mesh `:22` <-> that port in its own forwarding path
+/// ([`crate::forward`]), entirely in userspace — portable across Linux/macOS/
+/// Windows, no OS firewall rules. The host sshd keeps `:22` on every other
+/// interface untouched.
+pub const SSH_PORT: u16 = 22;
+
+/// Internal port the embedded SSH server binds (all platforms). Mesh `:22` is
+/// translated to/from this port by the userspace NAT in `forward.rs`. Distinct
+/// from the iroh listen port (41383).
+pub const SSH_LISTEN_PORT: u16 = 41384;
 
 /// Per-network SSH authorization snapshot: network name -> allow list, where
 /// each entry is a peer's user-identity (hex [`EndpointId`]) or `"*"` (any peer
@@ -77,9 +87,10 @@ impl SshServer {
         }
     }
 
-    /// Spawn a listener on each mesh address. Runs until `token` is cancelled.
-    /// A bind failure on one address (e.g. a host sshd already holds port 22) is
-    /// logged and skipped, never fatal.
+    /// Spawn a listener on each mesh address (at [`SSH_LISTEN_PORT`]). Runs until
+    /// `token` is cancelled. Mesh `:22` is mapped to this port by the userspace
+    /// NAT in `forward.rs`, so a stock client connects on `:22` while the host
+    /// sshd keeps `:22` on every other interface.
     pub fn spawn(self, addrs: Vec<IpAddr>, token: CancellationToken) {
         tokio::spawn(async move {
             let key = match load_or_generate_host_key() {
@@ -99,14 +110,14 @@ impl SshServer {
                 ..Default::default()
             });
             for addr in addrs {
-                let listener = match bind_listener(addr, SSH_PORT) {
+                let listener = match bind_listener(addr, SSH_LISTEN_PORT) {
                     Ok(l) => l,
                     Err(e) => {
-                        warn!(%addr, error = %e, "mesh SSH: cannot bind port 22 (host sshd?); skipping");
+                        warn!(%addr, port = SSH_LISTEN_PORT, error = %e, "mesh SSH: cannot bind listener; skipping");
                         continue;
                     }
                 };
-                info!(%addr, "mesh SSH listening on port 22");
+                info!(%addr, port = SSH_LISTEN_PORT, "mesh SSH listening (reachable as :22)");
                 let peers = self.peers.clone();
                 let dum = self.device_user_map.clone();
                 let authz = self.authz.clone();

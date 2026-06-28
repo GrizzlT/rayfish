@@ -9,6 +9,7 @@
 #   firewall      3-peer suggested-firewall + rule matrix (tests/e2e/firewall)
 #   closed-net    3-peer admission + lifecycle commands (tests/e2e/closed-net)
 #   dns           2-peer Magic DNS resolution + resolv.conf takeover (tests/e2e/dns)
+#   ssh           2-peer mesh SSH (`ray firewall ssh`) allow/deny matrix (tests/e2e/ssh)
 #   bench         throughput / latency benchmark        (tests/bench)
 #
 # Actions:
@@ -44,6 +45,9 @@ scenario_meta(){
                  LABELS=(srv-a srv-b srv-c) ;;
     dns)         DIR="$ROOT/tests/e2e/dns"
                  NAMES=(rayfish-dns-a rayfish-dns-b)
+                 LABELS=(srv-a srv-b) ;;
+    ssh)         DIR="$ROOT/tests/e2e/ssh"
+                 NAMES=(rayfish-ssh-a rayfish-ssh-b)
                  LABELS=(srv-a srv-b) ;;
     bench)       DIR="$ROOT/tests/bench"
                  NAMES=(rayfish-bench-a rayfish-bench-b)
