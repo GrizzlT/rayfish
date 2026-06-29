@@ -57,27 +57,76 @@ pub const SSH_PORT: u16 = 22;
 /// collide with a kernel-assigned ephemeral port on an unrelated local flow.
 pub const SSH_LISTEN_PORT: u16 = 30022;
 
-/// Per-network SSH authorization snapshot: network name -> allow list, where
-/// each entry is a peer's user-identity (hex [`EndpointId`]) or `"*"` (any peer
-/// on that network). Held in an [`ArcSwap`] so `ray firewall ssh allow/deny`
-/// updates are picked up by a live listener without a restart.
-pub type SshAuthz = Arc<ArcSwap<HashMap<String, Vec<String>>>>;
+/// Per-network SSH authorization snapshot: network name -> the network's SSH
+/// allow rules (peer + permitted login users). Held in an [`ArcSwap`] so
+/// `ray firewall ssh allow/deny` updates are picked up by a live listener
+/// without a restart.
+pub type SshAuthz = Arc<ArcSwap<HashMap<String, Vec<crate::config::SshRule>>>>;
 
 /// Build an empty authorization snapshot.
 pub fn new_authz() -> SshAuthz {
     Arc::new(ArcSwap::from_pointee(HashMap::new()))
 }
 
-/// Decide whether `user` (a peer's user identity) may open an SSH session, given
-/// the networks we currently share with it. Authorized iff some shared network's
-/// allow list contains the peer's identity or `"*"`.
-fn is_authorized(authz: &SshAuthz, user: &EndpointId, networks: &[SmolStr]) -> bool {
+/// The set of local unix accounts a peer may log in as, accumulated across the
+/// networks shared with it. `*` (any user, including root) wins over everything;
+/// an allow rule with no explicit users grants the non-root default; explicit
+/// usernames grant exactly those. The per-user check is by **uid** so a uid-0
+/// account under a non-`root` name can't slip past the non-root default.
+#[derive(Default, Debug, PartialEq)]
+struct UserPolicy {
+    /// Some rule matched this peer (it may open a session at all).
+    matched: bool,
+    /// A rule granted `*`: any user, including root.
+    any: bool,
+    /// A rule granted the default (no explicit users): any non-root user.
+    nonroot: bool,
+    /// Explicitly named users.
+    users: std::collections::HashSet<String>,
+}
+
+impl UserPolicy {
+    /// Fold one matching rule's `users` list into the policy.
+    fn add(&mut self, users: &[String]) {
+        self.matched = true;
+        if users.iter().any(|u| u == "*") {
+            self.any = true;
+        } else if users.is_empty() {
+            self.nonroot = true;
+        } else {
+            self.users.extend(users.iter().cloned());
+        }
+    }
+
+    /// Whether the peer is authorized to open a session at all (before the
+    /// per-user check). No matching rule => reject every auth attempt.
+    fn authorized(&self) -> bool {
+        self.matched
+    }
+
+    /// Whether the requested login (`name`, resolved to `uid`) is permitted.
+    fn permits(&self, name: &str, uid: u32) -> bool {
+        self.any || self.users.contains(name) || (self.nonroot && uid != 0)
+    }
+}
+
+/// Accumulate the login policy for `user` (a peer's user identity) across the
+/// networks we currently share with it: every allow rule whose `peer` is `"*"`
+/// or this identity contributes its permitted users.
+fn resolve_user_policy(authz: &SshAuthz, user: &EndpointId, networks: &[SmolStr]) -> UserPolicy {
     let map = authz.load();
     let id = user.to_string();
-    networks.iter().any(|net| {
-        map.get(net.as_str())
-            .is_some_and(|list| list.iter().any(|e| e == "*" || e == &id))
-    })
+    let mut policy = UserPolicy::default();
+    for net in networks {
+        if let Some(rules) = map.get(net.as_str()) {
+            for rule in rules {
+                if rule.peer == "*" || rule.peer == id {
+                    policy.add(&rule.users);
+                }
+            }
+        }
+    }
+    policy
 }
 
 /// Handle to a running SSH server so the daemon can stop it on `ray down` /
@@ -196,9 +245,9 @@ async fn handle_conn(
         return;
     };
     let user_identity = device_user_map.resolve(&peer_id);
-    let authorized = is_authorized(&authz, &user_identity, &networks);
-    debug!(%src, peer = %user_identity.fmt_short(), authorized, "mesh SSH connection");
-    let handler = SshHandler::new(authorized, user_identity);
+    let policy = resolve_user_policy(&authz, &user_identity, &networks);
+    debug!(%src, peer = %user_identity.fmt_short(), authorized = policy.authorized(), "mesh SSH connection");
+    let handler = SshHandler::new(policy, user_identity);
     match russh::server::run_stream(config, stream, handler).await {
         Ok(session) => {
             let _ = session.await;
@@ -214,14 +263,19 @@ struct PtyReq {
     row: u16,
 }
 
-/// Per-connection SSH handler. Authorization is precomputed from the peer
-/// identity before the handshake; `auth_none` just returns it.
+/// Per-connection SSH handler. The peer's login policy is precomputed from its
+/// identity before the handshake; `auth_none` resolves the requested unix user
+/// and checks it against that policy.
 struct SshHandler {
-    authorized: bool,
+    /// Which local users this peer may log in as (computed at connect time).
+    policy: UserPolicy,
     /// The connecting peer's user identity (for logging).
     user: EndpointId,
     /// The unix user the client asked to log in as (the `user` in `user@host`).
     login_user: String,
+    /// The resolved login account, set in `auth_none` once the requested user
+    /// passes the policy, so the session task doesn't re-run `getpwnam`.
+    login: Option<LoginInfo>,
     pty: Option<PtyReq>,
     channel: Option<Channel<Msg>>,
     /// Set once a shell/exec session starts; forwards window-resize events to
@@ -230,11 +284,12 @@ struct SshHandler {
 }
 
 impl SshHandler {
-    fn new(authorized: bool, user: EndpointId) -> Self {
+    fn new(policy: UserPolicy, user: EndpointId) -> Self {
         Self {
-            authorized,
+            policy,
             user,
             login_user: String::new(),
+            login: None,
             pty: None,
             channel: None,
             resize_tx: None,
@@ -248,9 +303,14 @@ impl SshHandler {
         let Some(channel) = self.channel.take() else {
             return;
         };
+        // `login` is set in `auth_none` once the requested user is authorized;
+        // a session can't reach here without a successful auth, so this holds.
+        let Some(info) = self.login.take() else {
+            return;
+        };
         let channel_id = channel.id();
         let handle = session.handle();
-        let login_user = self.login_user.clone();
+        let login_name = info.name.clone();
         let pty = self.pty.take();
         let peer = self.user;
         let (resize_tx, resize_rx) = mpsc::unbounded_channel();
@@ -261,18 +321,13 @@ impl SshHandler {
             // cmd` with no -t) use plain pipes so stdout/stderr aren't merged or
             // CRLF-translated, matching a conventional sshd.
             let result = match pty {
-                Some(pty_req) => {
-                    run_pty_session(channel, &login_user, command, pty_req, resize_rx).await
-                }
-                None => {
-                    run_pipe_session(channel, handle.clone(), channel_id, &login_user, command)
-                        .await
-                }
+                Some(pty_req) => run_pty_session(channel, info, command, pty_req, resize_rx).await,
+                None => run_pipe_session(channel, handle.clone(), channel_id, info, command).await,
             };
             let code = match result {
                 Ok(c) => c,
                 Err(e) => {
-                    warn!(peer = %peer.fmt_short(), user = %login_user, error = %e, "mesh SSH session failed");
+                    warn!(peer = %peer.fmt_short(), user = %login_name, error = %e, "mesh SSH session failed");
                     1
                 }
             };
@@ -288,11 +343,29 @@ impl Handler for SshHandler {
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
         self.login_user = user.to_string();
-        if self.authorized {
-            Ok(Auth::Accept)
-        } else {
+        if !self.policy.authorized() {
             info!(peer = %self.user.fmt_short(), "mesh SSH: rejecting unauthorized peer");
-            Ok(Auth::reject())
+            return Ok(Auth::reject());
+        }
+        // Resolve the requested account so the per-user policy is enforced by
+        // uid (a uid-0 account under a non-`root` name can't bypass the non-root
+        // default). An unknown user is rejected here rather than failing later
+        // after a shell spawn. The resolved info is reused by the session task.
+        match resolve_login(user) {
+            Ok(info) if self.policy.permits(user, info.uid) => {
+                self.login = Some(info);
+                Ok(Auth::Accept)
+            }
+            Ok(info) => {
+                info!(peer = %self.user.fmt_short(), user, uid = info.uid,
+                    "mesh SSH: peer not permitted to log in as this user");
+                Ok(Auth::reject())
+            }
+            Err(e) => {
+                debug!(peer = %self.user.fmt_short(), user, error = %e,
+                    "mesh SSH: requested login user not found");
+                Ok(Auth::reject())
+            }
         }
     }
 
@@ -440,12 +513,11 @@ fn login_env<'a>(home: &Path, shell: &Path, name: &str) -> [(&'a str, std::ffi::
 /// exits. Returns the child's exit code.
 async fn run_pty_session(
     channel: Channel<Msg>,
-    login_user: &str,
+    info: LoginInfo,
     command: Option<String>,
     pty_req: PtyReq,
     mut resize_rx: mpsc::UnboundedReceiver<pty_process::Size>,
 ) -> Result<u32> {
-    let info = resolve_login(login_user)?;
     let drop = drop_privs(info.uid, info.gid, &info.name)?;
 
     let (pty, pts) = pty_process::open().context("opening pty")?;
@@ -511,10 +583,9 @@ async fn run_pipe_session(
     channel: Channel<Msg>,
     handle: Handle,
     channel_id: ChannelId,
-    login_user: &str,
+    info: LoginInfo,
     command: Option<String>,
 ) -> Result<u32> {
-    let info = resolve_login(login_user)?;
     let drop = drop_privs(info.uid, info.gid, &info.name)?;
 
     let mut cmd = tokio::process::Command::new(&info.shell);
@@ -629,6 +700,13 @@ mod tests {
         iroh::SecretKey::from(b).public()
     }
 
+    fn rule(peer: &str, users: &[&str]) -> crate::config::SshRule {
+        crate::config::SshRule {
+            peer: peer.to_string(),
+            users: users.iter().map(|u| u.to_string()).collect(),
+        }
+    }
+
     #[test]
     fn authz_matches_identity_and_wildcard_per_network() {
         let alice = id(1);
@@ -636,22 +714,64 @@ mod tests {
         let authz = new_authz();
         let mut map = HashMap::new();
         // `net1` authorizes alice explicitly; `net2` authorizes any peer.
-        map.insert("net1".to_string(), vec![alice.to_string()]);
-        map.insert("net2".to_string(), vec!["*".to_string()]);
+        map.insert("net1".to_string(), vec![rule(&alice.to_string(), &[])]);
+        map.insert("net2".to_string(), vec![rule("*", &[])]);
         authz.store(Arc::new(map));
 
+        let authorized = |u, nets: &[&str]| {
+            let nets: Vec<SmolStr> = nets.iter().map(|n| SmolStr::new(n)).collect();
+            resolve_user_policy(&authz, u, &nets).authorized()
+        };
         // alice on net1 → allowed; bob on net1 → denied.
-        assert!(is_authorized(&authz, &alice, &[SmolStr::new("net1")]));
-        assert!(!is_authorized(&authz, &bob, &[SmolStr::new("net1")]));
+        assert!(authorized(&alice, &["net1"]));
+        assert!(!authorized(&bob, &["net1"]));
         // wildcard on net2 → anyone allowed.
-        assert!(is_authorized(&authz, &bob, &[SmolStr::new("net2")]));
+        assert!(authorized(&bob, &["net2"]));
         // a network with no allow list → denied.
-        assert!(!is_authorized(&authz, &alice, &[SmolStr::new("net3")]));
+        assert!(!authorized(&alice, &["net3"]));
         // union across shared networks: alice shares net3 (no rule) + net2 (*).
-        assert!(is_authorized(
-            &authz,
-            &alice,
-            &[SmolStr::new("net3"), SmolStr::new("net2")]
-        ));
+        assert!(authorized(&alice, &["net3", "net2"]));
+    }
+
+    #[test]
+    fn user_policy_default_is_nonroot() {
+        // An allow rule with no explicit users grants any non-root user but not
+        // root, enforced by uid (so a uid-0 account under any name is blocked).
+        let alice = id(1);
+        let authz = new_authz();
+        authz.store(Arc::new(HashMap::from([(
+            "net".to_string(),
+            vec![rule(&alice.to_string(), &[])],
+        )])));
+        let p = resolve_user_policy(&authz, &alice, &[SmolStr::new("net")]);
+        assert!(p.permits("deploy", 1000), "non-root user allowed");
+        assert!(!p.permits("root", 0), "root (uid 0) blocked by default");
+        assert!(!p.permits("toor", 0), "any uid-0 account blocked, not just 'root'");
+    }
+
+    #[test]
+    fn user_policy_explicit_and_wildcard() {
+        let alice = id(1);
+        let authz = new_authz();
+        // net1: alice may only be `deploy`; net2: alice may be any user (`*`).
+        authz.store(Arc::new(HashMap::from([
+            ("net1".to_string(), vec![rule(&alice.to_string(), &["deploy"])]),
+            ("net2".to_string(), vec![rule(&alice.to_string(), &["*"])]),
+        ])));
+
+        // Only net1 shared → just `deploy`, root and others denied.
+        let p = resolve_user_policy(&authz, &alice, &[SmolStr::new("net1")]);
+        assert!(p.permits("deploy", 1000));
+        assert!(!p.permits("ci", 1001));
+        assert!(!p.permits("root", 0));
+
+        // net2 shared → `*` wins, even root.
+        let p = resolve_user_policy(&authz, &alice, &[SmolStr::new("net2")]);
+        assert!(p.permits("root", 0));
+
+        // Union: explicit `deploy` (net1) + `*` (net2) → `*` dominates.
+        let p = resolve_user_policy(&authz, &alice, &[SmolStr::new("net1"), SmolStr::new("net2")]);
+        assert!(p.permits("root", 0));
+        assert!(p.permits("anyone", 1234));
     }
 }

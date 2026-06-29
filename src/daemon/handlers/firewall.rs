@@ -431,10 +431,14 @@ impl DaemonState {
 
     /// Add or remove a peer from a network's SSH allow list. `peer` is `*` (any
     /// peer on the network) or a name/ip/short-id resolved to a user identity.
+    /// On allow, `users` is the set of local accounts the peer may log in as
+    /// (empty = any non-root user; `"*"` = any incl. root) and **replaces** the
+    /// peer's prior users. On deny, the peer's rule is dropped (`users` ignored).
     pub(crate) async fn firewall_ssh_allow(
         &self,
         network: &str,
         peer: &str,
+        users: Vec<String>,
         allow: bool,
     ) -> IpcMessage {
         let mut app_config = match config::load() {
@@ -474,11 +478,18 @@ impl DaemonState {
             .find(|n| n.name == network)
             .expect("network presence checked above");
         if allow {
-            if !net.ssh_allow.contains(&entry) {
-                net.ssh_allow.push(entry.clone());
+            // Normalize: a `*` collapses the list to just `*` (any incl. root);
+            // otherwise dedupe. Empty = the non-root default.
+            let users = normalize_ssh_users(users);
+            match net.ssh_allow.iter_mut().find(|r| r.peer == entry) {
+                Some(r) => r.users = users,
+                None => net.ssh_allow.push(config::SshRule {
+                    peer: entry.clone(),
+                    users,
+                }),
             }
         } else {
-            net.ssh_allow.retain(|e| e != &entry);
+            net.ssh_allow.retain(|r| r.peer != entry);
         }
         let net = net.clone();
         if let Err(e) = config::save_network(&net) {
@@ -488,12 +499,18 @@ impl DaemonState {
         }
         // Push the change to any live listener.
         self.rebuild_ssh_authz();
-        IpcMessage::Ok {
-            message: format!(
-                "ssh {} {peer} on {network}",
-                if allow { "allow" } else { "deny" }
-            ),
-        }
+        let detail = if allow {
+            let r = net.ssh_allow.iter().find(|r| r.peer == entry);
+            let as_users = match r.map(|r| r.users.as_slice()) {
+                Some([]) | None => " as any non-root user".to_string(),
+                Some(u) if u.iter().any(|x| x == "*") => " as any user".to_string(),
+                Some(u) => format!(" as {}", u.join(",")),
+            };
+            format!("ssh allow {peer} on {network}{as_users}")
+        } else {
+            format!("ssh deny {peer} on {network}")
+        };
+        IpcMessage::Ok { message: detail }
     }
 
     /// Report the SSH server state + per-network allow lists.
@@ -504,11 +521,33 @@ impl DaemonState {
                 c.networks
                     .into_iter()
                     .filter(|n| !n.ssh_allow.is_empty())
-                    .map(|n| (n.name, n.ssh_allow))
+                    .map(|n| {
+                        let allow = n
+                            .ssh_allow
+                            .into_iter()
+                            .map(|r| ray_proto::ipc::SshAllowView {
+                                peer: r.peer,
+                                users: r.users,
+                            })
+                            .collect();
+                        (n.name, allow)
+                    })
                     .collect(),
             ),
             Err(_) => (false, Vec::new()),
         };
         IpcMessage::FirewallSshState { enabled, networks }
     }
+}
+
+/// Normalize an SSH allow rule's user list: a `*` (any user incl. root) collapses
+/// the whole list to just `*`; otherwise sort + dedupe. An empty list is left
+/// empty, meaning "any non-root user" (the secure default).
+fn normalize_ssh_users(mut users: Vec<String>) -> Vec<String> {
+    if users.iter().any(|u| u == "*") {
+        return vec!["*".to_string()];
+    }
+    users.sort();
+    users.dedup();
+    users
 }

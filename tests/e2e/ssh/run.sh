@@ -98,14 +98,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "5. ray firewall ssh allow ssh srv-b — srv-b can now log in"
+step "5. ray firewall ssh allow srv-b — default grants any non-root user only"
+# Create a plain user on srv-a; the default allow (no --user) permits non-root
+# logins but must NOT permit root.
+on "$A" 'id meshtest >/dev/null 2>&1 || useradd -m -s /bin/bash meshtest' >/dev/null 2>&1
 on "$A" "ray firewall ssh allow $NET srv-b" | strip | sed 's/^/   a| /'
-OUT="$(ssh_try "$B" "$A_IP" whoami)"
+# root is denied under the default (non-root) policy.
+OUT="$(ssh_try "$B" "$A_IP" whoami root)"
 echo "$OUT" | sed 's/^/   b| /'
-echo "$OUT" | grep -qi '^root' && pass "authorized srv-b logged in (whoami == root)" \
-  || fail "authorized srv-b could not log in: $OUT"
+echo "$OUT" | grep -qiE 'permission denied|authentication fail' \
+  && pass "root login denied under the non-root default" \
+  || fail "root login should have been denied under the default: $OUT"
+# meshtest (non-root) is admitted.
+OUT="$(ssh_try "$B" "$A_IP" whoami meshtest)"
+echo "$OUT" | sed 's/^/   b| /'
+echo "$OUT" | grep -qi '^meshtest' && pass "non-root srv-b logged in (whoami == meshtest)" \
+  || fail "non-root srv-b could not log in: $OUT"
 # exec path with a distinctive marker.
-OUT="$(ssh_try "$B" "$A_IP" 'echo ray-ssh-ok-$((6*7))')"
+OUT="$(ssh_try "$B" "$A_IP" 'echo ray-ssh-ok-$((6*7))' meshtest)"
 echo "$OUT" | sed 's/^/   b| /'
 echo "$OUT" | grep -q 'ray-ssh-ok-42' && pass "exec command runs over mesh SSH" \
   || fail "exec command did not run: $OUT"
@@ -113,10 +123,9 @@ echo "$OUT" | grep -q 'ray-ssh-ok-42' && pass "exec command runs over mesh SSH" 
 # ---------------------------------------------------------------------------
 step "5b. privilege drop — login as a non-root user sheds the daemon's groups"
 # The daemon runs as root (groups include 0/root). A correct privilege drop calls
-# initgroups so the spawned shell gets ONLY the target user's groups. Create a
-# plain user on srv-a and log in as it; `id` must not show root's group.
-on "$A" 'id meshtest >/dev/null 2>&1 || useradd -m -s /bin/bash meshtest' >/dev/null 2>&1
-IDOUT="$(ssh_try "$B" "$A_IP" id "meshtest")"
+# initgroups so the spawned shell gets ONLY the target user's groups. `id` for
+# meshtest must not show root's group.
+IDOUT="$(ssh_try "$B" "$A_IP" id meshtest)"
 echo "$IDOUT" | sed 's/^/   b| /'
 if echo "$IDOUT" | grep -q 'uid=[0-9]*(meshtest)'; then
   if echo "$IDOUT" | grep -qE '\(root\)|groups=.*\b0\('; then
@@ -135,26 +144,34 @@ step "5c. piped exec output is untranslated (no PTY CRLF)"
 # of a command that prints one newline: pipe path = 0, PTY path = 1.
 CR="$(on "$B" "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o BatchMode=yes -o ConnectTimeout=8 -o PreferredAuthentications=none,publickey \
-  root@$A_IP echo hi 2>/dev/null | tr -cd '\r' | wc -c | tr -d ' '")"
+  meshtest@$A_IP echo hi 2>/dev/null | tr -cd '\r' | wc -c | tr -d ' '")"
 echo "   b| carriage-returns in output: ${CR:-?}"
 [[ "${CR:-1}" == "0" ]] && pass "non-PTY exec output is byte-clean (no CRLF translation)" \
   || fail "non-PTY exec output was CRLF-translated (CR count=${CR:-?})"
 
 # ---------------------------------------------------------------------------
-step "6. ray firewall ssh deny ssh srv-b — access revoked"
+step "5d. --user '*' grants root explicitly"
+on "$A" "ray firewall ssh allow $NET srv-b --user '*'" | strip | sed 's/^/   a| /'
+OUT="$(ssh_try "$B" "$A_IP" whoami root)"
+echo "$OUT" | sed 's/^/   b| /'
+echo "$OUT" | grep -qi '^root' && pass "root login allowed once '*' is granted" \
+  || fail "root login should be allowed with --user '*': $OUT"
+
+# ---------------------------------------------------------------------------
+step "6. ray firewall ssh deny srv-b — access revoked"
 on "$A" "ray firewall ssh deny $NET srv-b" | strip | sed 's/^/   a| /'
-OUT="$(ssh_try "$B" "$A_IP" whoami)"
+OUT="$(ssh_try "$B" "$A_IP" whoami meshtest)"
 echo "$OUT" | sed 's/^/   b| /'
 echo "$OUT" | grep -qiE 'permission denied|authentication fail' \
   && pass "revoked srv-b is rejected again" \
   || fail "revoked srv-b was not rejected: $OUT"
 
 # ---------------------------------------------------------------------------
-step "7. wildcard allow (*) admits any peer on the network"
-on "$A" "ray firewall ssh allow $NET '*'" | strip | sed 's/^/   a| /'
-OUT="$(ssh_try "$B" "$A_IP" whoami)"
+step "7. wildcard peer allow (* with --user '*') admits any peer as any user"
+on "$A" "ray firewall ssh allow $NET '*' --user '*'" | strip | sed 's/^/   a| /'
+OUT="$(ssh_try "$B" "$A_IP" whoami root)"
 echo "$OUT" | sed 's/^/   b| /'
-echo "$OUT" | grep -qi '^root' && pass "wildcard allow admits srv-b" \
+echo "$OUT" | grep -qi '^root' && pass "wildcard allow admits srv-b as root" \
   || fail "wildcard allow did not admit srv-b: $OUT"
 
 # ---------------------------------------------------------------------------

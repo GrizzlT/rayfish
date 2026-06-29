@@ -1604,8 +1604,9 @@ impl DaemonState {
             IpcMessage::FirewallSshAllow {
                 network,
                 peer,
+                users,
                 allow,
-            } => self.firewall_ssh_allow(&network, &peer, allow).await,
+            } => self.firewall_ssh_allow(&network, &peer, users, allow).await,
             IpcMessage::FirewallSshShow => self.firewall_ssh_show(),
             IpcMessage::SetHostname { network, hostname } => {
                 self.set_hostname(&network, &hostname).await

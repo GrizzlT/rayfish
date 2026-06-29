@@ -100,14 +100,20 @@ async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
     let req = match action {
         SshAction::On => ipc::IpcMessage::FirewallSshSet { enabled: true },
         SshAction::Off => ipc::IpcMessage::FirewallSshSet { enabled: false },
-        SshAction::Allow { network, peer } => ipc::IpcMessage::FirewallSshAllow {
+        SshAction::Allow {
             network,
             peer,
+            user,
+        } => ipc::IpcMessage::FirewallSshAllow {
+            network,
+            peer,
+            users: user,
             allow: true,
         },
         SshAction::Deny { network, peer } => ipc::IpcMessage::FirewallSshAllow {
             network,
             peer,
+            users: vec![],
             allow: false,
         },
         SshAction::Show { network } => {
@@ -131,8 +137,12 @@ async fn ipc_firewall_ssh(action: SshAction) -> Result<()> {
 
 /// Render `ray firewall ssh show` output (or JSON), optionally filtered to one
 /// network.
-fn render_ssh_state(enabled: bool, networks: Vec<(String, Vec<String>)>, filter: Option<&str>) {
-    let networks: Vec<(String, Vec<String>)> = networks
+fn render_ssh_state(
+    enabled: bool,
+    networks: Vec<(String, Vec<ipc::SshAllowView>)>,
+    filter: Option<&str>,
+) {
+    let networks: Vec<(String, Vec<ipc::SshAllowView>)> = networks
         .into_iter()
         .filter(|(n, _)| filter.is_none_or(|f| f == n))
         .collect();
@@ -141,7 +151,10 @@ fn render_ssh_state(enabled: bool, networks: Vec<(String, Vec<String>)>, filter:
             "enabled": enabled,
             "networks": networks.iter().map(|(n, a)| serde_json::json!({
                 "network": n,
-                "allow": a,
+                "allow": a.iter().map(|r| serde_json::json!({
+                    "peer": r.peer,
+                    "users": r.users,
+                })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         }));
         return;
@@ -154,15 +167,24 @@ fn render_ssh_state(enabled: bool, networks: Vec<(String, Vec<String>)>, filter:
     for (net, allow) in &networks {
         let entries: Vec<String> = allow
             .iter()
-            .map(|e| {
-                if e == "*" || e.len() <= 12 {
-                    e.clone()
+            .map(|r| {
+                let peer = if r.peer == "*" || r.peer.len() <= 12 {
+                    r.peer.clone()
                 } else {
-                    format!("{}…", &e[..12])
-                }
+                    format!("{}…", &r.peer[..12])
+                };
+                // Empty users = the non-root default; `*` = any user incl. root.
+                let users = if r.users.is_empty() {
+                    "any non-root user".to_string()
+                } else if r.users.iter().any(|u| u == "*") {
+                    "any user".to_string()
+                } else {
+                    r.users.join(",")
+                };
+                format!("{peer} → {users}")
             })
             .collect();
-        println!("  {net}: {}", entries.join(", "));
+        println!("  {net}: {}", entries.join("; "));
     }
 }
 

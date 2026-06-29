@@ -549,6 +549,10 @@ pub(crate) enum SshAction {
         network: String,
         /// Peer (hostname / mesh IP / short id) or `*`
         peer: String,
+        /// Local unix users this peer may log in as (comma-separated). Omit for
+        /// any non-root user; pass `*` for any user including root.
+        #[arg(long = "user", short = 'u', value_delimiter = ',')]
+        user: Vec<String>,
     },
     /// Revoke a peer's SSH authorization on a network.
     #[command(visible_aliases = ["rm", "del"])]

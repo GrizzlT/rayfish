@@ -131,10 +131,14 @@ pub enum IpcMessage {
     },
     /// Add (`allow=true`) or remove (`allow=false`) a peer from a network's SSH
     /// allow list. `peer` is a resolved peer EndpointId (hex) or `"*"` (any peer
-    /// on the network). `ray firewall ssh allow|deny <network> <peer>`.
+    /// on the network). `users` are the local accounts the peer may log in as on
+    /// allow (empty = any non-root user, `"*"` = any incl. root); ignored on
+    /// deny, which drops the peer's rule. `ray firewall ssh allow|deny <net> <peer>`.
     FirewallSshAllow {
         network: String,
         peer: String,
+        #[serde(default)]
+        users: Vec<String>,
         allow: bool,
     },
     /// Read the SSH server state + per-network allow lists (open read).
@@ -345,11 +349,11 @@ pub enum IpcMessage {
         rules: Vec<FirewallRuleView>,
     },
     /// Embedded mesh SSH state (reply to `FirewallSshShow`): whether the server
-    /// is enabled, and each network's allow list (`*` or peer short-ids/hex).
+    /// is enabled, and each network's allow list.
     FirewallSshState {
         enabled: bool,
-        /// `(network, allow-entries)`; entries are `"*"` or peer identities.
-        networks: Vec<(String, Vec<String>)>,
+        /// `(network, allow-entries)` for networks with at least one rule.
+        networks: Vec<(String, Vec<SshAllowView>)>,
     },
     FileList {
         files: Vec<PendingFileInfo>,
@@ -411,6 +415,15 @@ pub struct FirewallRuleView {
     /// `Some(net)` if this rule was suggested by network `net`; `None` if local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_by: Option<String>,
+}
+
+/// One mesh-SSH allow entry as shown by `ray firewall ssh show`. `peer` is `"*"`
+/// or a peer identity (hex); `users` is the permitted login accounts (empty =
+/// any non-root user, `"*"` = any incl. root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshAllowView {
+    pub peer: String,
+    pub users: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -139,11 +139,24 @@ pub struct NetworkConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub direct: bool,
     /// Peers authorized to SSH into this node over this network's mesh link
-    /// (`ray firewall ssh allow <net> <peer>`). Each entry is a peer EndpointId
-    /// (hex), or `"*"` to authorize any peer on the network. Only consulted when
-    /// the global `ssh_enabled` toggle is on. Empty = no peer may SSH in.
+    /// (`ray firewall ssh allow <net> <peer>`). Only consulted when the global
+    /// `ssh_enabled` toggle is on. Empty = no peer may SSH in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ssh_allow: Vec<String>,
+    pub ssh_allow: Vec<SshRule>,
+}
+
+/// One mesh-SSH authorization entry: a peer and the local unix users it may log
+/// in as. `peer` is a peer's user-identity (hex [`EndpointId`]) or `"*"` (any
+/// peer on the network). `users` lists the permitted login accounts; an **empty
+/// list means any non-root user** (the secure default), and `"*"` in the list
+/// means any user including root. Setting a peer's rule replaces its `users`
+/// (last write wins); the SSH server folds rules across shared networks at
+/// login (see [`crate::ssh`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshRule {
+    pub peer: String,
+    #[serde(default)]
+    pub users: Vec<String>,
 }
 
 fn default_true() -> bool {
