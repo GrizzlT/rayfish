@@ -312,7 +312,9 @@ pub async fn run_mesh(
         }
         tracing::debug!(dst = %info.dst_ip, "routing to peer");
         // SSH NAT: rewrite our reply's source port (listen -> 22) so the peer
-        // sees it as coming from `:22`. Only copies when it actually matches.
+        // sees it as coming from `:22`. The cheap pre-check (TCP + source port ==
+        // listen port) gates the copy; `rewrite_ssh_port` still confirms the
+        // source IP is ours and no-ops otherwise, so ordinary traffic is untouched.
         let pkt = if ssh_nat().is_some_and(|n| info.protocol == 6 && info.src_port == n.listen_port)
         {
             let mut v = pkt.to_vec();

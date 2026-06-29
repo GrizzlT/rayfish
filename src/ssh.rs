@@ -12,10 +12,14 @@
 //! Authorization is the only gate; SSH auth itself is the `none` method (the
 //! identity is already proven). For now an authorized peer may log in as any
 //! local unix user, including root — tighter user-mapping is future work.
+//!
+//! Authorization is evaluated once, when the connection is accepted, so
+//! `ray firewall ssh allow/deny` changes apply to *new* sessions; an
+//! already-established session is not torn down by a later `deny`.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,9 +44,10 @@ use crate::peers::{DeviceUserMap, PeerTable};
 /// more-specific `<mesh-ip>:22` bind over the wildcard listener (EADDRINUSE,
 /// regardless of SO_REUSEADDR/REUSEPORT). So the daemon binds [`SSH_LISTEN_PORT`]
 /// and rewrites mesh `:22` <-> that port in its own forwarding path
-/// ([`crate::forward`]), entirely in userspace — portable across Linux/macOS/
-/// Windows, no OS firewall rules. The host sshd keeps `:22` on every other
-/// interface untouched.
+/// ([`crate::forward`]), entirely in userspace — no OS firewall rules, portable
+/// across the platforms rayfish's TUN runs on (Linux and macOS; the session
+/// teardown uses Unix-only privilege-drop syscalls). The host sshd keeps `:22`
+/// on every other interface untouched.
 pub const SSH_PORT: u16 = 22;
 
 /// Internal port the embedded SSH server binds (all platforms). Mesh `:22` is
@@ -417,7 +422,7 @@ fn drop_privs(
 }
 
 /// Apply the common login environment to a command builder.
-fn login_env<'a>(home: &PathBuf, shell: &PathBuf, name: &str) -> [(&'a str, std::ffi::OsString); 5] {
+fn login_env<'a>(home: &Path, shell: &Path, name: &str) -> [(&'a str, std::ffi::OsString); 5] {
     [
         ("HOME", home.into()),
         ("USER", name.into()),
@@ -536,6 +541,11 @@ async fn run_pipe_session(
     let mut stdout = child.stdout.take().context("child stdout")?;
     let mut stderr = child.stderr.take().context("child stderr")?;
 
+    // Output goes out via `handle.data`/`extended_data` (the stream can't emit
+    // the separate stderr extended-data channel), so we only need the read half
+    // for client stdin. Dropping the write half here is safe: `tokio::io::split`
+    // keeps the underlying channel alive until *both* halves drop, and the
+    // close-on-drop lives on the read half, which `stdin_task` holds open.
     let stream = channel.into_stream();
     let (mut chan_read, _chan_write) = tokio::io::split(stream);
 
