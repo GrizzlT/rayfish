@@ -713,12 +713,7 @@ struct Resolvconf {
 
 #[cfg(target_os = "linux")]
 fn try_resolvconf() -> Option<Resolvconf> {
-    use std::path::Path;
     use std::process::Command;
-    let paths = ["/sbin/resolvconf", "/usr/sbin/resolvconf"];
-    if !paths.iter().any(|p| Path::new(p).exists()) {
-        return None;
-    }
     let variant = match Command::new("resolvconf").arg("--version").output() {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -729,7 +724,7 @@ fn try_resolvconf() -> Option<Resolvconf> {
                 ResolvconfVariant::Debian
             }
         }
-        Err(_) => ResolvconfVariant::Debian,
+        Err(_) => return None,
     };
     Some(Resolvconf { variant })
 }
