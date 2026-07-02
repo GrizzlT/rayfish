@@ -2,6 +2,8 @@
 //! connect-all, activate/deactivate (data plane), teardown, leave. Split out of `daemon/mod.rs`.
 
 use super::super::*;
+use std::net::IpAddr;
+use std::sync::RwLock;
 
 /// The membership a coordinator restores at startup, sourced from the signed
 /// `GroupBlob` (authoritative) or the stale config roster as a fallback.
@@ -180,12 +182,19 @@ impl DaemonState {
             auto_accept_firewall: net_config
                 .map(|nc| nc.auto_accept_firewall)
                 .unwrap_or(false),
+            auto_accept_files: net_config
+                .map(|nc| nc.auto_accept_files)
+                .unwrap_or(false),
             admins: net_config.map(|nc| nc.admins.clone()).unwrap_or_default(),
             direct: net_config.map(|nc| nc.direct).unwrap_or(false),
+            ssh_allow: net_config
+                .map(|nc| nc.ssh_allow.clone())
+                .unwrap_or_default(),
+            aliases: net_config.map(|nc| nc.aliases.clone()).unwrap_or_default(),
         })?;
 
         let cancel = self.shutdown_token.child_token();
-        let state = Arc::new(std::sync::RwLock::new(net_state));
+        let state = Arc::new(RwLock::new(net_state));
         let invite_lock = Arc::new(tokio::sync::Mutex::new(()));
         let dht_notify = Arc::new(tokio::sync::Notify::new());
         let (tasks, disconnect_tx) =
@@ -342,6 +351,122 @@ impl DaemonState {
         self.leave_network(name).await
     }
 
+    /// Remove a member from a closed network. Coordinator-only (any network-key
+    /// holder). Prunes the target from the roster + approved list, republishes the
+    /// signed blob, and broadcasts a `MemberSync` so every member reconverges and
+    /// drops the target mesh-wide (`prune_departed_peers`); the coordinator also
+    /// closes its own link to the target immediately. Refused on open networks
+    /// (the target would auto-re-join) and against coordinators / self.
+    pub(crate) async fn kick_member(&self, network: &str, peer: &str) -> IpcMessage {
+        let (state, dht_notify, has_key, mode) = match self.networks.get(network) {
+            Some(h) => {
+                let (has_key, mode) = {
+                    let s = h.state.read().unwrap();
+                    (s.network_secret_key.is_some(), s.mode)
+                };
+                (h.state.clone(), h.dht_notify.clone(), has_key, mode)
+            }
+            None => {
+                return IpcMessage::Error {
+                    message: format!("network '{network}' not found"),
+                };
+            }
+        };
+        if !has_key {
+            return IpcMessage::Error {
+                message: "only a coordinator (network key holder) can kick a member".to_string(),
+            };
+        }
+        if mode == GroupMode::Open {
+            return IpcMessage::Error {
+                message: format!(
+                    "'{network}' is an open network — a kicked peer can re-join immediately. \
+                     Kicking only takes effect on a closed network."
+                ),
+            };
+        }
+
+        // Resolve the argument to a roster member. `resolve_peer_name` may hand
+        // back a transport id or a user identity; match either against the stored
+        // member key (which is the user identity for a paired peer).
+        let candidate = match self.resolve_peer_name(peer).await {
+            Some(id) => id,
+            None => {
+                return IpcMessage::Error {
+                    message: format!("could not resolve peer '{peer}'"),
+                };
+            }
+        };
+        let candidate_user = self.device_user_map.resolve(&candidate);
+        let (member_id, member_ip, is_coord, display) = {
+            let s = state.read().unwrap();
+            match s
+                .members
+                .all()
+                .into_iter()
+                .find(|m| m.identity == candidate || m.identity == candidate_user)
+            {
+                Some(m) => (
+                    m.identity,
+                    m.ip,
+                    m.is_coordinator,
+                    m.hostname.clone().unwrap_or_else(|| m.identity.fmt_short().to_string()),
+                ),
+                None => {
+                    return IpcMessage::Error {
+                        message: format!("'{peer}' is not a member of '{network}'"),
+                    };
+                }
+            }
+        };
+        if member_id == self.endpoint.id() {
+            return IpcMessage::Error {
+                message: "cannot kick yourself — use `ray leave` or `ray nuke`".to_string(),
+            };
+        }
+        if is_coord {
+            return IpcMessage::Error {
+                message: format!(
+                    "'{display}' is a coordinator (holds the network key); kicking can't remove \
+                     its access. Revoke the key instead."
+                ),
+            };
+        }
+
+        // Prune the roster + approved list, then republish the signed blob so the
+        // removal is authoritative, and drop the target's DNS entries.
+        {
+            let mut s = state.write().unwrap();
+            s.members.remove(&member_id);
+            s.approved.remove(&member_id);
+        }
+        dns::remove_hostname_by_ip(
+            &self.hostname_table,
+            &self.reverse_table,
+            network,
+            member_ip,
+        )
+        .await;
+        update_snapshot_and_publish(&state, &self.blob_store, &dht_notify).await;
+        broadcast_member_sync(&self.peers, None).await;
+
+        // Sever our own link(s) to the target now, rather than waiting for it to
+        // time out. Other members drop it when they reconverge from the freshly
+        // published record (`prune_departed_peers`).
+        for (pid, ip, conn) in self.peers.peers_for_network_with_conn(network) {
+            if pid == member_id || self.device_user_map.resolve(&pid) == member_id {
+                conn.close(VarInt::from_u32(forward::KICK_CODE), b"kicked from network");
+                self.peers
+                    .remove_peer_from_network(&ip, &derive_ipv6(&pid), network);
+            }
+        }
+
+        tracing::info!(peer = %member_id.fmt_short(), network = %network, "kicked member");
+        IpcMessage::Ok {
+            message: format!("kicked '{display}' from '{network}'"),
+        }
+    }
+
     /// Connect to every saved network (control plane). Run once at daemon
     /// startup so mesh connections follow the daemon lifecycle, not the data
     /// plane: `ray down` keeps these connected so the node stays online to
@@ -381,6 +506,7 @@ impl DaemonState {
                 let name = net.name.clone();
                 let persisted_hostname = net.my_hostname.clone();
                 let net_auto_accept = net.auto_accept_firewall;
+                let net_auto_accept_files = net.auto_accept_files;
                 let net_pubkey = match &net.network_public_key {
                     Some(k) => k.to_string(),
                     None => {
@@ -398,6 +524,7 @@ impl DaemonState {
                             None,
                             None,
                             net_auto_accept,
+                            net_auto_accept_files,
                             false,
                         )
                         .await
@@ -429,6 +556,56 @@ impl DaemonState {
         }
 
         tracing::info!(networks = count, "control plane connected");
+    }
+
+    /// Rebuild the live per-network SSH allow-list snapshot from persisted
+    /// config, so a running listener authorizes against current rules. Cheap and
+    /// only called on SSH config changes / activation (not the hot path).
+    pub(crate) fn rebuild_ssh_authz(&self) {
+        let mut map = HashMap::new();
+        if let Ok(cfg) = config::load() {
+            for n in &cfg.networks {
+                if !n.ssh_allow.is_empty() {
+                    map.insert(n.name.clone(), n.ssh_allow.clone());
+                }
+            }
+        }
+        self.ssh_authz.store(Arc::new(map));
+    }
+
+    /// Start the embedded mesh SSH listeners on this node's mesh addresses, if
+    /// not already running. Idempotent. Bound to the data plane: called from
+    /// `activate` when `ssh_enabled`, and from the `ssh on` IPC while active.
+    pub(crate) fn start_ssh(self: &Arc<Self>) {
+        let mut guard = self.ssh_token.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let token = CancellationToken::new();
+        *guard = Some(token.clone());
+        drop(guard);
+        self.rebuild_ssh_authz();
+        let my_v4 = self.identity.local_ip();
+        let my_v6 = derive_ipv6(&self.identity.local_identity());
+        let server = crate::ssh::SshServer::new(
+            self.peers.clone(),
+            self.device_user_map.clone(),
+            self.ssh_authz.clone(),
+        );
+        server.spawn(
+            vec![IpAddr::V4(my_v4), IpAddr::V6(my_v6)],
+            token,
+        );
+        // Turn on the userspace port NAT so mesh `:22` reaches the listener.
+        crate::forward::set_ssh_nat_active(true);
+    }
+
+    /// Stop the SSH listeners if running. Idempotent.
+    pub(crate) fn stop_ssh(&self) {
+        crate::forward::set_ssh_nat_active(false);
+        if let Some(t) = self.ssh_token.lock().unwrap().take() {
+            t.cancel();
+        }
     }
 
     /// Activate the VPN: bring the TUN interface up, configure system DNS.
@@ -501,6 +678,12 @@ impl DaemonState {
 
         self.configure_magic_dns(&mut warnings).await;
 
+        // Start the embedded mesh SSH server if enabled. It binds the mesh IPs'
+        // port 22, so it follows the data plane (mesh addresses must be up).
+        if config::load().map(|c| c.ssh_enabled).unwrap_or(false) {
+            self.start_ssh();
+        }
+
         tracing::info!("data plane activated");
         if warnings.is_empty() {
             IpcMessage::Ok {
@@ -540,7 +723,7 @@ impl DaemonState {
                 // program (NetworkManager, dhclient) overwrites it (inotify watch).
                 #[cfg(target_os = "linux")]
                 if is_direct {
-                    let rt = tokio_util::sync::CancellationToken::new();
+                    let rt = CancellationToken::new();
                     *self.dns_reassert_token.lock().unwrap() = Some(rt.clone());
                     tokio::spawn(dns_config::run_resolv_reassert(search, rt));
                 }
@@ -571,6 +754,9 @@ impl DaemonState {
         if let Some(rt) = self.dns_reassert_token.lock().unwrap().take() {
             rt.cancel();
         }
+
+        // The SSH listeners bind the mesh IPs, which go down with the data plane.
+        self.stop_ssh();
 
         // Revert system DNS (extract the configurator before reverting so the
         // mutex guard isn't held across the call).

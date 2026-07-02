@@ -2,8 +2,8 @@
 // integration tests and benchmarks can reach them; this binary is the CLI/IPC
 // client built on top.
 use rayfish::{
-    DNS_DOMAIN, apply, config, daemon, firewall, identity, invite, ipc, layout, logdir, membership,
-    onepassword, picker, progress, shutdown, stats, style,
+    DNS_DOMAIN, apply, config, daemon, firewall, hostname, identity, invite, ipc, layout, logdir,
+    membership, onepassword, picker, progress, shutdown, stats, style,
 };
 
 use std::sync::{Arc, atomic};
@@ -88,6 +88,11 @@ pub(crate) enum Command {
         /// it, suggestions queue for `ray firewall accept`.
         #[arg(long)]
         auto_accept_firewall: bool,
+        /// Auto-accept incoming file transfers from your own paired devices on
+        /// this network (no manual `ray files accept`). Only offers whose sender
+        /// is one of your own devices are accepted.
+        #[arg(long)]
+        auto_accept_files: bool,
     },
     /// Leave a network (remove from saved config)
     #[command(visible_alias = "rm")]
@@ -102,6 +107,14 @@ pub(crate) enum Command {
         /// Force destroy even if other members exist
         #[arg(long)]
         force: bool,
+    },
+    /// Remove a member from a closed network (coordinator only)
+    #[command(visible_alias = "boot")]
+    Kick {
+        /// Network name
+        network: String,
+        /// Member to remove: hostname, mesh IP, or short id
+        peer: String,
     },
     /// Show status of all networks (active + saved)
     #[command(visible_aliases = ["st", "ls"])]
@@ -205,6 +218,15 @@ pub(crate) enum Command {
         network: String,
         #[command(subcommand)]
         action: AdminAction,
+    },
+    /// Manage local, per-network aliases (a friendly name for a user identity).
+    /// Node-local and display-only: shown inline in `ray status` and used to seed
+    /// a `ray apply` spec's `aliases:` map. Never published to the network.
+    Alias {
+        /// Network name
+        network: String,
+        #[command(subcommand)]
+        action: AliasAction,
     },
     /// Manage local device firewall rules
     Firewall {
@@ -391,6 +413,27 @@ pub(crate) enum AdminAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum AliasAction {
+    /// Bind an alias to a user. `key` is an identity string (from `ray
+    /// identityof`) or a currently-joined hostname, resolved to its identity.
+    Set {
+        /// Identity string or a joined hostname
+        key: String,
+        /// The alias to assign
+        alias: String,
+    },
+    /// List this network's aliases
+    #[command(visible_alias = "ls")]
+    List,
+    /// Remove an alias by name
+    #[command(visible_aliases = ["rm", "del"])]
+    Remove {
+        /// The alias to remove
+        alias: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum ConnectionsAction {
     /// List pending incoming connection requests (default)
     #[command(visible_alias = "ls")]
@@ -457,7 +500,8 @@ pub(crate) enum FirewallAction {
         /// A comma list adds one rule per item.
         #[arg(long, short = 'P')]
         port: Option<String>,
-        /// Peer short ID (omit for any peer)
+        /// Peer: hostname, mesh IP, short id, endpoint id, or user identity
+        /// (omit for any peer)
         #[arg(long)]
         peer: Option<String>,
         /// Restrict to a network (omit to match any network the peer is reached through)
@@ -535,6 +579,49 @@ pub(crate) enum FirewallAction {
         /// `on` or `off`
         state: String,
     },
+    /// Embedded mesh SSH server (Tailscale-style): SSH into this node by mesh
+    /// identity, no SSH keys. `ssh on` starts the server; `ssh allow <net> <peer>`
+    /// authorizes a peer to log in. Connect with a stock client: `ssh user@host.ray`.
+    Ssh {
+        #[command(subcommand)]
+        action: SshAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SshAction {
+    /// Start the embedded mesh SSH server on this node (listens on the mesh IPs'
+    /// port 22; opens tcp:22 in the local firewall).
+    On,
+    /// Stop the mesh SSH server (removes the tcp:22 passthrough).
+    Off,
+    /// Authorize a peer to SSH into this node over a network. `peer` is a
+    /// hostname, mesh IP, short id, or `*` (any peer on the network).
+    #[command(visible_alias = "ok")]
+    Allow {
+        /// Network name
+        network: String,
+        /// Peer (hostname / mesh IP / short id) or `*`
+        peer: String,
+        /// Local unix users this peer may log in as (comma-separated). Omit for
+        /// any non-root user; pass `*` for any user including root.
+        #[arg(long = "user", short = 'u', value_delimiter = ',')]
+        user: Vec<String>,
+    },
+    /// Revoke a peer's SSH authorization on a network.
+    #[command(visible_aliases = ["rm", "del"])]
+    Deny {
+        /// Network name
+        network: String,
+        /// Peer (hostname / mesh IP / short id) or `*`
+        peer: String,
+    },
+    /// Show the mesh SSH server state and per-network allow lists.
+    #[command(visible_aliases = ["ls", "list"])]
+    Show {
+        /// Optional network to filter to
+        network: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -546,6 +633,33 @@ pub(crate) enum FilesAction {
         /// Output directory (default: ~/Downloads)
         #[arg(long, short)]
         output: Option<String>,
+    },
+    /// Toggle auto-accepting file transfers from your own paired devices on a
+    /// network (`on` also drains any already-queued offers from your devices;
+    /// `off` stops future auto-accept). Only your own devices are auto-accepted.
+    AutoAccept {
+        /// Network name
+        network: String,
+        /// `on` or `off`
+        state: String,
+    },
+    /// Set/show/clear the directory where auto-accepted files are written
+    /// (absolute path). With no argument, prints the current value.
+    DownloadDir {
+        /// Absolute path (omit to show current)
+        path: Option<String>,
+        /// Clear the setting (revert to download-user / operator fallback)
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Set/show/clear the unix user that owns auto-accepted files (and whose
+    /// ~/Downloads receives them when no download-dir is set).
+    DownloadUser {
+        /// Username or numeric uid (omit to show current)
+        user: Option<String>,
+        /// Clear the setting
+        #[arg(long)]
+        clear: bool,
     },
 }
 
@@ -818,6 +932,7 @@ async fn main() -> Result<()> {
             hostname,
             tor,
             auto_accept_firewall,
+            auto_accept_files,
         } => {
             ipc_join(
                 &network_key,
@@ -825,10 +940,12 @@ async fn main() -> Result<()> {
                 hostname,
                 tor,
                 auto_accept_firewall,
+                auto_accept_files,
             )
             .await
         }
         Command::Nuke { name, force } => ipc_nuke(&name, force).await,
+        Command::Kick { network, peer } => ipc_kick(&network, &peer).await,
         Command::Status => ipc_status().await,
         Command::Report => ipc_report().await,
         Command::Daemon => {
@@ -879,6 +996,7 @@ async fn main() -> Result<()> {
         Command::Identityof { network, hostname } => {
             cmd_identityof(&network, &hostname, cli.json).await
         }
+        Command::Alias { network, action } => cmd_alias(&network, action, cli.json).await,
         Command::Mdns { state } => cmd_mdns(&state),
         Command::Config { action } => cmd_config(action, cli.json),
         Command::SetOperator { user } => cmd_set_operator(&user).await,
@@ -960,7 +1078,7 @@ fn cmd_config(action: Option<ConfigAction>, json: bool) -> Result<()> {
 }
 
 /// Resolve a username to its UID, falling back to parsing a numeric UID.
-fn uid_for_user(user: &str) -> Option<u32> {
+pub(crate) fn uid_for_user(user: &str) -> Option<u32> {
     use std::ffi::CString;
     let cname = CString::new(user).ok()?;
     let pw = unsafe { libc::getpwnam(cname.as_ptr()) };

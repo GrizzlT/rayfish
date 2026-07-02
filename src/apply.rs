@@ -19,6 +19,7 @@
 //! peers; an empty subject suggests nothing. There is no `default` field.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -192,7 +193,7 @@ networks:
 /// expects to exist; it is diffed against the joined hosts. The `*` wildcard
 /// (subject or peer) is not a real host and is excluded.
 pub fn expected_hosts(spec: &DeploySpec) -> Vec<String> {
-    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut set: BTreeSet<String> = BTreeSet::new();
     for firewall in spec.networks.values() {
         for (subject, rules) in firewall {
             if subject != "*" {
@@ -222,13 +223,26 @@ pub fn expected_hosts(spec: &DeploySpec) -> Vec<String> {
 /// rules simply aren't emitted yet and will materialize on a later apply once the
 /// user joins, mirroring how `firewall::materialize_suggestions` skips
 /// unresolved peers).
+/// Merge a network's stored (node-local `ray alias`) map with a spec's inline
+/// `aliases:` map. The spec wins on a name conflict. Both are already canonical
+/// (`name -> identity`); the result seeds [`expand_firewall`]. Stored aliases are
+/// node-local and never reach the blob, exactly like spec aliases.
+pub fn merge_aliases(
+    stored: &BTreeMap<String, String>,
+    spec: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = stored.clone();
+    merged.extend(spec.iter().map(|(k, v)| (k.clone(), v.clone())));
+    merged
+}
+
 pub fn expand_firewall(
     fw: &SuggestedFirewall,
     aliases: &BTreeMap<String, String>,
     groups: &BTreeMap<String, Vec<String>>,
     resolve_alias: &dyn Fn(&str) -> Vec<String>,
 ) -> (SuggestedFirewall, Vec<String>) {
-    let mut empty_aliases: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut empty_aliases: BTreeSet<String> = BTreeSet::new();
 
     // Resolve one alias name to its joined hostnames, recording it if empty.
     let mut resolve_one_alias = |name: &str, ident: &str| -> Vec<String> {
@@ -299,7 +313,7 @@ pub fn expand_firewall(
 /// of tokens sorted and deduplicated (canonical, so repeated expansions are
 /// idempotent). An empty existing value just adopts the new tokens.
 fn merge_spec(existing: &mut String, new: &str) {
-    let mut tokens: std::collections::BTreeSet<&str> = existing
+    let mut tokens: BTreeSet<&str> = existing
         .split(',')
         .chain(new.split(','))
         .map(str::trim)
@@ -504,6 +518,48 @@ networks:
         assert_eq!(wild.allows.get("alice-laptop").map(String::as_str), Some("tcp:22"));
         assert_eq!(wild.allows.get("alice-phone").map(String::as_str), Some("tcp:22"));
         assert!(!wild.allows.contains_key("alice"), "alias name must not survive");
+    }
+
+    #[test]
+    fn merge_aliases_spec_overrides_stored() {
+        // Stored (node-local `ray alias`) seeds the map; the spec's inline
+        // `aliases:` wins on a name conflict and adds new names.
+        let stored: BTreeMap<String, String> = [
+            ("alice".to_string(), "id-stored-alice".to_string()),
+            ("bob".to_string(), "id-bob".to_string()),
+        ]
+        .into();
+        let spec: BTreeMap<String, String> =
+            [("alice".to_string(), "id-spec-alice".to_string())].into();
+        let merged = merge_aliases(&stored, &spec);
+        assert_eq!(merged.get("alice").map(String::as_str), Some("id-spec-alice"));
+        assert_eq!(merged.get("bob").map(String::as_str), Some("id-bob"));
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn stored_alias_resolves_when_spec_omits_it() {
+        // A spec rule references `alice` but declares no `aliases:`; the stored
+        // alias seeds it and the rule expands to alice's joined hosts.
+        let merged = merge_aliases(
+            &[("alice".to_string(), "id-alice".to_string())].into(),
+            &BTreeMap::new(),
+        );
+        let groups = BTreeMap::new();
+        let resolve = |id: &str| -> Vec<String> {
+            if id == "id-alice" {
+                vec!["alice-laptop".to_string()]
+            } else {
+                vec![]
+            }
+        };
+        let mut fw = SuggestedFirewall::new();
+        fw.insert("*".to_string(), allows(&[("alice", "tcp:22")]));
+        let (out, warnings) = expand_firewall(&fw, &merged, &groups, &resolve);
+        assert!(warnings.is_empty());
+        let wild = out.get("*").unwrap();
+        assert_eq!(wild.allows.get("alice-laptop").map(String::as_str), Some("tcp:22"));
+        assert!(!wild.allows.contains_key("alice"));
     }
 
     #[test]

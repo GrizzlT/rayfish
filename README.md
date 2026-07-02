@@ -36,11 +36,12 @@ Each machine runs a small daemon (comparable to Tailscale's `tailscaled`) that c
 - 🔒 **Closed-by-default networks** with one-time invites, reusable fleet keys, or live approval (`--open` for public ones)
 - 🤝 **Direct 2-peer connections.** `ray connect <contact-id>` links you to one person with no room id or invite, approved like a friend request
 - 🌐 **Magic DNS.** `name.network.ray`, updated live as peers join, leave, or rename
-- 🧱 **Per-device firewall.** Directional, per-port, per-network rules with stateful return traffic. Secure by default: out of the box, unsolicited inbound TCP/UDP is denied (no local service port is exposed when you join a public network), while inbound ICMP (ping) and all outbound traffic are allowed. `ray firewall add in allow -p tcp --port N` opens a port (`--port` also takes a range `80-443` or a comma list `80,443`); `ray firewall default allow` restores permissive inbound behavior. By default a denied packet is silently dropped (stealthy); `ray firewall reject on` switches to "fail fast" mode, replying with a TCP RST / ICMP-unreachable so a blocked connection fails immediately ("connection refused") instead of hanging.
+- 🧱 **Per-device firewall.** Directional, per-port, per-network rules with stateful return traffic. Secure by default: out of the box, unsolicited inbound TCP/UDP is denied (no local service port is exposed when you join a public network), while inbound ICMP (ping) and all outbound traffic are allowed. `ray firewall add in allow -p tcp --port N` opens a port (`--port` also takes a range `80-443` or a comma list `80,443`); `ray firewall default allow` restores permissive inbound behavior. Scope a rule to one peer with `--peer`, which accepts any peer identifier (a hostname, mesh IP, short id, or identity). By default a denied packet is silently dropped (stealthy); `ray firewall reject on` switches to "fail fast" mode, replying with a TCP RST / ICMP-unreachable so a blocked connection fails immediately ("connection refused") instead of hanging.
+- 🔑 **Mesh SSH, no keys.** `ray firewall ssh on` runs an embedded SSH server on your mesh IPs; `ray firewall ssh allow <network> <peer>` authorizes a peer to log in. Connect with a stock client (`ssh user@host.ray`) — the peer is authenticated by its mesh identity, so there are no `authorized_keys` to distribute (Tailscale-style). For now an authorized peer may log in as any local user.
 - 🤝 **Coordinator firewall suggestions.** On any network the coordinator can suggest firewall rules that ride the signed network record (`*` targets all hosts); each node reviews them or opts into auto-install with `--auto-accept-firewall`.
-- 📜 **Declarative provisioning.** `ray apply deploy.yaml` stands up networks and firewall rules from a YAML spec. Define `aliases:` (a name for a user, expanding to all their devices) and `groups:` (a set of users/hosts) once, then reference them in firewall rules instead of repeating hostnames. `ray identityof <net> <host>` prints the identity string to alias.
+- 📜 **Declarative provisioning.** `ray apply deploy.yaml` stands up networks and firewall rules from a YAML spec. Define `aliases:` (a name for a user, expanding to all their devices) and `groups:` (a set of users/hosts) once, then reference them in firewall rules instead of repeating hostnames. `ray identityof <net> <host>` prints the identity string to alias. `ray alias <net> set <host> <name>` saves an alias on the node itself: it shows inline in `ray status` and seeds a spec's `aliases:` so you don't have to re-declare it.
 - 👥 **Multi-device identity.** Pair your laptop and phone under one identity; encrypted key backup (optionally to 1Password).
-- 📁 **File sharing.** `ray send file.zip bob`.
+- 📁 **File sharing.** `ray send file.zip bob`. Opt into `ray files auto-accept <net> on` to have transfers from your own paired devices land automatically; point them anywhere with `ray files download-dir <path>` or `download-user <user>`.
 - 📡 **mDNS** local discovery, and optional **Tor** transport.
 - 🛠 **Operator model.** Like Tailscale, run day-to-day commands without `sudo`.
 
@@ -119,6 +120,7 @@ latency, your public addresses, and whether UDP is getting through.
 
 ```bash
 ray leave gaming         # leave a network
+ray kick gaming alice    # coordinator only: remove a member from a closed network (disconnects them mesh-wide)
 ray down                 # standby: data plane (TUN + DNS) off, still connected to peers
 ray up                   # reactivate (no root needed, near-instant: connections were kept)
 sudo ray stop            # fully offline: daemon exits, peer connections close
@@ -204,6 +206,10 @@ Rayfish sits closest to [Tailscale](https://tailscale.com), but without a coordi
 ## Status
 
 Rayfish is experimental, pre-1.0 software and has not had an independent security audit. The wire format and on-disk config may still change between releases. Please [file issues](https://github.com/rayfish/rayfish/issues), but don't rely on it for anything critical yet.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full history, or the [releases page](https://github.com/rayfish/rayfish/releases) for per-version notes. `ray update --list` shows available releases and `ray update --check` reports what a pending upgrade brings.
 
 ## Building
 
