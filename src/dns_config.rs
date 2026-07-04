@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 #[cfg(target_os = "linux")]
 use std::path::Path;
+// Only the macOS/Linux configurators build resolver/backup file paths; Android
+// does no OS-level DNS configuration.
+#[cfg(not(target_os = "android"))]
 use std::path::PathBuf;
 
 #[allow(unused_imports)]
@@ -51,6 +54,11 @@ pub async fn revert(configurator: &dyn DnsConfigurator) -> Result<()> {
 }
 
 pub async fn detect_and_configure(tun_name: &str) -> Result<Box<dyn DnsConfigurator>> {
+    // Only the macOS/Linux branches consume `tun_name`; on any other target
+    // (e.g. Android) the function falls through to the unsupported-platform bail.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = tun_name;
+
     #[cfg(target_os = "macos")]
     {
         let _ = tun_name;
@@ -543,10 +551,7 @@ async fn try_networkmanager_dbus(tun_name: &str) -> Option<NetworkManagerDns> {
 
 #[cfg(target_os = "linux")]
 impl NetworkManagerDns {
-    async fn get_device_path(
-        &self,
-        conn: &Connection,
-    ) -> Result<zbus::zvariant::OwnedObjectPath> {
+    async fn get_device_path(&self, conn: &Connection) -> Result<zbus::zvariant::OwnedObjectPath> {
         let reply = conn
             .call_method(
                 Some("org.freedesktop.NetworkManager"),
@@ -568,9 +573,7 @@ impl NetworkManagerDns {
 #[async_trait]
 impl DnsConfigurator for NetworkManagerDns {
     async fn apply(&self) -> Result<()> {
-        let conn = Connection::system()
-            .await
-            .context("D-Bus system bus")?;
+        let conn = Connection::system().await.context("D-Bus system bus")?;
 
         let device_path = self.get_device_path(&conn).await?;
 
@@ -618,11 +621,7 @@ impl DnsConfigurator for NetworkManagerDns {
                 device_path.as_str(),
                 Some("org.freedesktop.NetworkManager.Device"),
                 "Reapply",
-                &(
-                    HashMap::<String, HashMap<String, Value>>::new(),
-                    0u64,
-                    0u32,
-                ),
+                &(HashMap::<String, HashMap<String, Value>>::new(), 0u64, 0u32),
             )
             .await;
 
@@ -858,10 +857,7 @@ async fn reassert_resolv_conf(search: &[String]) -> Result<()> {
 /// in direct mode, so on an NM host this watch mostly fires for dhclient or
 /// other writers; it remains the catch-all repair either way.
 #[cfg(target_os = "linux")]
-pub async fn run_resolv_reassert(
-    search: Vec<String>,
-    token: tokio_util::sync::CancellationToken,
-) {
+pub async fn run_resolv_reassert(search: Vec<String>, token: tokio_util::sync::CancellationToken) {
     use futures::StreamExt;
 
     // Re-assert immediately: covers any trample between apply() and our arrival.
@@ -1010,7 +1006,9 @@ async fn nm_quiet_remove() {
         tracing::warn!(error = %e, "failed to remove NetworkManager dns=none drop-in");
         return;
     }
-    tracing::info!("restored NetworkManager DNS management (removed dns=none drop-in); reloading NM");
+    tracing::info!(
+        "restored NetworkManager DNS management (removed dns=none drop-in); reloading NM"
+    );
     nm_reload().await;
 }
 

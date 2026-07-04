@@ -95,6 +95,11 @@ pub enum IpcMessage {
     FirewallReject {
         enabled: bool,
     },
+    /// Global firewall kill switch (`ray firewall on|off`). When `enabled` is
+    /// false the firewall stops enforcing and allows every packet.
+    FirewallSetEnabled {
+        enabled: bool,
+    },
     /// Coordinator-only: replace the network's suggested firewall rules and
     /// republish the signed blob. Authority comes from holding the network's
     /// secret key; works on any network (suggestions are advisory).
@@ -305,6 +310,11 @@ pub enum IpcMessage {
     StatusResponse {
         endpoint_id: EndpointId,
         mdns_enabled: bool,
+        /// Whether this node opted into automatic stable updates. Reflects the
+        /// running daemon's setting (which can differ from on-disk config until a
+        /// restart). Defaulted so an older CLI/daemon pair still deserializes.
+        #[serde(default)]
+        auto_update: bool,
         /// Whether the VPN is active (TUN up, networks connected) or on standby.
         active: bool,
         /// This node's contact id (`ray connect`), shown at the top of status.
@@ -330,6 +340,11 @@ pub enum IpcMessage {
         /// (global). Shown in the status "pending" summary.
         #[serde(default)]
         pending_connects: usize,
+        /// Networks this node has asked to join but has not yet been admitted
+        /// to (persisted `AppConfig.pending_joins`), minus any that are now
+        /// active. Shown in the UI as "waiting for approval".
+        #[serde(default)]
+        pending_networks: Vec<String>,
     },
     /// Reply to `Ping`. `probes` holds one entry per probe in send order: the
     /// measured round-trip in milliseconds, or `None` if that probe timed out.
@@ -374,6 +389,10 @@ pub enum IpcMessage {
         /// get a TCP RST / ICMP-unreachable reply instead of a silent drop.
         #[serde(default)]
         reject: bool,
+        /// Global kill switch (`ray firewall off`). When true the firewall is not
+        /// enforcing: every packet is allowed regardless of rules/defaults.
+        #[serde(default)]
+        disabled: bool,
         rules: Vec<FirewallRuleView>,
     },
     /// Current suggested firewall rules for a network (reply to
@@ -553,6 +572,9 @@ pub struct PeerStatus {
     pub ipv6: Option<Ipv6Addr>,
     pub hostname: Option<String>,
     pub user_identity: Option<EndpointId>,
+    /// True when this peer is another of the local user's own paired devices
+    /// (its resolved user identity equals ours).
+    pub is_own_device: bool,
     pub connection: Option<ConnectionInfo>,
 }
 
@@ -909,6 +931,7 @@ mod tests {
         let resp = IpcMessage::StatusResponse {
             endpoint_id: ep_id,
             mdns_enabled: true,
+            auto_update: false,
             active: true,
             contact_id: Some("contact123".to_string()),
             daemon_version: "0.1.0".to_string(),
@@ -926,6 +949,7 @@ mod tests {
                     ipv6: None,
                     hostname: None,
                     user_identity: None,
+                    is_own_device: false,
                     connection: None,
                 }],
                 pending_suggestions: 0,
